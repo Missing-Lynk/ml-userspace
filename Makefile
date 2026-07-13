@@ -1,12 +1,14 @@
 # Build orchestrator for the userspace components.
 #
-#   make            everything (daemons, gstreamer, hud)
+#   make            everything (daemons, gstreamer + static pipeline, hud)
 #   make daemons    the static musl aarch64 daemons (ml-linkd, ml-ledd) -> build/
 #   make linkd      just ml-linkd
 #   make ledd       just ml-ledd
 #   make gst        the gstreamer pipeline/HUD binaries (delegates to gstreamer/src/build.sh)
+#   make gst-static the standalone static ml-pipeline for the rootfs (build-static.sh)
 #   make hud        the LVGL HUD binary (delegates to its CMake build)
-#   make clean      remove build/ (gstreamer and hud clean via their own build trees)
+#   make font       generate the BTFL OSD glyph atlas from betaflight.mcm (needs python3 + Pillow)
+#   make clean      remove all build output (build/, gstreamer/build, hud/build, font atlas)
 #
 # The daemons build into build/ at the repo root. gstreamer and hud own their build
 # systems and write into their own build/ trees.
@@ -14,11 +16,12 @@
 REPO  := $(abspath .)
 BUILD := $(REPO)/build
 
-all: daemons gst hud
+all: daemons gst gst-static hud font
 
-daemons: $(BUILD)/ml-linkd $(BUILD)/ml-ledd
-linkd:   $(BUILD)/ml-linkd
-ledd:    $(BUILD)/ml-ledd
+daemons:    $(BUILD)/ml-linkd $(BUILD)/ml-ledd $(BUILD)/ml-rf-bringup
+linkd:      $(BUILD)/ml-linkd
+ledd:       $(BUILD)/ml-ledd
+rf-bringup: $(BUILD)/ml-rf-bringup
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -35,15 +38,24 @@ $(BUILD)/$(1): $(1)/$(1).c ml-shared/mlm.h | $(BUILD)
 endef
 $(eval $(call daemon_rule,ml-linkd,,-pthread))
 $(eval $(call daemon_rule,ml-ledd,linux-headers,))
+$(eval $(call daemon_rule,ml-rf-bringup,linux-headers,))
 
 gst:
 	./gstreamer/src/build.sh
+
+gst-static:
+	./gstreamer/scripts/build-static.sh
 
 hud:
 	cmake -S hud -B hud/build -DCMAKE_TOOLCHAIN_FILE=$(REPO)/hud/cmake/aarch64-static.cmake
 	cmake --build hud/build -j$(shell nproc)
 
-clean:
-	rm -rf $(BUILD)
+font: assets/osd-fonts/font_BTFL_hd.png
 
-.PHONY: all daemons linkd ledd gst hud clean
+assets/osd-fonts/font_BTFL_hd.png: assets/osd-fonts/betaflight.mcm assets/osd-fonts/mcm2png.py
+	python3 assets/osd-fonts/mcm2png.py $< $@
+
+clean:
+	rm -rf $(BUILD) gstreamer/build hud/build assets/osd-fonts/font_BTFL_hd.png
+
+.PHONY: all daemons linkd ledd rf-bringup gst gst-static hud font clean
