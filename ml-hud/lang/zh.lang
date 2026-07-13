@@ -1,0 +1,40 @@
+# 中文菜单目录。可自由编辑；运行时重新加载，无需重新编译。
+# 格式： key = value  （以 # 开头的行为注释）
+
+# 侧边栏
+nav.goggles = 眼镜
+nav.dvr = 录制
+nav.air_unit = 天空端
+nav.playback = 回放
+
+# 眼镜设置
+goggles.brightness         = 亮度
+goggles.msp_osd            = MSP OSD 叠加
+goggles.show_system_osd    = 显示系统 OSD
+goggles.show_temperature   = 显示温度
+goggles.buzzer_volume      = 蜂鸣器音量
+goggles.key_tones_off      = 关闭按键音
+goggles.low_voltage_alarm  = 低电压报警
+goggles.min_cell_voltage   = 最低单节电压
+goggles.language           = 语言
+goggles.slot_switch        = 切换到插槽 A
+
+# 录制
+dvr.autostart = 自动开始录制
+dvr.resolution = 分辨率
+dvr.record_osd = 录制 OSD
+dvr.save_srt = 保存 SRT
+dvr.format = 格式化 SD 卡
+dvr.format_prompt = 格式化 SD 卡？
+
+# 天空端
+air_unit.no_link = 未连接天空端
+air_unit.connected = 天空端已连接
+
+# 回放
+playback.empty = 无录像
+
+# 通用
+common.off = 关
+common.cancel = 取消
+slot_switch.prompt = 重启进入原厂插槽 A？

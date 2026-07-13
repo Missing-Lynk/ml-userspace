@@ -1,0 +1,40 @@
+# English menu catalog. Edit freely; reloaded at runtime, no recompile needed.
+# Format: key = value   (lines starting with # are comments)
+
+# Sidebar sections
+nav.goggles = Goggles
+nav.dvr = DVR
+nav.air_unit = Air Unit
+nav.playback = Playback
+
+# Goggles section
+goggles.brightness         = Brightness
+goggles.msp_osd            = MSP OSD Overlay
+goggles.show_system_osd    = Show System OSD
+goggles.show_temperature   = Show Temperature
+goggles.buzzer_volume      = Buzzer Volume
+goggles.key_tones_off      = Disable Key Tones
+goggles.low_voltage_alarm  = Low Voltage Alarm
+goggles.min_cell_voltage   = Minimum Cell Voltage
+goggles.language           = Language
+goggles.slot_switch        = Switch to Slot A
+
+# DVR section
+dvr.autostart = Auto Start Recording
+dvr.resolution = Resolution
+dvr.record_osd = Record OSD
+dvr.save_srt = Save SRT
+dvr.format = Format SD Card
+dvr.format_prompt = Format the SD card?
+
+# Air Unit section
+air_unit.no_link = No air unit connected
+air_unit.connected = Air unit connected
+
+# Playback
+playback.empty = No recordings
+
+# Generic
+common.off = Off
+common.cancel = Cancel
+slot_switch.prompt = Reboot into stock slot A?

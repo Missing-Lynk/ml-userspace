@@ -8,7 +8,7 @@
 #   make gst-static the standalone static ml-pipeline for the rootfs (build-static.sh)
 #   make hud        the LVGL HUD binary (delegates to its CMake build)
 #   make font       generate the BTFL OSD glyph atlas from betaflight.mcm (needs python3 + Pillow)
-#   make clean      remove all build output (build/, gstreamer/build, hud/build, font atlas)
+#   make clean      remove all build output (build/, gstreamer/build, ml-hud/build, font atlas)
 #
 # The daemons build into build/ at the repo root. gstreamer and hud own their build
 # systems and write into their own build/ trees.
@@ -47,8 +47,8 @@ gst-static:
 	./gstreamer/scripts/build-static.sh
 
 hud:
-	cmake -S hud -B hud/build -DCMAKE_TOOLCHAIN_FILE=$(REPO)/hud/cmake/aarch64-static.cmake
-	cmake --build hud/build -j$(shell nproc)
+	cmake -S ml-hud -B ml-hud/build -DCMAKE_TOOLCHAIN_FILE=$(REPO)/ml-hud/cmake/aarch64-static.cmake
+	cmake --build ml-hud/build -j$(shell nproc)
 
 font: assets/osd-fonts/font_BTFL_hd.png
 
@@ -56,6 +56,6 @@ assets/osd-fonts/font_BTFL_hd.png: assets/osd-fonts/betaflight.mcm assets/osd-fo
 	python3 assets/osd-fonts/mcm2png.py $< $@
 
 clean:
-	rm -rf $(BUILD) gstreamer/build hud/build assets/osd-fonts/font_BTFL_hd.png
+	rm -rf $(BUILD) gstreamer/build ml-hud/build assets/osd-fonts/font_BTFL_hd.png
 
 .PHONY: all daemons linkd ledd rf-bringup gst gst-static hud font clean

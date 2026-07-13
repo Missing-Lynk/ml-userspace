@@ -8,7 +8,8 @@
  *  - drm.sock       SOCK_STREAM; ml-drmfd passes the shared DRM master fd via SCM_RIGHTS.
  *  - telemetry.sock SOCK_DGRAM; one datagram = one mlm_hdr-framed record, consumer binds,
  *    producer sends MSG_DONTWAIT and drops on error (video never blocks on the HUD).
- *  - osd.sock       same datagram contract, MSP DisplayPort records (future).
+ *  - osd.sock       same datagram contract, MSP DisplayPort records (the HUD binds; ml-linkd,
+ *                    or ml-hud/tools/osd-replay on the bench, sends).
  */
 #ifndef MLM_H
 #define MLM_H
