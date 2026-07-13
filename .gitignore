@@ -1,0 +1,18 @@
+# Build outputs: the centralized daemon build/ and gstreamer's + hud's own build
+# trees (build/, build-host/), wherever they sit.
+build*/
+
+# gstreamer packaging and local test clips
+*.sqsh
+*.h264
+*.h265
+
+# hud host-preview framebuffer dumps
+hud/*.png
+
+# generated OSD glyph sheet (rendered from betaflight.mcm by osd-fonts/mcm2png.py)
+assets/osd-fonts/font_BTFL_hd.png
+
+# python
+__pycache__/
+*.pyc
