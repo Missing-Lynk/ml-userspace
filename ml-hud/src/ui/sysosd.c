@@ -35,6 +35,7 @@ static lv_obj_t *g_lbl_channel;      /* RF channel (services/linkstate) */
 static lv_obj_t *g_lbl_battery;      /* goggle pack */
 static lv_obj_t *g_lbl_link;         /* WIFI + SNR (services/linkstate) */
 static lv_obj_t *g_lbl_sdcard;
+static lv_obj_t *g_lbl_bitrate;      /* incoming-video downlink rate (Mbps); dim when the link is down */
 static lv_obj_t *g_lbl_temp;         /* goggle SoC temperature; gated by the Show Temperature setting */
 static lv_obj_t *g_lbl_rec;          /* red "REC"; shown only while ml-pipeline reports recording */
 static lv_obj_t *g_lbl_standby;      /* power glyph at the left of the air group; shown only in standby */
@@ -149,6 +150,9 @@ void sysosd_create(lv_obj_t *parent)
     lv_obj_set_width(g_lbl_battery, OSD_BATTERY_WIDTH);   /* fixed width: no reflow on value change */
     g_lbl_link = add_field(g_group_left, LV_SYMBOL_WIFI, "No Link", COLOR_WARN);
     g_lbl_sdcard = add_field(g_group_left, LV_SYMBOL_SD_CARD, "--", COLOR_TEXT);
+    /* Incoming-video bitrate, between the SD card and temperature. Only meaningful while the air-unit
+     * downlink is up, so it reads a dim placeholder otherwise (like the RF fields). */
+    g_lbl_bitrate = add_field(g_group_left, LV_SYMBOL_DOWNLOAD, "-- Mbps", COLOR_TEXT_DIM);
     g_lbl_temp = add_field(g_group_left, NULL, "--°C", COLOR_TEXT);
     lv_obj_add_flag(g_lbl_temp, LV_OBJ_FLAG_HIDDEN);   /* shown only when enabled and a reading exists */
     /* Last in the goggle group: toggling REC grows into the middle slack instead of shifting the
@@ -336,6 +340,16 @@ void sysosd_update(const telemetry_t *telemetry, const air_telem_t *air, setting
         lv_label_set_text_fmt(g_lbl_sdcard, "%s %dG", LV_SYMBOL_SD_CARD, (int) (telemetry->sd_free_gb + 0.5f));
     } else {
         lv_label_set_text(g_lbl_sdcard, LV_SYMBOL_SD_CARD " --");
+    }
+
+    /* Incoming-video bitrate: shown live only while the downlink is up (its byte rate is otherwise 0). */
+    if (connected && telemetry->have_bitrate) {
+        int tenths = (int) (telemetry->bitrate_mbps * 10.0f + 0.5f);
+        lv_label_set_text_fmt(g_lbl_bitrate, "%s %d.%d Mbps", LV_SYMBOL_DOWNLOAD, tenths / 10, tenths % 10);
+        lv_obj_set_style_text_color(g_lbl_bitrate, COLOR_TEXT, 0);
+    } else {
+        lv_label_set_text_fmt(g_lbl_bitrate, "%s -- Mbps", LV_SYMBOL_DOWNLOAD);
+        lv_obj_set_style_text_color(g_lbl_bitrate, COLOR_TEXT_DIM, 0);
     }
 
     /* Goggle SoC temperature, shown only when the Show Temperature setting is on and a reading exists. */

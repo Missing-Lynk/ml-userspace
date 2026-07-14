@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <fcntl.h>
+#include <stdint.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/statvfs.h>
 
@@ -27,6 +29,59 @@ static int read_int_file(const char *path)
 
     buffer[count] = '\0';
     return atoi(buffer);
+}
+
+/* Read a 64-bit unsigned counter file (netdev byte counters exceed 2^31 within a session). Returns
+ * -1 on any failure so the caller can distinguish "no reading" from a genuine value. */
+static long long read_u64_file(const char *path)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return -1;
+    }
+
+    char buffer[32];
+    ssize_t count = read(fd, buffer, sizeof(buffer) - 1);
+    close(fd);
+
+    if (count <= 0) {
+        return -1;
+    }
+
+    buffer[count] = '\0';
+    return strtoll(buffer, NULL, 10);
+}
+
+static uint32_t mono_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint32_t) (t.tv_sec * 1000 + t.tv_nsec / 1000000);
+}
+
+/* Incoming-video bitrate: the SDIO netdev RX byte counter differentiated over wall time. The counter
+ * is monotonic per boot, so a smaller reading than last means it was reset (driver reload) - we skip
+ * that tick and re-baseline. The first call only baselines (no interval yet). */
+static void read_bitrate(const board_profile_t *board, telemetry_t *out)
+{
+    static long long last_bytes = -1;
+    static uint32_t  last_ms;
+
+    long long bytes = read_u64_file(board->sdio_rx_bytes_path);
+    uint32_t now = mono_ms();
+    if (bytes < 0) {
+        last_bytes = -1;   /* source gone: re-baseline when it returns */
+        return;
+    }
+
+    uint32_t elapsed = now - last_ms;
+    if (last_bytes >= 0 && bytes >= last_bytes && elapsed >= 250) {
+        out->have_bitrate = 1;
+        out->bitrate_mbps = (float) ((bytes - last_bytes) * 8) / ((double) elapsed * 1000.0);
+    }
+
+    last_bytes = bytes;
+    last_ms = now;
 }
 
 /** @brief Estimate the pack cell count from the pack voltage. */
@@ -57,6 +112,8 @@ void telemetry_read(telemetry_t *out)
     out->sd_free_gb = 0.0;
     out->have_temp = 0;
     out->temp_c = 0;
+    out->have_bitrate = 0;
+    out->bitrate_mbps = 0.0f;
 
     const board_profile_t *board = board_current();
 
@@ -87,4 +144,6 @@ void telemetry_read(telemetry_t *out)
         out->have_temp = 1;
         out->temp_c = temp_c;
     }
+
+    read_bitrate(board, out);
 }
