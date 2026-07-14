@@ -252,6 +252,7 @@ static void *drm_disp_run(void *arg)
                     ditem_release(&it);
                     continue;
                 }
+
                 c->modeset_done = 1;
                 c->front_it = it;   /* on screen now; SetCrtc gives no flip event */
             } else if (drmModePageFlip(c->drm_fd, c->crtc_id, fbid,
@@ -458,6 +459,55 @@ guint32 tile_fb_get(struct ctx *c, int ch, const struct tileview *t)
     return fb;
 }
 
+/* Allocate the persistent black primary FB the CRTC parks on while a decode graph is torn down,
+ * so the DC never scans a freed FB (the fault that powered the panel off on a playback<->live
+ * swap). artosyn_vo has no dumb-buffer support, so it is a zeroed I420 dma-heap buffer (same
+ * layout/format as the video, so the park is a clean no-format-change modeset). Allocate this
+ * BEFORE the composite pool grabs the CMA, and only once. Returns 0 on success. */
+int drm_make_idle_fb(struct ctx *c)
+{
+    if (c->idle_fb) {
+        return 0;
+    }
+
+    int fd = ml_heap_alloc(COMP_SIZE);
+    if (fd < 0) {
+        fprintf(stderr, "ml-pipeline: idle_fb heap alloc failed (no CMA?) - swaps may blank the panel\n");
+        return -1;
+    }
+
+    guint8 *m = mmap(NULL, COMP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (m != MAP_FAILED) {
+        /* Fill with the vendor no-signal splash (I420 1920x1080 == COMP_SIZE) so parking here on a
+         * swap - and returning to live with no RF frame - shows the mountain, not black. Falls back
+         * to black if the image is missing. */
+        const char *sp = getenv("ML_NOSIGNAL") ? getenv("ML_NOSIGNAL") : "/usr/local/share/nosignal.yuv";
+        int imgfd = open(sp, O_RDONLY);
+        size_t got = 0;
+        if (imgfd >= 0) {
+            ssize_t n;
+            while (got < COMP_SIZE && (n = read(imgfd, m + got, COMP_SIZE - got)) > 0) {
+                got += n;
+            }
+            close(imgfd);
+        }
+
+        if (got != COMP_SIZE) {
+            memset(m, 0, COMP_YSIZE);                          /* black luma */
+            memset(m + COMP_UOFF, 128, COMP_SIZE - COMP_UOFF); /* neutral chroma */
+        }
+
+        ml_dmabuf_sync(fd, 0);                                 /* flush to DDR for the DC */
+        munmap(m, COMP_SIZE);
+    }
+
+    guint32 h = 0;
+    c->idle_fb = drm_make_fb(c, fd, &h);   /* PRIME-import as a YUV420 scanout FB (keeps fd via GEM) */
+    c->idle_dumb = h;
+
+    return c->idle_fb ? 0 : -1;
+}
+
 int drm_disp_init(struct ctx *c)
 {
     int p[2];
@@ -468,6 +518,7 @@ int drm_disp_init(struct ctx *c)
     memset(&c->prev_it, 0, sizeof c->prev_it);
     c->next_it.cbi = c->front_it.cbi = c->pending_it.cbi = c->prev_it.cbi = -1;
     c->retire_dumps = getenv("ML_DUMP_RETIRE") ? atoi(getenv("ML_DUMP_RETIRE")) : 0;
+    c->modeset_done = 0;   /* re-modeset the first frame of each (re)init - modes swap at runtime */
     pthread_mutex_init(&c->disp_lock, NULL);
 
     if (pipe2(p, O_NONBLOCK | O_CLOEXEC)) {
@@ -511,6 +562,16 @@ void drm_disp_shutdown(struct ctx *c)
     if (write(c->wake_w, &w, 1) < 0) { }
 
     pthread_join(c->disp_thread, NULL);
+
+    if (!c->planes_on && c->idle_fb) {
+        /* Park the CRTC on the persistent black FB and wait past the shadow latch BEFORE freeing
+         * the per-frame/composite FBs, so the DC is never left fetching a removed buffer (which
+         * powers the panel off). The single/composite analogue of the plane-mode dance below.
+         */
+        drmModeSetCrtc(c->drm_fd, c->crtc_id, c->idle_fb, 0, 0, &c->conn_id, 1, &c->mode);
+        usleep(4 * 1000000 / RF_FPS);
+    }
+
     if (c->planes_on) {
         /* Take the video planes off the CRTC before their FBs (and the decoder buffers
          * behind them) go away, and WAIT past the next shadow latch: the EMIT clear only
@@ -560,10 +621,24 @@ void drm_disp_shutdown(struct ctx *c)
         if (c->fb_handle[i]) {
             drmCloseBufferHandle(c->drm_fd, c->fb_handle[i]);
         }
+
+        c->fb_id[i] = 0;        /* a later re-init re-imports these; don't double-remove */
+        c->fb_handle[i] = 0;
     }
 
     ditem_release(&c->prev_it);
     ditem_release(&c->front_it);
     ditem_release(&c->pending_it);
     ditem_release(&c->next_it);
+
+    /* Close the display thread's wake self-pipe so a re-init's pipe2 does not leak fds. */
+    if (c->wake_r > 0) {
+        close(c->wake_r);
+        c->wake_r = -1;
+    }
+
+    if (c->wake_w > 0) {
+        close(c->wake_w);
+        c->wake_w = -1;
+    }
 }

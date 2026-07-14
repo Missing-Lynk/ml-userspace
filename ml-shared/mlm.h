@@ -98,26 +98,45 @@ struct mlm_led {
  */
 enum mlm_cmd_type {
     MLM_CMD_REC_TOGGLE = 1, /* start recording if idle, stop if recording */
+    MLM_CMD_PLAY       = 2, /* play a file: the NUL-terminated path follows the mlm_cmd in the datagram */
+    MLM_CMD_PAUSE      = 3, /* pause playback (hold current frame) */
+    MLM_CMD_RESUME     = 4, /* resume paused playback */
+    MLM_CMD_SEEK       = 5, /* seek within the current clip; arg = permille (0..1000) of duration */
+    MLM_CMD_STOP       = 6, /* stop playback and return to the live stream */
+    MLM_CMD_SPEED      = 7, /* set play speed; arg = signed multiplier (int32 bit-cast): 1 = normal,
+                            *  2/4/8 fast-forward, -2/-4/-8 rewind. Realised as a rate seek. */
 };
 
 struct mlm_cmd {
     uint32_t cmd; /* enum mlm_cmd_type */
-    uint32_t arg; /* command-specific; 0 when unused */
+    uint32_t arg; /* command-specific; 0 when unused, permille for SEEK */
 } __attribute__((packed));
+/* MLM_CMD_PLAY carries the file path as bytes after the mlm_cmd in the same datagram; the
+ * full frame is { mlm_hdr, mlm_cmd, char path[] } (NUL-terminated, bounded by MLM_PATH_MAX). */
+#define MLM_PATH_MAX 512
 
 /* MLM_T_STATE payload (ml-pipeline -> HUD on telemetry.sock). The pipeline broadcasts its current
  * mode on every change and re-asserts periodically, so a restarted HUD (or one that missed a
  * datagram) reconverges. New modes (PLAYBACK, ...) append; the HUD treats unknown values as IDLE.
  */
 enum mlm_state_mode {
-    MLM_STATE_IDLE      = 0, /* receiving/decoding only */
+    MLM_STATE_IDLE      = 0, /* receiving/decoding the live stream only */
     MLM_STATE_RECORDING = 1, /* a DVR recording is active */
+    MLM_STATE_PLAYBACK  = 2, /* a file is playing back (preempting the live stream) */
 };
 
 struct mlm_state {
     uint32_t state;    /* enum mlm_state_mode */
-    uint32_t reserved; /* room for playback position/speed later */
+    uint32_t flags;    /* MLM_STATE_F_* (playback: paused vs playing) */
+    uint32_t pos_ms;   /* playback: current position in ms (0 otherwise) */
+    uint32_t dur_ms;   /* playback: clip duration in ms (0 if unknown / not playing) */
 } __attribute__((packed));
+
+#define MLM_STATE_F_PAUSED 0x1 /* playback is paused (only meaningful in MLM_STATE_PLAYBACK) */
+#define MLM_STATE_F_ENDED  0x2 /* playback reached end-of-clip: last frame held, position at duration,
+                                *  awaiting the user (replay or exit). Still MLM_STATE_PLAYBACK. */
+#define MLM_STATE_F_RENDERING 0x4 /* first decoded frame is on the display (the clip is visible); before
+                                   *  this the HUD keeps the menu up with a loading spinner. */
 
 /* SCM_RIGHTS fd passing over drm.sock */
 static inline int mlm_send_fd(int sock, int fd)
@@ -181,6 +200,39 @@ static inline int mlm_get_drm_fd(void)
     close(sock);
 
     return fd;
+}
+
+/* Send one MLM_T_CMD to ml-pipeline's ctrl.sock. `path` (PLAY only, else NULL) is appended,
+ * NUL-terminated. Connectionless DGRAM: returns 0 if the datagram was sent, -1 otherwise (a
+ * down pipeline just means nobody is bound). */
+static inline int mlm_ctrl_send(uint32_t cmd, uint32_t arg, const char *path)
+{
+    struct { struct mlm_hdr h; struct mlm_cmd cmd; char path[MLM_PATH_MAX]; } __attribute__((packed)) frame;
+    size_t len = sizeof frame.h + sizeof frame.cmd;
+
+    frame.h.magic = MLM_MAGIC;
+    frame.h.type = MLM_T_CMD;
+    frame.h.flags = 0;
+    frame.cmd.cmd = cmd;
+    frame.cmd.arg = arg;
+    if (path) {
+        size_t n = strnlen(path, MLM_PATH_MAX - 1);
+        memcpy(frame.path, path, n);
+        frame.path[n] = '\0';
+        len += n + 1;
+    }
+
+    int sock = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        return -1;
+    }
+
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    strncpy(addr.sun_path, MLM_CTRL_SOCK, sizeof addr.sun_path - 1);
+    int ok = sendto(sock, &frame, len, 0, (struct sockaddr *)&addr, sizeof addr) == (ssize_t)len ? 0 : -1;
+    close(sock);
+
+    return ok;
 }
 
 #endif

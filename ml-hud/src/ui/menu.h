@@ -38,4 +38,8 @@ void menu_close_all(void); /**< @brief Close the menu entirely, whatever the dep
 /** @brief Re-dim the link-gated Air Unit entry from the live link state. Call on a timer while open. */
 void menu_refresh_link(void);
 
+/** @brief Advance the playback transport bar from the pipeline's telemetry. Call every loop tick so
+ *  the scrubber tracks position promptly; a no-op unless a clip is playing. */
+void menu_playback_tick(void);
+
 #endif /* HUD_UI_MENU_H */

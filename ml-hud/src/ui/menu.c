@@ -1,7 +1,9 @@
 /** @file menu.c @brief See menu.h. */
 #include "menu.h"
 #include "display.h"
+#include "player.h"
 #include "sysosd.h"
+#include "theme.h"
 #include "tone.h"
 
 #include "backlight.h"
@@ -17,13 +19,7 @@
 #include <string.h>
 #include <unistd.h>
 
-/* Palette + sizes, matching the libre menu layout (libre/app/menu_config.h). */
-#define COLOR_BG             lv_color_hex(0x0A0E14)
-#define COLOR_SIDEBAR        lv_color_hex(0x131A26)
-#define COLOR_ACCENT         lv_color_hex(0x29ABE2)
-#define COLOR_TEXT           lv_color_hex(0xE6EAF0)
-#define COLOR_TEXT_DIM       lv_color_hex(0x7A8497)
-#define COLOR_TEXT_ON_ACCENT lv_color_hex(0x05121C)
+/* The palette (COLOR_*) lives in theme.h, shared with the player. Menu layout sizes: */
 #define SIDEBAR_WIDTH_PCT    20
 #define SIDEBAR_PAD          22
 #define CONTENT_PAD          36
@@ -157,6 +153,9 @@ static void enter_sidebar_zone(void);
 static void enter_content_zone(void);
 static int  menu_is_linked(void);
 static void update_air_unit_dim(void);
+
+/* The recordings player (transport bar + playback state) lives in player.c; menu.c drives it through
+ * player.h and hands it the shared menu objects via g_player_host below. */
 
 /* keypad injection: the controller feeds discrete key edges into this queue; the LVGL keypad
  * indev drains one per read, so a queued press then release becomes a navigation/click/key event.
@@ -597,8 +596,19 @@ static void render_dvr(void)
     render_settings_list(g_dvr_items, DVR_ITEM_COUNT, NULL);
 }
 
-/* The SD-card recordings list: one focusable row per clip (icon + name, size on the right). The rows
- * are navigable but CENTER does nothing. An empty list shows a hint and keeps focus in the sidebar.
+/* CENTER on a recording row: start playing that clip (the player remembers it for the return focus). */
+static void playback_row_clicked(lv_event_t *event)
+{
+    static recording_t recs[MAX_RECORDINGS];
+    int i = (int) (intptr_t) lv_event_get_user_data(event);
+    int n = recordings_list(recs, MAX_RECORDINGS);
+    if (i >= 0 && i < n) {
+        player_start(i, recs[i].name);
+    }
+}
+
+/* The SD-card recordings list: one focusable row per clip (icon + name, size on the right). CENTER
+ * plays the clip (player_start). An empty list shows a hint and keeps focus in the sidebar.
  */
 static void render_playback(void)
 {
@@ -612,11 +622,26 @@ static void render_playback(void)
 
     for (int i = 0; i < count; i++) {
         lv_obj_t *row = make_row(LV_SYMBOL_VIDEO, recordings[i].name);
-        char size[24];
+        lv_obj_add_event_cb(row, playback_row_clicked, LV_EVENT_CLICKED, (void *) (intptr_t) i);
+
+        /* Right-hand value: clip length (from the MP4 header) and file size. The length is dropped
+         * only if the header will not parse. */
+        char value[40];
+        char path[512];
+        recordings_path(recordings[i].name, path, sizeof path);
         long gb_tenths = (recordings[i].size_mb * 10 + 512) / 1024;   /* MB -> GB, one decimal */
-        snprintf(size, sizeof(size), "%ld.%ld GB", gb_tenths / 10, gb_tenths % 10);
-        lv_obj_t *size_label = lv_label_create(row);
-        lv_label_set_text(size_label, size);
+
+        unsigned ms = recordings_duration_ms(path);
+        if (ms > 0) {
+            unsigned s = ms / 1000;
+            snprintf(value, sizeof(value), "%u:%02u   %ld.%ld GB", s / 60, s % 60,
+                     gb_tenths / 10, gb_tenths % 10);
+        } else {
+            snprintf(value, sizeof(value), "%ld.%ld GB", gb_tenths / 10, gb_tenths % 10);
+        }
+        lv_obj_t *value_label = lv_label_create(row);
+        lv_obj_set_style_text_color(value_label, COLOR_TEXT_DIM, 0);   /* de-emphasise vs the name */
+        lv_label_set_text(value_label, value);
     }
 }
 
@@ -803,6 +828,7 @@ static lv_obj_t *make_modal(const char *heading_text)
     lv_label_set_text(heading, heading_text);
     lv_obj_set_style_text_font(heading, &g_menu_font, 0);
     lv_obj_set_style_text_color(heading, COLOR_ACCENT, 0);
+
     return box;
 }
 
@@ -819,6 +845,7 @@ static lv_obj_t *make_modal_button(lv_obj_t *box, const char *text)
 
     lv_obj_t *label = lv_label_create(opt);
     lv_label_set_text(label, text);
+
     return opt;
 }
 
@@ -906,6 +933,29 @@ static void format_sdcard(void)
     system("/usr/local/bin/ml-sdformat >/dev/null 2>&1");
 }
 
+/* player host: the shared menu objects + focus callback the recordings player borrows (player.h). */
+static lv_group_t *host_group(void)     { return g_group; }
+static lv_obj_t   *host_menu_root(void) { return g_menu; }
+static lv_obj_t   *host_content(void)   { return g_content; }
+static int         host_menu_open(void) { return g_is_open; }
+
+/* Re-enter the recordings list after playback and land on the clip that was played (not the top). */
+static void restore_recordings_list(int row_index)
+{
+    enter_content_zone();
+    if (row_index >= 0 && (uint32_t) row_index < lv_obj_get_child_count(g_content)) {
+        lv_group_focus_obj(lv_obj_get_child(g_content, row_index));
+    }
+}
+
+static const player_host_t g_player_host = {
+    .group        = host_group,
+    .menu_root    = host_menu_root,
+    .content      = host_content,
+    .menu_open    = host_menu_open,
+    .restore_list = restore_recordings_list,
+};
+
 /* lifecycle */
 void menu_init(settings_t *settings)
 {
@@ -918,6 +968,8 @@ void menu_init(settings_t *settings)
     lv_indev_set_type(g_keypad, LV_INDEV_TYPE_KEYPAD);
     lv_indev_set_read_cb(g_keypad, keypad_read_cb);
     lv_indev_set_group(g_keypad, g_group);
+
+    player_init(&g_player_host);
 }
 
 void menu_apply_persisted(void)
@@ -949,10 +1001,13 @@ void menu_open(void)
 
 void menu_close(void)
 {
+    player_on_menu_closing();   /* stop any playback before the content pane (spinner parent) goes */
+
     if (g_select_box != NULL) {
         lv_obj_delete(g_select_box);
         g_select_box = NULL;
     }
+
     g_select_open = 0;
     g_select_closing = 0;
 
@@ -997,6 +1052,11 @@ void menu_refresh_link(void)
     }
 }
 
+void menu_playback_tick(void)
+{
+    player_tick();   /* drive the loading phase / transport bar (no-op unless a clip is playing) */
+}
+
 int menu_depth(void)
 {
     return g_zone;
@@ -1005,6 +1065,16 @@ int menu_depth(void)
 void menu_back(void)
 {
     if (!g_is_open) {
+        return;
+    }
+
+    if (player_is_loading()) {
+        player_cancel_loading();   /* abandon the clip before it opened */
+        return;
+    }
+
+    if (player_is_open()) {
+        player_close(1);   /* stop playback, return to the recordings list */
         return;
     }
 
@@ -1023,35 +1093,60 @@ void menu_back(void)
 
 void menu_up(void)
 {
-    if (g_is_open) {
+    if (g_is_open && !player_is_open() && !player_is_loading()) {
         feed_key(LV_KEY_PREV);
     }
 }
 
 void menu_down(void)
 {
-    if (g_is_open) {
+    if (g_is_open && !player_is_open() && !player_is_loading()) {
         feed_key(LV_KEY_NEXT);
     }
 }
 
 void menu_left(void)
 {
-    if (g_is_open) {
-        feed_key(LV_KEY_LEFT);
+    if (!g_is_open) {
+        return;
     }
+    if (player_is_loading()) {
+        return;   /* navigation frozen while a clip loads */
+    }
+    if (player_is_open()) {
+        player_key_left();
+        return;
+    }
+    feed_key(LV_KEY_LEFT);
 }
 
 void menu_right(void)
 {
-    if (g_is_open) {
-        feed_key(LV_KEY_RIGHT);
+    if (!g_is_open) {
+        return;
     }
+    if (player_is_loading()) {
+        return;   /* navigation frozen while a clip loads */
+    }
+    if (player_is_open()) {
+        player_key_right();
+        return;
+    }
+    feed_key(LV_KEY_RIGHT);
 }
 
 void menu_center(void)
 {
     if (!g_is_open) {
+        return;
+    }
+
+    if (player_is_loading()) {
+        return;   /* ignore input while a clip loads */
+    }
+
+    if (player_is_open()) {
+        player_key_center();
         return;
     }
 

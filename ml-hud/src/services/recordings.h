@@ -18,4 +18,22 @@ typedef struct {
  */
 int recordings_list(recording_t *out, int max);
 
+#include <stddef.h>
+
+/**
+ * @brief Build the absolute path of recording @p name (on the SD card) into @p out.
+ */
+void recordings_path(const char *name, char *out, size_t outsz);
+
+/**
+ * @brief Clip length in milliseconds, read from the MP4 `moov`/`mvhd` header (no decode, no gst).
+ *
+ * Walks the top-level atom tree by following size headers - `mdat` is skipped by its length, never
+ * read - so cost is a handful of seeks regardless of file size. The result is cached per (path,
+ * size, mtime), so repeated calls while rendering the list are free.
+ *
+ * @return Duration in ms, or 0 if the header could not be parsed.
+ */
+unsigned recordings_duration_ms(const char *path);
+
 #endif /* HUD_RECORDINGS_H */

@@ -20,6 +20,9 @@
 
 static uint32_t g_last_seen_ms;   /* monotonic ms of the last air-liveness datagram; 0 = never/lost */
 static uint32_t g_pipeline_state; /* last MLM_T_STATE from ml-pipeline; defaults to MLM_STATE_IDLE (0) */
+static uint32_t g_pb_flags;       /* playback flags (MLM_STATE_F_PAUSED) from the last MLM_T_STATE */
+static uint32_t g_pb_pos_ms;      /* playback position (ms) */
+static uint32_t g_pb_dur_ms;      /* playback duration (ms) */
 
 static const osd_channel_cb_t *g_osd_cb; /* registered sink for MLM_T_STATUS's raw 0x09/0x11 frames */
 static void *g_osd_ctx;
@@ -88,9 +91,12 @@ void linkstate_poll(int fd)
             }
         } else if (hdr.type == MLM_T_STATE
                    && n >= (ssize_t) (sizeof hdr + sizeof(struct mlm_state))) {
-            struct mlm_state st;   /* ml-pipeline's current mode (recording, later playback) */
+            struct mlm_state st;   /* ml-pipeline's current mode (idle / recording / playback) */
             memcpy(&st, buf + sizeof hdr, sizeof st);
             g_pipeline_state = st.state;
+            g_pb_flags = st.flags;
+            g_pb_pos_ms = st.pos_ms;
+            g_pb_dur_ms = st.dur_ms;
         }
     }
 }
@@ -104,6 +110,33 @@ void linkstate_set_osd_cb(const osd_channel_cb_t *cb, void *ctx)
 int linkstate_pipeline_state(void)
 {
     return (int) g_pipeline_state;
+}
+
+int linkstate_playback(int *paused, unsigned *pos_ms, unsigned *dur_ms)
+{
+    if (paused) {
+        *paused = (g_pb_flags & MLM_STATE_F_PAUSED) != 0;
+    }
+
+    if (pos_ms) {
+        *pos_ms = g_pb_pos_ms;
+    }
+
+    if (dur_ms) {
+        *dur_ms = g_pb_dur_ms;
+    }
+
+    return g_pipeline_state == MLM_STATE_PLAYBACK;
+}
+
+int linkstate_playback_ended(void)
+{
+    return g_pipeline_state == MLM_STATE_PLAYBACK && (g_pb_flags & MLM_STATE_F_ENDED) != 0;
+}
+
+int linkstate_playback_rendering(void)
+{
+    return g_pipeline_state == MLM_STATE_PLAYBACK && (g_pb_flags & MLM_STATE_F_RENDERING) != 0;
 }
 
 int linkstate_airunit_connected(void)

@@ -155,17 +155,26 @@ void rec_push(struct ctx *c, GstBuffer *buf, GstClockTime pts)
 }
 
 /* Broadcast the current mode to the HUD on telemetry.sock (MLM_T_STATE). The pipeline is the source
- * of truth; the HUD reflects what we report. Sent on every change and re-asserted by state_tick, so
- * a HUD that starts late or drops a datagram reconverges.
+ * of truth; the HUD reflects what we report. Playback takes precedence over recording in the mode
+ * field and carries position/duration for the scrubber. Sent on every change and re-asserted by
+ * state_tick, so a HUD that starts late or drops a datagram reconverges.
  */
-static void send_state(struct ctx *c)
+void send_state(struct ctx *c)
 {
+    uint32_t mode = c->pb_active ? MLM_STATE_PLAYBACK
+                  : c->rec_on    ? MLM_STATE_RECORDING
+                                 : MLM_STATE_IDLE;
     struct {
         struct mlm_hdr h;
         struct mlm_state s;
     } __attribute__((packed)) rec = {
         .h = { .magic = MLM_MAGIC, .type = MLM_T_STATE, .flags = 0 },
-        .s = { .state = c->rec_on ? MLM_STATE_RECORDING : MLM_STATE_IDLE, .reserved = 0 },
+        .s = { .state = mode,
+               .flags = (c->pb_active && c->pb_paused ? MLM_STATE_F_PAUSED : 0)
+                      | (c->pb_active && c->pb_ended ? MLM_STATE_F_ENDED : 0)
+                      | (c->pb_active && c->pb_rendering ? MLM_STATE_F_RENDERING : 0),
+               .pos_ms = c->pb_active ? c->pb_pos_ms : 0,
+               .dur_ms = c->pb_active ? c->pb_dur_ms : 0 },
     };
     sendto(c->tsock, &rec, sizeof rec, MSG_DONTWAIT,
            (struct sockaddr *)&c->taddr, sizeof c->taddr);
@@ -230,19 +239,61 @@ gboolean state_tick(gpointer u)
 gboolean on_ctrl(gint fd, GIOCondition cond, gpointer u)
 {
     struct ctx *c = u;
-    struct {
-        struct mlm_hdr h;
-        struct mlm_cmd cmd;
-    } __attribute__((packed)) rec;
+    char buf[sizeof(struct mlm_hdr) + sizeof(struct mlm_cmd) + MLM_PATH_MAX];
+    const size_t head = sizeof(struct mlm_hdr) + sizeof(struct mlm_cmd);
 
     (void)cond;
-    ssize_t n = recv(fd, &rec, sizeof rec, MSG_DONTWAIT);
-    if (n < (ssize_t)sizeof rec || rec.h.magic != MLM_MAGIC || rec.h.type != MLM_T_CMD) {
+    ssize_t n = recv(fd, buf, sizeof buf - 1, MSG_DONTWAIT);
+    if (n < (ssize_t)head) {
         return G_SOURCE_CONTINUE;
     }
 
-    if (rec.cmd.cmd == MLM_CMD_REC_TOGGLE) {
-        rec_toggle(c);
+    struct mlm_hdr h;
+    struct mlm_cmd cmd;
+    memcpy(&h, buf, sizeof h);
+    memcpy(&cmd, buf + sizeof h, sizeof cmd);
+    if (h.magic != MLM_MAGIC || h.type != MLM_T_CMD) {
+        return G_SOURCE_CONTINUE;
+    }
+
+    /* MLM_CMD_PLAY carries a NUL-terminated path after the mlm_cmd; force-terminate defensively. */
+    buf[n] = '\0';
+    const char *path = (n > (ssize_t)head) ? buf + head : NULL;
+
+    switch (cmd.cmd) {
+        case MLM_CMD_REC_TOGGLE: {
+            rec_toggle(c);
+        } break;
+
+        case MLM_CMD_PLAY: {
+            if (path && *path) {
+                playback_play(c, path);
+            }
+        } break;
+
+        case MLM_CMD_PAUSE: {
+            playback_pause(c);
+        } break;
+
+        case MLM_CMD_RESUME: {
+            playback_resume(c);
+        } break;
+
+        case MLM_CMD_SEEK: {
+            playback_seek(c, cmd.arg);
+        } break;
+
+        case MLM_CMD_STOP: {
+            playback_stop(c, TRUE);
+        } break;
+
+        case MLM_CMD_SPEED: {
+            playback_set_speed(c, (gint32)cmd.arg);   /* arg is the signed multiplier bit-cast */
+        } break;
+
+        default: {
+            /* unknown command: ignore (forward-compatible) */
+        } break;
     }
 
     return G_SOURCE_CONTINUE;

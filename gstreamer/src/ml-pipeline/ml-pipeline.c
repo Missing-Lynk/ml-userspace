@@ -32,7 +32,7 @@
 
 
 /* file mode's per-decoded-frame FRAMESTATS probe (unchanged). */
-static GstPadProbeReturn on_frame(GstPad *pad, GstPadProbeInfo *info, gpointer u)
+GstPadProbeReturn on_frame(GstPad *pad, GstPadProbeInfo *info, gpointer u)
 {
     struct ctx *c = u;
     GstBuffer *buf = GST_PAD_PROBE_INFO_BUFFER(info);
@@ -112,7 +112,7 @@ static void setup_appsrc(struct ctx *c, int ch)
  * planes, so gstv4l2videodec silently normalize-COPIES every tile-1 frame into system
  * memory (~the entire historical tile-1 slowness/allocator=sysmem asymmetry).
  */
-static GstPadProbeReturn asink_alloc_probe(GstPad *pad, GstPadProbeInfo *info, gpointer u)
+GstPadProbeReturn asink_alloc_probe(GstPad *pad, GstPadProbeInfo *info, gpointer u)
 {
     GstQuery *q = GST_PAD_PROBE_INFO_QUERY(info);
 
@@ -139,20 +139,13 @@ static void setup_appsink(struct ctx *c, int ch)
     c->asink[ch] = GST_APP_SINK(e);
 }
 
-static int run_rf(struct ctx *c, int plane, int drm_fd)
+/* Build the RF decode graph (two wave5 H.265 decoders -> appsinks), reset the per-session
+ * pairing/flow-control state, add its bus watch, go PLAYING, and start the UDP rx thread.
+ * Called at session start and after every playback swap. */
+int rf_decode_start(struct ctx *c)
 {
-    /* Two decoders -> two appsinks (raw I420 tiles); a compositor thread pairs them by PTS,
-     * DMA-blits both into one 1920x1080 I420 composite, and hands it to the custom DRM/KMS
-     * display sink (drm_disp_*), which flips it onto the primary plane and retires the buffer
-     * only when the NEXT frame's page-flip completes - the vendor's retire-after-scanout model,
-     * replacing kmssink (whose skip-vsync release freed the buffer before the flip latched, so
-     * the pool overwrote a buffer the DC was still scanning). The decode pipeline is rebuilt on
-     * each session restart; the display sink persists (holds the DRM fd, keeps the last frame on
-     * the panel across a restart, the vendor behavior).
-     */
     GError *err = NULL;
-    (void)plane;   /* the composite owns the CRTC primary plane via page-flip, no plane-id arg */
-    c->drm_fd = drm_fd;
+
     /* NOTE: dec0 exports its decoded buffers as dmabuf (so tile 0 DMA-blits), but dec1 gives
      * non-dmabuf memory (tile 1 CPU-falls-back) - a wave5 asymmetry tied to the 552-row / meta-less
      * tile, NOT fixed by capture-io-mode=dmabuf (tried, no effect). Full-DMA needs a wave5/v4l2
@@ -169,52 +162,71 @@ static int run_rf(struct ctx *c, int plane, int drm_fd)
     setup_appsrc(c, 1);
     setup_appsink(c, 0);
     setup_appsink(c, 1);
-    pthread_mutex_init(&c->comp_lock, NULL);
+
+    /* fresh session: wait for each tile's next IDR, no stale outputs, empty holds */
     c->last_fid = -1;
+    c->started[0] = c->started[1] = FALSE;
+    c->samples[0] = c->samples[1] = 0;
+    c->sent[0] = c->sent[1] = 0;
+    c->drop_sync[0] = c->drop_sync[1] = FALSE;
+    c->discard_before[0] = c->discard_before[1] = 0;
+    c->t1_nhold = 0;
+    c->t1_released = FALSE;
+    c->t0_nhold = 0;
+    c->tile_w[0] = c->tile_w[1] = 0;
+    c->tile_h[0] = c->tile_h[1] = 0;
 
-    c->lsock = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-    c->laddr.sun_family = AF_UNIX;
-    strncpy(c->laddr.sun_path, MLM_LINK_SOCK, sizeof c->laddr.sun_path - 1);
-
-    /* ctrl.sock: the HUD record button (and the ml-rec test tool) send MLM_T_CMD here. Bind is
-     * best-effort - if it fails the pipeline still runs, just without external record control.
-     */
-    c->ctrl_sock = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-    if (c->ctrl_sock >= 0) {
-        struct sockaddr_un ca = { .sun_family = AF_UNIX };
-        strncpy(ca.sun_path, MLM_CTRL_SOCK, sizeof ca.sun_path - 1);
-        unlink(MLM_CTRL_SOCK);
-        if (bind(c->ctrl_sock, (struct sockaddr *)&ca, sizeof ca) < 0) {
-            perror("ml-pipeline: bind ctrl.sock");
-            close(c->ctrl_sock);
-            c->ctrl_sock = -1;
-        }
-    }
-
-    c->loop = g_main_loop_new(NULL, FALSE);
     GstBus *bus = gst_element_get_bus(c->pipe);
-    gst_bus_add_watch(bus, on_bus, c);
-    g_unix_signal_add(SIGINT, on_signal, c);
-    g_unix_signal_add(SIGTERM, on_signal, c);
-    g_unix_signal_add(SIGUSR1, on_sigusr1, c);
-    if (c->ctrl_sock >= 0) {
-        g_unix_fd_add(c->ctrl_sock, G_IO_IN, on_ctrl, c);
-    }
-    guint ready_id = g_timeout_add_seconds(2, rf_ready_tick, c);
-    guint state_id = g_timeout_add_seconds(1, state_tick, c);   /* re-assert MLM_T_STATE to the HUD */
+    c->rf_bus_watch = gst_bus_add_watch(bus, on_bus, c);
+    gst_object_unref(bus);
 
-    /* Plane-scanout by default (plans/gst-plane-scanout.md): tiles ride video0/video1
-     * directly, zero blits, no composite pool. ML_COMPOSE=1 forces the old composite
-     * path (e.g. when the HUD needs bank 1). Falls back automatically if the plane
-     * setup fails.
-     */
+    gst_element_set_state(c->pipe, GST_STATE_PLAYING);
+    c->rx_run = 1;
+    pthread_create(&c->rx_thread, NULL, rf_rx, c);
+
+    return 0;
+}
+
+/* Tear the RF decode graph down to NULL (the one warm wave5 operation proven safe), stop the
+ * rx thread, drop the pairing slots and any held AUs. Leaves the display sink alone. */
+void rf_decode_stop(struct ctx *c)
+{
+    c->rx_run = 0;
+    pthread_join(c->rx_thread, NULL);
+    if (c->rf_bus_watch) {
+        g_source_remove(c->rf_bus_watch);
+        c->rf_bus_watch = 0;
+    }
+
+    gst_element_set_state(c->pipe, GST_STATE_NULL);
+    gst_element_get_state(c->pipe, NULL, NULL, GST_CLOCK_TIME_NONE);
+    clear_pending(c);
+
+    for (int i = 0; i < c->t1_nhold; i++) {
+        gst_buffer_unref(c->t1_hold[i]);
+    }
+
+    c->t1_nhold = 0;
+    for (int i = 0; i < c->t0_nhold; i++) {
+        gst_buffer_unref(c->t0_hold[i]);
+    }
+
+    c->t0_nhold = 0;
+    gst_object_unref(c->pipe);
+    c->pipe = NULL;
+}
+
+/* Bring the RF display sink up in its chosen mode (plane scanout by default; composite when the
+ * HUD/DVR needs a free overlay bank). Records the mode in c->rf_planes so playback can restore
+ * it. Returns 0 on success. */
+static int rf_display_init(struct ctx *c, int drm_fd)
+{
     c->planes_on = !getenv("ML_COMPOSE");
     if (getenv("ML_DVR") && c->planes_on) {
         /* DVR encodes the composite; plane scanout builds no composite. Force composite mode. */
         fprintf(stderr, "ml-pipeline: ML_DVR set -> forcing composite mode (plane scanout has no composite to encode)\n");
         c->planes_on = FALSE;
     }
-    c->dmablit_fd = -1;
     if (c->planes_on && drm_disp_init(c) == 0) {
         /* Gate bounds: display holds at most 4 pairs (next/pending/front/prev) of the
          * ~9-buffer decoder capture pools; keep unpaired skew small so parked halves
@@ -231,62 +243,119 @@ static int run_rf(struct ctx *c, int plane, int drm_fd)
         }
         printf("ml-pipeline: rf -> composite 1920x1080 via custom DRM sink, drm fd %d, :%d\n",
                drm_fd, RF_VIDEO_PORT);
-        if (!comp_pool_init(c)) {
+
+        drm_make_idle_fb(c);   /* reserve the park FB BEFORE the pool grabs the CMA */
+        if (c->comp_n == 0 && !comp_pool_init(c)) {   /* pool is allocated once, reused across swaps */
             fprintf(stderr, "ml-pipeline: composite dma-heap pool init failed "
                             "(CONFIG_DMABUF_HEAPS_CMA? enough CMA?)\n");
             return 1;
         }
+
         if (drm_disp_init(c)) {
             fprintf(stderr, "ml-pipeline: DRM display sink init failed\n");
             return 1;
         }
-        /* Increment 2: off-CPU tile blit via the AXI DMA engine. Optional - if /dev/ml-dmablit
-         * is absent (ml_dmablit.ko not loaded) or a tile is not a packed dmabuf, on_tile
-         * CPU-blits.
-         */
-        c->dmablit_fd = open("/dev/ml-dmablit", O_RDWR | O_CLOEXEC);
-        fprintf(stderr, "ml-pipeline: tile blit = %s\n",
-                c->dmablit_fd >= 0 ? "DMA (ml_dmablit) with CPU fallback" :
-                "CPU only (/dev/ml-dmablit not available - load ml_dmablit.ko for DMA)");
+
+        if (c->dmablit_fd < 0) {
+            /* off-CPU tile blit via the AXI DMA engine. Optional - if /dev/ml-dmablit is absent
+             * (ml_dmablit.ko not loaded) or a tile is not a packed dmabuf, on_tile CPU-blits.
+             */
+            c->dmablit_fd = open("/dev/ml-dmablit", O_RDWR | O_CLOEXEC);
+            fprintf(stderr, "ml-pipeline: tile blit = %s\n",
+                    c->dmablit_fd >= 0 ? "DMA (ml_dmablit) with CPU fallback" :
+                    "CPU only (/dev/ml-dmablit not available - load ml_dmablit.ko for DMA)");
+        }
+    }
+    c->rf_planes = c->planes_on;
+    return 0;
+}
+
+static int run_rf(struct ctx *c, int plane, int drm_fd)
+{
+    /* The RF session: the display sink (drm_disp_*) persists for the whole run while the decode
+     * graph is (re)built by rf_decode_start/stop - on session restart AND on a playback swap
+     * (a selected file preempts the live stream via the ctrl.sock PLAY command). */
+    (void)plane;   /* the composite owns the CRTC primary plane via page-flip, no plane-id arg */
+    c->drm_fd = drm_fd;
+    c->dmablit_fd = -1;
+    pthread_mutex_init(&c->comp_lock, NULL);
+
+    c->lsock = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    c->laddr.sun_family = AF_UNIX;
+    strncpy(c->laddr.sun_path, MLM_LINK_SOCK, sizeof c->laddr.sun_path - 1);
+
+    /* ctrl.sock: the HUD (record button, playback controls) and the ml-rec/ml-play test tools
+     * send MLM_T_CMD here. Bind is best-effort - if it fails the pipeline still runs, just
+     * without external control.
+     */
+    c->ctrl_sock = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (c->ctrl_sock >= 0) {
+        struct sockaddr_un ca = { .sun_family = AF_UNIX };
+        strncpy(ca.sun_path, MLM_CTRL_SOCK, sizeof ca.sun_path - 1);
+        unlink(MLM_CTRL_SOCK);
+        if (bind(c->ctrl_sock, (struct sockaddr *)&ca, sizeof ca) < 0) {
+            perror("ml-pipeline: bind ctrl.sock");
+            close(c->ctrl_sock);
+            c->ctrl_sock = -1;
+        }
     }
 
-    gst_element_set_state(c->pipe, GST_STATE_PLAYING);
+    c->loop = g_main_loop_new(NULL, FALSE);
+    g_unix_signal_add(SIGINT, on_signal, c);
+    g_unix_signal_add(SIGTERM, on_signal, c);
+    g_unix_signal_add(SIGUSR1, on_sigusr1, c);
+    if (c->ctrl_sock >= 0) {
+        g_unix_fd_add(c->ctrl_sock, G_IO_IN, on_ctrl, c);
+    }
+    guint ready_id = g_timeout_add_seconds(2, rf_ready_tick, c);
+    guint state_id = g_timeout_add_seconds(1, state_tick, c);   /* re-assert MLM_T_STATE to the HUD */
+
+    if (rf_display_init(c, drm_fd)) {
+        return 1;
+    }
+
+    if (rf_decode_start(c)) {
+        return 1;
+    }
+
     if (getenv("ML_DVR")) {
         rec_start(c, getenv("ML_DVR"));   /* auto-start recording for the session */
     }
 
-    c->rx_run = 1;
-    pthread_create(&c->rx_thread, NULL, rf_rx, c);
     g_main_loop_run(c->loop);
 
-    c->rx_run = 0;
-    pthread_join(c->rx_thread, NULL);
-    rec_stop(c);   /* finalize the DVR MP4 before tearing down decoders (composites have stopped) */
+    /* Teardown. During playback the RF graph is already down and the display sink is in
+     * single-stream mode, so let playback_stop unwind it; otherwise tear RF down directly. */
+    rec_stop(c);   /* finalize the DVR MP4 before tearing down decoders */
+    if (c->pb_active) {
+        playback_stop(c, FALSE);   /* tears the playback pipe + display down, no RF resume */
+    } else {
+        /* Scanout FIRST, decoders second: in plane mode the DC is fetching the decoders' own
+         * dmabufs, so the planes must be off (and latched off) before the gst teardown starts
+         * releasing capture pools. The reverse order left a window where the DC fetched
+         * buffers whose owner was mid-teardown (a mode-switch hard hang).
+         */
+        drm_disp_shutdown(c);
+        rf_decode_stop(c);
+    }
+
     g_source_remove(ready_id);
     g_source_remove(state_id);
+
     if (c->ctrl_sock >= 0) {
         close(c->ctrl_sock);
         unlink(MLM_CTRL_SOCK);
     }
-    /* Scanout FIRST, decoders second: in plane mode the DC is fetching the decoders' own
-     * dmabufs, so the planes must be off (and latched off) before the gst teardown starts
-     * releasing capture pools. The reverse order left a window where the DC fetched
-     * buffers whose owner was mid-teardown (a mode-switch hard hang).
-     */
-    drm_disp_shutdown(c);
-    gst_element_set_state(c->pipe, GST_STATE_NULL);
-    clear_pending(c);
 
     printf("ml-pipeline: rf done. rx=%llu bad_hdr=%llu bad_crc=%llu pushed=%llu composed=%llu\n",
            (unsigned long long)c->rx_pkts, (unsigned long long)c->rx_bad_hdr,
            (unsigned long long)c->rx_bad_crc, (unsigned long long)c->rx_pushed,
            (unsigned long long)c->composed);
 
-    gst_object_unref(bus);
-    gst_object_unref(c->pipe);
     if (c->dmablit_fd >= 0) {
         close(c->dmablit_fd);
     }
+
     return 0;
 }
 
@@ -294,13 +363,14 @@ static int run_rf(struct ctx *c, int plane, int drm_fd)
  * drm_disp mailbox (no composite pool, no kmssink). The sample is held in the ditem until the flip
  * retires it, keeping the decoder buffer alive while it is on screen. Zero-copy.
  */
-static GstFlowReturn on_file_sample(GstAppSink *sink, gpointer u)
+GstFlowReturn on_file_sample(GstAppSink *sink, gpointer u)
 {
     struct ctx *c = u;
     GstSample *s = gst_app_sink_pull_sample(sink);
     if (!s) {
         return GST_FLOW_OK;
     }
+
     GstBuffer *buf = gst_sample_get_buffer(s);
     struct tileview t;
     GstMapInfo m;
@@ -309,21 +379,28 @@ static GstFlowReturn on_file_sample(GstAppSink *sink, gpointer u)
         gst_sample_unref(s);
         return GST_FLOW_OK;
     }
+
     int fd = t.fd;
     gst_buffer_unmap(buf, &m);   /* only the fd + geometry are needed to build the scanout FB */
     if (fd < 0) {                /* not a single-dmabuf buffer -> cannot scan out zero-copy */
         gst_sample_unref(s);
         return GST_FLOW_OK;
     }
+
     guint32 fb = tile_fb_get(c, 0, &t);
     if (!fb) {
         gst_sample_unref(s);
         return GST_FLOW_OK;
     }
+
     struct ditem it = { .cbi = -1 };
     it.smp[0] = s;               /* ownership -> display thread; released on retirement */
     it.fb[0] = fb;
     drm_disp_submit(c, &it, GST_BUFFER_PTS(buf));
+    if (c->pb_active && !c->pb_rendering) {
+        c->pb_rendering = TRUE;   /* first clip frame is on its way to the panel; unblock the HUD */
+    }
+
     return GST_FLOW_OK;
 }
 
@@ -392,6 +469,7 @@ static int run_file(struct ctx *c, const char *file, int plane, int drm_fd)
 
 int main(int argc, char **argv)
 {
+    setvbuf(stdout, NULL, _IOLBF, 0);   /* line-buffered: logs reach the service log promptly */
     gst_init(&argc, &argv);
     crc32_init();
     if (argc < 2) {
@@ -424,5 +502,6 @@ int main(int argc, char **argv)
         int plane = (argc > 2) ? atoi(argv[2]) : 33;
         rc = run_file(&c, argv[1], plane, drm_fd);
     }
+
     return rc;
 }

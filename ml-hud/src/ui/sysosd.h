@@ -37,6 +37,9 @@ void sysosd_set_menu_open(int open);
 /** @brief Show or hide the red "REC" indicator (driven by ml-pipeline's reported state). */
 void sysosd_set_recording(int recording);
 
+/** @brief Show or hide the whole System OSD bar (playback hides it, leaving only the transport bar). */
+void sysosd_set_visible(int visible);
+
 /** @brief Force a full repaint of the bar. Call after another layer (a full BTFL redraw on menu close)
  *         has overwritten the shared overlay under the strip.
  */

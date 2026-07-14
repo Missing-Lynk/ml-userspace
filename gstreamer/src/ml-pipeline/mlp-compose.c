@@ -8,7 +8,7 @@
  * the panel. The `reserved` heap is the no-map uncached-coherent carveout: CPU writes land
  * in DDR directly, so what we compose is what the DC fetches. Prefer it; ML_HEAP overrides.
  */
-static int ml_heap_alloc(gsize len)
+int ml_heap_alloc(gsize len)
 {
     struct dma_heap_allocation_data a = { .len = len, .fd_flags = O_RDWR | O_CLOEXEC };
     struct dirent *de;

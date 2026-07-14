@@ -33,6 +33,21 @@ int linkstate_airunit_connected(void);
  *  reconverges after a HUD or pipeline restart. */
 int linkstate_pipeline_state(void);
 
+/**
+ * @brief Playback progress from the pipeline's MLM_T_STATE.
+ * @param paused  out: 1 if playback is paused (may be NULL).
+ * @param pos_ms  out: current position in ms (may be NULL).
+ * @param dur_ms  out: clip duration in ms (may be NULL).
+ * @return 1 if a file is currently playing back, 0 otherwise.
+ */
+int linkstate_playback(int *paused, unsigned *pos_ms, unsigned *dur_ms);
+
+/** @brief Whether the current clip has reached end-of-clip (last frame held, awaiting replay/exit). */
+int linkstate_playback_ended(void);
+
+/** @brief Whether the first decoded frame of the current clip is on the display (playback visible). */
+int linkstate_playback_rendering(void);
+
 /** @brief Close the seam. */
 void linkstate_close(int fd);
 

@@ -414,9 +414,13 @@ int main(int argc, char **argv)
             input_drain(input_fd, on_button, &h);
         }
 
-        linkstate_poll(link_fd);   /* drain link/telemetry datagrams; updates air-unit + pipeline state */
+        /* drain link/telemetry datagrams; updates air-unit + pipeline state */
+        linkstate_poll(link_fd);
         if (have_drm) {
             sysosd_set_recording(linkstate_pipeline_state() == MLM_STATE_RECORDING);
+
+            /* track the playback scrubber at loop rate, not the 1 s OSD cadence */
+            menu_playback_tick();
         }
 
         /* Beeps: end any finished key tone; run the low-voltage alarm on its own cadence. */

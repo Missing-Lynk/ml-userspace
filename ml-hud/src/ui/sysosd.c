@@ -27,6 +27,7 @@ static lv_obj_t *g_lbl_temp;         /* SoC temperature; gated by the Show Tempe
 static lv_obj_t *g_lbl_rec;          /* red "REC"; shown only while ml-pipeline reports recording */
 
 static int g_menu_open;
+static int g_force_hidden;            /* playback hides the whole bar, overriding the setting */
 static int g_alarm_active;           /* set each update; read by the blink timer */
 static int g_blink_on = 1;
 
@@ -131,6 +132,20 @@ void sysosd_set_recording(int recording)
     }
 }
 
+void sysosd_set_visible(int visible)
+{
+    if (g_osd == NULL) {
+        return;
+    }
+
+    g_force_hidden = !visible;   /* latched: sysosd_update must not override it each tick */
+    if (visible) {
+        lv_obj_remove_flag(g_osd, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(g_osd, LV_OBJ_FLAG_HIDDEN);   /* playback shows only the transport bar */
+    }
+}
+
 void sysosd_invalidate(void)
 {
     if (g_osd != NULL) {
@@ -141,6 +156,12 @@ void sysosd_invalidate(void)
 void sysosd_update(const telemetry_t *telemetry, settings_t *settings)
 {
     if (g_osd == NULL) {
+        return;
+    }
+
+    /* Playback hides the bar outright, leaving only the transport overlay. */
+    if (g_force_hidden) {
+        lv_obj_add_flag(g_osd, LV_OBJ_FLAG_HIDDEN);
         return;
     }
 

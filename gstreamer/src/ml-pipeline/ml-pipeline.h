@@ -211,6 +211,9 @@ struct ctx {
     guint32 pp_srcw[2], pp_srch[2], pp_cx[2], pp_cy[2], pp_cw[2], pp_ch[2];
     guint32 pp_srcx[2], pp_srcy[2];
     guint32 prim_fb, prim_dumb;         /* static black primary FB (CRTC keystone) + its dumb handle */
+    guint32 idle_fb, idle_dumb;         /* persistent black primary FB the CRTC parks on across
+                                         * decode-graph swaps, so tearing a graph down never leaves
+                                         * the DC fetching a freed FB (which powers the panel off) */
     int tile_w[2], tile_h[2];           /* per-tile geometry, latched from the first sample */
     struct tfb { int fd; guint32 fb, handle; } tfb[2][32];  /* per-decoder dmabuf-fd -> FB cache */
     int ntfb[2];
@@ -264,6 +267,21 @@ struct ctx {
                                              and pair stale halves with fresh ones - drop them
                                              */
     guint64 stale_drop;
+
+    /* Playback (mlp-playback.c): a selected file preempts the live RF stream. The RF decode
+     * pipeline is torn down to NULL and rebuilt around playback (the proven session-restart
+     * teardown), so only one wave5 decode graph is ever live and the display sink is
+     * re-initialised for the single-stream scanout. */
+    gboolean pb_active;                 /* a file is currently playing (preempts RF) */
+    gboolean pb_paused;
+    gboolean pb_ended;                  /* reached EOS: last frame held, awaiting replay or exit */
+    gboolean pb_rendering;              /* first decoded frame has been submitted to the display */
+    GstElement *pb_pipe;                /* filesrc -> demux -> parse -> wave5 dec -> appsink */
+    guint pb_timer;                     /* position-telemetry timeout id (0 = none) */
+    guint pb_bus_watch;                 /* bus watch id on pb_pipe */
+    guint32 pb_pos_ms, pb_dur_ms;       /* last queried playback position + duration */
+    gboolean rf_planes;                 /* RF display mode (planes_on) to restore after playback */
+    guint rf_bus_watch;                 /* bus watch id on the RF pipe (re-added on each rebuild) */
 };
 
 
@@ -288,6 +306,7 @@ gboolean map_tile(GstSample *s, GstBuffer *buf, GstMapInfo *m, struct tileview *
 void emit_framestats(struct ctx *c, GstClockTime pts);
 
 /* compose */
+int ml_heap_alloc(gsize len);
 void ml_dmabuf_sync(int fd, int start);
 gboolean comp_pool_init(struct ctx *c);
 GstBuffer *comp_get(struct ctx *c, int *idx_out);
@@ -300,11 +319,13 @@ void drm_disp_submit(struct ctx *c, const struct ditem *it, GstClockTime pts);
 guint32 tile_fb_get(struct ctx *c, int ch, const struct tileview *t);
 int drm_disp_init(struct ctx *c);
 void drm_disp_shutdown(struct ctx *c);
+int drm_make_idle_fb(struct ctx *c);
 
 /* record */
 int rec_start(struct ctx *c, const char *path);
 void rec_stop(struct ctx *c);
 void rec_push(struct ctx *c, GstBuffer *buf, GstClockTime pts);
+void send_state(struct ctx *c);
 gboolean state_tick(gpointer u);
 gboolean on_ctrl(gint fd, GIOCondition cond, gpointer u);
 
@@ -313,5 +334,23 @@ GstFlowReturn on_tile(GstAppSink *sink, gpointer u);
 void clear_pending(struct ctx *c);
 void *rf_rx(void *arg);
 gboolean rf_ready_tick(gpointer u);
+
+/* rf decode-graph lifecycle (ml-pipeline.c) - built/torn down around playback swaps */
+int rf_decode_start(struct ctx *c);
+void rf_decode_stop(struct ctx *c);
+
+/* single-stream file scanout callbacks (ml-pipeline.c), shared by CLI file mode + playback */
+GstFlowReturn on_file_sample(GstAppSink *sink, gpointer u);
+GstPadProbeReturn on_frame(GstPad *pad, GstPadProbeInfo *info, gpointer u);
+GstPadProbeReturn asink_alloc_probe(GstPad *pad, GstPadProbeInfo *info, gpointer u);
+
+/* playback (mlp-playback.c) - driven by ctrl.sock commands */
+void playback_play(struct ctx *c, const char *path);
+void playback_pause(struct ctx *c);
+void playback_resume(struct ctx *c);
+void playback_seek(struct ctx *c, guint32 permille);
+void playback_set_speed(struct ctx *c, gint32 speed);
+void playback_end(struct ctx *c);
+void playback_stop(struct ctx *c, gboolean resume_live);
 
 #endif /* ML_PIPELINE_H */

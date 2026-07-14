@@ -14,6 +14,7 @@
 
 int main(int argc, char **argv)
 {
+    setvbuf(stdout, NULL, _IONBF, 0);   /* unbuffered: survive being killed mid-capture */
     const char *path = MLM_TELEMETRY_SOCK;
     if (argc > 1 && !strcmp(argv[1], "osd")) {
         path = MLM_OSD_SOCK;

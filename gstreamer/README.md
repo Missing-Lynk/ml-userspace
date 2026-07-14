@@ -80,6 +80,17 @@ Architecture facts (each one paid for in bricked runs - do not regress them):
 
 Testbed (no RF hardware needed): `glue/capture/make-synth-session.py` renders a testsrc2 clip with a huge frame counter ACROSS the tile seam, tiles + encodes it FPV-shape, and wraps bit-exact RF datagrams into a `.rfdump`; `glue/capture/rf-replay.py --dump` does the same from a real pcap. The static `glue/capture/ml-rf-replay.c` plays a `.rfdump` ON the goggle to `127.0.0.1:10001` (`ip link set lo up` first - slot B boots with lo down; host->goggle UDP over the USB gadget wedges it). `--loop` wraps FrameId and exercises the session-restart path every pass.
 
+## Playback: a recording preempts the live stream (`mlp-playback.c`)
+
+Selecting a clip in the HUD's Playback list sends `MLM_CMD_PLAY <path>` on `ctrl.sock`; the pipeline preempts the live RF feed and plays the file, returning to live on stop or end. Because only one wave5 decode graph may be live, PLAY tears the RF graph down to NULL and re-inits the display sink for single-stream scanout (`qtdemux ! h264parse ! v4l2h264dec` for the DVR's H.264/MP4, a direct parser for a raw elementary stream), then decodes the file and scans each frame out on the primary CRTC via the same custom DRM sink. The graph swap parks the CRTC on a persistent idle FB first, so tearing a graph down never leaves the DC fetching a freed framebuffer (that powers the panel off - the swap wedge). The playback appsink needs the same GstVideoMeta allocation probe as RF mode, or the decoder normalize-copies to system memory and the zero-copy scanout drops every frame.
+
+Transport, all over `ctrl.sock` (`MLM_CMD_PAUSE/RESUME/STOP/SPEED`):
+- **Speed** is a single rate seek (no periodic seeking), with trickmode key-units above 1x so wave5 only emits keyframes and never falls behind at 4x/8x. Forward (2/4/8x) is validated; **reverse is unproven on wave5** (reverse trickmode) - the fallback is periodic backward seeks. A live wave5 flush-seek is a known stall risk, so `MLM_CMD_SEEK` (position seek, `playback_seek`) exists but is exercised only by the `ml-play` CLI, not the HUD.
+- **End of clip** holds the last frame (the graph *pauses*, it is not torn down, so the last sample stays pinned and lit) and publishes `MLM_STATE_F_ENDED`; the HUD then replays or exits.
+- **First-frame signal**: the first decoded frame submitted to the display sets `MLM_STATE_F_RENDERING`, which the HUD waits on to drop its loading spinner and reveal the transport bar - so the ~1 s decoder warm-up hides behind the menu instead of showing the idle splash.
+
+State (mode + paused/ended/rendering flags + position/duration) is published to the HUD as `MLM_T_STATE` at ~5 Hz for the scrubber. Duration for the scrubber is the HUD's own MP4-header parse, not the pipeline's live duration (which grows for fragmented recordings).
+
 ## Platform facts baked into the scripts (details in the script comments)
 
 - `kmssink` needs `driver-name=artosyn-vo plane-id=33`: its auto-probe knows neither our driver name nor that plane 0 is the scanout primary (its auto-pick grabs the ARGB4444 overlay and fails caps negotiation).
