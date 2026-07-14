@@ -27,4 +27,10 @@ void pipecmd_playback_stop(void);
 /** @brief Set play speed: 1 = normal, 2/4/8 fast-forward, -2/-4/-8 rewind. */
 void pipecmd_playback_speed(int speed);
 
+/**
+ * @brief Ask ml-pipeline to show the no-signal splash instead of the last decoded frame.
+ *  Sent when the live RF link drops; the pipeline resumes video on its own when frames return.
+ */
+void pipecmd_show_nosignal(void);
+
 #endif /* HUD_PIPECMD_H */

@@ -291,6 +291,17 @@ gboolean on_ctrl(gint fd, GIOCondition cond, gpointer u)
             playback_set_speed(c, (gint32)cmd.arg);   /* arg is the signed multiplier bit-cast */
         } break;
 
+        case MLM_CMD_SHOW_IDLE: {
+            /* Live link dropped: park on the no-signal splash instead of the last decoded frame.
+             * Never during playback - a file owns the display. The display thread does the actual
+             * flip (it owns every DRM commit); we just raise the flag and kick it awake.
+             */
+            if (!c->pb_active) {
+                c->show_idle = 1;
+                pipe_wake(c->wake_w);
+            }
+        } break;
+
         default: {
             /* unknown command: ignore (forward-compatible) */
         } break;

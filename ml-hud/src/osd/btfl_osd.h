@@ -56,4 +56,16 @@ void btfl_osd_invalidate(void);
 int btfl_osd_update(surface_t *dst, const unsigned char *canvas, int len,
                     rect_t *rects, int max_rects);
 
+/**
+ * @brief Blank every currently-drawn cell in @p dst and empty the grid, without a new canvas. Used
+ *        when the link drops so the last MSP OSD frame does not linger over the no-signal splash;
+ *        btfl_osd_update alone cannot clear it because no further frames arrive. Only glyphed cells
+ *        are touched, so a co-drawn layer (e.g. the System OSD bar) is left intact.
+ * @param rects     Filled with the cleared cells' screen rectangles.
+ * @param max_rects Capacity of @p rects.
+ * @return >0 = that many dirty rectangles to present; 0 = nothing was drawn (skip present); -1 = more
+ *         cells cleared than @p max_rects (present the whole surface).
+ */
+int btfl_osd_clear(surface_t *dst, rect_t *rects, int max_rects);
+
 #endif /* HUD_BTFL_OSD_H */

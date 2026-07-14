@@ -71,6 +71,7 @@ typedef struct {
     int            rec_autostop_sent;  /* latch: the "stream lost" record-stop toggle was already sent */
     int            rec_autostart_sent; /* latch: the "stream up" auto-record start toggle was already sent */
     int            rec_is_auto;        /* the current recording was started by auto-record (not the button) */
+    int            nosignal_sent;      /* latch: the "stream lost" no-signal-splash command was already sent */
     long           osd_frames;
     long           rendered;
     uint16_t       last_voltage_mV;
@@ -466,6 +467,31 @@ int main(int argc, char **argv)
         if (!autorecord && recording && h.rec_is_auto) {
             pipecmd_record_toggle();
             h.rec_is_auto = 0;
+        }
+
+        /* No-signal splash: when the link drops during live view, ask the pipeline to park on the
+         * default no-signal frame instead of holding the last decoded frame. Latched to fire once
+         * per drop; the latch clears on reconnect and the pipeline resumes video on its own when
+         * frames return. Only in live (IDLE) mode - playback owns the display itself.
+         */
+        if (!connected && state == MLM_STATE_IDLE && linkstate_pipeline_seen() && !h.nosignal_sent) {
+            pipecmd_show_nosignal();
+            h.nosignal_sent = 1;
+
+            /* Clear the last MSP OSD frame off the overlay once, so stale FC glyphs do not linger over
+             * the no-signal splash. Only in the flying view (menu closed) - with the menu up the OSD
+             * is hidden and the surface is the menu's to draw. btfl_osd_clear leaves the System OSD
+             * bar intact.
+             */
+            if (have_drm && hud_btfl_visible(h.state)) {
+                rect_t rects[128];
+                int n = btfl_osd_clear(h.fb, rects, (int) (sizeof(rects) / sizeof(rects[0])));
+                if (n != 0) {
+                    drm_overlay_present(h.drm, h.fb, rects, n);
+                }
+            }
+        } else if (connected) {
+            h.nosignal_sent = 0;
         }
 
         if (have_drm) {

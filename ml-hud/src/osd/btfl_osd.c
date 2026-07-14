@@ -180,3 +180,41 @@ int btfl_osd_update(surface_t *dst, const unsigned char *canvas, int len, rect_t
 
     return count;
 }
+
+int btfl_osd_clear(surface_t *dst, rect_t *rects, int max_rects)
+{
+    if (dst == NULL || dst->px == NULL || !msp_font_loaded()) {
+        return 0;
+    }
+
+    int count = 0;
+    int overflow = 0;
+    for (int r = 0; r < BTFL_OSD_ROWS; r++) {
+        for (int c = 0; c < BTFL_OSD_COLS; c++) {
+            /* Empty cells drew nothing, so there is nothing to clear. */
+            if (g_grid[r][c] == CELL_EMPTY) {
+                continue;
+            }
+
+            draw_cell(dst, r, c, CELL_EMPTY);   /* paint the cell back to the background */
+            g_grid[r][c] = CELL_EMPTY;
+
+            if (count < max_rects) {
+                rects[count] = cell_rect(r, c);
+            } else {
+                overflow = 1;
+            }
+            count++;
+        }
+    }
+
+    if (count == 0) {
+        return 0;
+    }
+
+    if (overflow) {
+        return -1;
+    }
+
+    return count;
+}

@@ -224,6 +224,10 @@ struct ctx {
                                          * DC registers via /dev/mem, which hangs the device)
                                          */
     int modeset_done;
+    volatile int show_idle;             /* HUD asked (via MLM_CMD_SHOW_IDLE) to park on the no-signal
+                                         * splash: the live link dropped. Set on the ctrl thread, read
+                                         * by the display thread; a returning video frame clears it. */
+    int idle_shown;                     /* display-thread-only: the no-signal splash is currently up */
 
     /* Stagger: hold a FEW tile-1 AUs so the two wave5 instances do not start allocating at
      * the identical instant. Deliberately small: the hold becomes a PERMANENT decode lag
@@ -296,6 +300,21 @@ struct tileview {
     int fd;                    /* source dmabuf fd for the DMA blit, or -1 if not dmabuf-backed */
     gsize yoff, uoff, voff;    /* plane byte offsets within fd (parallel the y/u/v CPU pointers) */
 };
+
+/* Kick the display thread's poll loop via its self-pipe. The pipe is O_NONBLOCK, so a full
+ * buffer (EAGAIN) means a wake token is already pending and the reader will drain it; any
+ * error is therefore safe to ignore. Named helper so the ignored result is intentional, not
+ * a bare empty-braced guard.
+ */
+static inline void pipe_wake(int fd)
+{
+    const char w = 1;
+    ssize_t n;
+
+    do {
+        n = write(fd, &w, 1);
+    } while (n < 0 && errno == EINTR);
+}
 
 /* cross-file prototypes; file-local helpers stay static in their .c */
 /* util */
