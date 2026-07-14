@@ -28,6 +28,11 @@ static uint32_t g_pb_dur_ms;      /* playback duration (ms) */
 static const osd_channel_cb_t *g_osd_cb; /* registered sink for MLM_T_STATUS's raw 0x09/0x11 frames */
 static void *g_osd_ctx;
 
+/* Local baseband link metrics from ml-linkd's MLM_T_LINKINFO; MLM_LINKINFO_NONE until one arrives. */
+static int g_channel = MLM_LINKINFO_NONE;
+static int g_snr_db = MLM_LINKINFO_NONE;
+static int g_distance_m = MLM_LINKINFO_NONE;
+
 static uint32_t now_ms(void)
 {
     struct timespec t;
@@ -90,6 +95,13 @@ void linkstate_poll(int fd)
             } else if (link.state == MLM_LINK_PARAMS_ACKED || link.state == MLM_LINK_SESSION_RESTART) {
                 g_last_seen_ms = now_ms();
             }
+        } else if (hdr.type == MLM_T_LINKINFO
+                   && n >= (ssize_t) (sizeof hdr + sizeof(struct mlm_linkinfo))) {
+            struct mlm_linkinfo info;   /* local baseband metrics for the air-unit System OSD */
+            memcpy(&info, buf + sizeof hdr, sizeof info);
+            g_channel = info.channel;
+            g_snr_db = info.snr_db;
+            g_distance_m = info.distance_m;
         } else if (hdr.type == MLM_T_STATE
                    && n >= (ssize_t) (sizeof hdr + sizeof(struct mlm_state))) {
             struct mlm_state st;   /* ml-pipeline's current mode (idle / recording / playback) */
@@ -149,6 +161,21 @@ int linkstate_playback_rendering(void)
 int linkstate_airunit_connected(void)
 {
     return g_last_seen_ms != 0 && (uint32_t) (now_ms() - g_last_seen_ms) < LINK_STALE_MS;
+}
+
+int linkstate_channel(void)
+{
+    return g_channel;
+}
+
+int linkstate_snr_db(void)
+{
+    return g_snr_db;
+}
+
+int linkstate_distance_m(void)
+{
+    return g_distance_m;
 }
 
 void linkstate_close(int fd)

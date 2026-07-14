@@ -62,7 +62,7 @@ int osd_decode_version(const unsigned char *payload, int payload_len, osd_versio
     out->fw[16] = '\0';
 
     out->voltage_mV = read_u16(payload, OSD10K_VERSION_OFF_VOLTAGE_MV);
-    out->link_a = read_u16(payload, OSD10K_VERSION_OFF_LINK_A);
+    out->air_temp_c = read_u16(payload, OSD10K_VERSION_OFF_TEMP_C);
     out->link_b = payload[OSD10K_VERSION_OFF_LINK_B];
 
     return 0;

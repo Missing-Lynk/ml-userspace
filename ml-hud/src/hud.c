@@ -74,9 +74,11 @@ typedef struct {
     int            nosignal_sent;      /* latch: the "stream lost" no-signal-splash command was already sent */
     long           osd_frames;
     long           rendered;
-    uint16_t       last_voltage_mV;
+    uint16_t       last_voltage_mV;  /* air-unit pack mV, from the 0x09/0x11 status frames */
     int            have_voltage;
     int            have_version;     /* saw a version frame (fw string + link metrics) */
+    int            air_temp_c;       /* air-unit temperature (0x09 frame @98), whole deg C */
+    int            have_air_temp;
 } hud_ctx_t;
 
 static void render_and_present(hud_ctx_t *h, const unsigned char *canvas, int len)
@@ -124,6 +126,10 @@ static void on_version(void *ctx, const osd_header_t *header, const osd_version_
     h->last_voltage_mV = v->voltage_mV;
     h->have_voltage = 1;
     h->have_version = 1;
+
+    /* @98 is the air unit's own temperature in deg C. */
+    h->air_temp_c = v->air_temp_c;
+    h->have_air_temp = 1;
 }
 
 static void on_periodic(void *ctx, const osd_header_t *header, const osd_periodic_t *p)
@@ -513,7 +519,18 @@ int main(int argc, char **argv)
             h.sysosd_next_ms = now + SYSOSD_PERIOD_MS;
             telemetry_t telemetry;
             telemetry_read(&telemetry);
-            sysosd_update(&telemetry, h.settings);
+
+            /* Air-unit values decoded from the :10000 status frames; blanked when the link is down so
+             * the bar shows placeholders rather than stale readings. */
+            int air_up = linkstate_airunit_connected();
+            air_telem_t air = {
+                .have_voltage = air_up && h.have_voltage,
+                .voltage_mV = h.last_voltage_mV,
+                .have_temp = air_up && h.have_air_temp,
+                .temp_c = h.air_temp_c,
+            };
+
+            sysosd_update(&telemetry, &air, h.settings);
             menu_refresh_link();   /* keep the Air Unit entry's dim in step with the live link */
         }
 

@@ -37,6 +37,7 @@
 #include <signal.h>
 #include <pthread.h>
 #include <time.h>
+#include <math.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -73,9 +74,22 @@
 #define SETTLE_TICKS     15               /* ~2.5 s of SETTLE */
 #define ALIVE_EVERY      720              /* STEADY ticks between alive lines (~30 s) */
 #define OPEN_RETRY_EVERY 30               /* WAIT_DEV: log every Nth failed open */
-#define POLL_LINK_EVERY  4                /* Get1V1Info every Nth STEADY tick (~6 Hz) */
+#define POLL_LINK_EVERY  4                /* Get1V1Info + GetDistance every Nth STEADY tick (~6 Hz) */
 #define FF02_EVERY       7                /* ff02 every Nth STEADY tick (~3.4 Hz) */
+#define LINKINFO_EVERY   24               /* publish MLM_T_LINKINFO every Nth STEADY tick (~1 Hz) */
 #define SEQ_START        0x15             /* initial poll sequence number */
+
+/* The baseband channel index we tune the local RX to at OPEN (SET_CHNIDX). Single source of truth:
+ * used both in OPEN_SEQ and when publishing the channel for the HUD's System OSD. */
+#define OPEN_CHNIDX      5
+
+/* Baseband GET reply field offsets. Replies arrive on the request channel BB_GET (0x01), port =
+ * selector. Get1V1Info (0x73) carries a linear SNR at +0x06 (dB = 10*log10(raw/36); zero until a
+ * video link is up); GetDistanceResult (0x05) a u32 at +0 (0xFFFFFFFF = no ranging fix). */
+#define REPLY_CH         0x01
+#define V1V1_OFF_SNR     0x06
+#define DIST_OFF_RESULT  0x00
+#define DIST_NONE        0xFFFFFFFFu   /* GetDistance result when no ranging fix (bench / no GPS) */
 
 /* :10000 params-handshake message types (LE u32, byte 0) */
 #define MP_REQUEST       1
@@ -108,6 +122,12 @@ static volatile long g_last_telem_ms;       /* last :10000 RX */
 static volatile long g_last_ready_ms;       /* last MLM_T_READY heartbeat */
 static volatile long g_last_ack_ms;         /* last type3 ACK sent */
 
+/* Local baseband link metrics, parsed from the GET replies in the reader thread and published for
+ * the HUD's System OSD. Single writer (reader), single reader (main publish); MLM_LINKINFO_NONE
+ * until a reply lands. */
+static volatile int g_snr_db = MLM_LINKINFO_NONE;
+static volatile int g_distance_m = MLM_LINKINFO_NONE;
+
 static void on_sig(int sig)
 {
     (void)sig;
@@ -120,6 +140,14 @@ static long now_ms(void)
 
     clock_gettime(CLOCK_MONOTONIC, &t);
     return t.tv_sec * 1000L + t.tv_nsec / 1000000L;
+}
+
+/* Absolute ChnIdx -> displayed "CH N" (1..16): number = ChnIdx - 1, shown directly, with 0 -> 16. */
+static int chnidx_to_display(int chnidx)
+{
+    int number = chnidx - 1;
+
+    return number == 0 ? 16 : number;
 }
 
 /* MLM producer (telemetry.sock / osd.sock; drop on error, never block). */
@@ -229,7 +257,7 @@ struct bb_frame {
  * seq is the captured RPC sequence id, replayed as-is.
  */
 static const struct bb_frame OPEN_SEQ[] = {
-    { BB_SET, 0, 0, SET_CHNIDX, 6,     (const uint8_t[]){ 0x02, 0x05 }, 2 },  /* select channel index 5 */
+    { BB_SET, 0, 0, SET_CHNIDX, 6,     (const uint8_t[]){ 0x02, OPEN_CHNIDX }, 2 },  /* select channel index */
     { BB_SET, 0, 0, SET_POWER,  0xcbf, (const uint8_t[]){ RF_RX, 0x17 }, 2 },  /* RX chain, 23 dBm */
 };
 static const int OPEN_SEQ_N = sizeof(OPEN_SEQ) / sizeof(OPEN_SEQ[0]);
@@ -287,6 +315,8 @@ static void *reader(void *arg)
                 continue;
             }
 
+            const uint8_t *payload = buf + i + 18;
+
             if (buf[i + 5] == 0x05 || (buf[i + 5] == 0x03 && buf[i + 8] == 0x06)) {
                 for (int k = 0; k < plen && g_chiplog_n < (int)sizeof(g_chiplog) - 1; k++) {
                     char ch = buf[i + 18 + k];
@@ -306,6 +336,33 @@ static void *reader(void *arg)
                     }
                 }
                 fflush(stdout);
+            } else if (buf[i + 5] == REPLY_CH && buf[i + 8] == GET_1V1INFO && plen >= V1V1_OFF_SNR + 2) {
+                /* Get1V1Info reply: linear SNR at +0x06 -> dB. Empty inter-poll replies (raw 0, seen
+                 * when video is idle or during a brief Tx-link blip) keep the last good value so the
+                 * OSD does not flicker to No Link; a real link loss blanks it via the air_lost gate.
+                 */
+                unsigned raw = payload[V1V1_OFF_SNR] | (payload[V1V1_OFF_SNR + 1] << 8);
+                if (raw > 0) {
+                    g_snr_db = (int)lroundf(10.0f * log10f((float)raw / 36.0f));
+                }
+
+                if (g_verbose) {
+                    printf(TAG " 1v1info snr_raw=%u snr_db=%d\n", raw, g_snr_db);
+                    fflush(stdout);
+                }
+            } else if (buf[i + 5] == REPLY_CH && buf[i + 8] == GET_DISTANCE && plen >= DIST_OFF_RESULT + 4) {
+                /* GetDistanceResult reply: u32 ranging result at +0, in metres per the vendor OSD.
+                 * 0xFFFFFFFF = no ranging fix (the bench value); publish NONE so the OSD shows a
+                 * placeholder. A real value awaits a live ranging flight.
+                 */
+                unsigned d = payload[DIST_OFF_RESULT] | (payload[DIST_OFF_RESULT + 1] << 8)
+                           | (payload[DIST_OFF_RESULT + 2] << 16) | (payload[DIST_OFF_RESULT + 3] << 24);
+
+                g_distance_m = d == DIST_NONE ? MLM_LINKINFO_NONE : (int)d;
+                if (g_verbose) {
+                    printf(TAG " distance=%d m (raw 0x%08x)\n", g_distance_m, d);
+                    fflush(stdout);
+                }
             }
             i += 18 + plen;
         }
@@ -635,10 +692,26 @@ int main(int argc, char **argv)
         if (ticks % POLL_LINK_EVERY == 0) {
             bb_get(poll, GET_1V1INFO, seq_link++);
             send_frame(poll, 19, "get-1v1");
+            bb_get(poll, GET_DISTANCE, seq_link++);
+            send_frame(poll, 19, "get-distance");
         }
 
         if (ticks % FF02_EVERY == 0) {
             send_frame(ff02, 19, "ff02");
+        }
+
+        /* Publish the local baseband link metrics for the HUD's System OSD (~1 Hz). Channel is a
+         * config fact we always know; SNR/distance go stale on air loss, so blank them then and let
+         * the HUD dim the whole air-unit side off its own connection state. */
+        if (ticks % LINKINFO_EVERY == 0) {
+            struct mlm_linkinfo info = {
+                .channel = chnidx_to_display(OPEN_CHNIDX),
+                .snr_db = g_air_lost ? MLM_LINKINFO_NONE : g_snr_db,
+                .distance_m = g_air_lost ? MLM_LINKINFO_NONE : g_distance_m,
+                .flags = 0,
+            };
+
+            mlm_pub(MLM_TELEMETRY_SOCK, MLM_T_LINKINFO, &info, sizeof info);
         }
 
         usleep(STEADY_STEP_US);

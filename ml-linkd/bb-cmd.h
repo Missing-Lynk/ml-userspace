@@ -35,6 +35,7 @@ enum bb_class {
 enum bb_get_sel {
     GET_STATUS        = 0x00,   /* GetStatus */
     GET_CANDIDATES    = 0x03,   /* GetCandidates */
+    GET_DISTANCE      = 0x05,   /* GetDistanceResult (RF ranging); reply = u32 metres at payload 0 */
     GET_STATUS_PARAMS = 0x04,   /* GetStatusParams */
     GET_MCS           = 0x06,   /* GetRxMcs / GetTxMcs / bitrate / framerate */
     GET_POWER         = 0x08,
