@@ -191,6 +191,60 @@ static int plane_commit(struct ctx *c, const struct ditem *it)
     return ret;
 }
 
+/* Stage overlay plane `i` in an atomic request: scan the `fb` region (src_w x src_h from the FB's
+ * top-left) out onto the whole CRTC. fb == 0 takes the plane off the CRTC (the rest is ignored).
+ * SRC_* are 16.16 fixed-point (hence << 16); CRTC_* are pixels.
+ */
+static void plane_stage_fullscreen(struct ctx *c, drmModeAtomicReq *req, int i,
+                                   guint32 fb, int src_w, int src_h)
+{
+    drmModeAtomicAddProperty(req, c->vid_plane[i], c->pp_fb[i], fb);
+    drmModeAtomicAddProperty(req, c->vid_plane[i], c->pp_crtcid[i], fb ? c->crtc_id : 0);
+    drmModeAtomicAddProperty(req, c->vid_plane[i], c->pp_srcx[i], 0);
+    drmModeAtomicAddProperty(req, c->vid_plane[i], c->pp_srcy[i], 0);
+    drmModeAtomicAddProperty(req, c->vid_plane[i], c->pp_srcw[i], (guint64)src_w << 16);
+    drmModeAtomicAddProperty(req, c->vid_plane[i], c->pp_srch[i], (guint64)src_h << 16);
+    drmModeAtomicAddProperty(req, c->vid_plane[i], c->pp_cx[i], 0);
+    drmModeAtomicAddProperty(req, c->vid_plane[i], c->pp_cy[i], 0);
+    drmModeAtomicAddProperty(req, c->vid_plane[i], c->pp_cw[i], COMP_W);
+    drmModeAtomicAddProperty(req, c->vid_plane[i], c->pp_ch[i], COMP_H);
+}
+
+/* Park the display on the no-signal splash (idle_fb) when the live link drops, so the panel stops
+ * holding the last decoded frame. Plane mode: scan the full-screen splash out on video0 and take
+ * video1 off the CRTC. Composite mode: modeset the CRTC to the splash. A blocking commit (no
+ * page-flip event to track); the held tile samples are released only AFTER the shadow latch,
+ * mirroring the shutdown teardown - freeing a buffer the DC is still scanning is the documented SoC
+ * hang. A returning video frame re-commits the planes and clears idle_shown.
+ */
+static void drm_show_idle(struct ctx *c)
+{
+    if (!c->idle_fb) {
+        /* No splash allocated (heap alloc failed): leave the last frame up. */
+        return;
+    }
+
+    if (c->planes_on) {
+        drmModeAtomicReq *req = drmModeAtomicAlloc();
+        if (req) {
+            plane_stage_fullscreen(c, req, 0, c->idle_fb, COMP_W, COMP_H);   /* video0: the splash */
+            plane_stage_fullscreen(c, req, 1, 0, 0, 0);                      /* video1: off */
+            if (drmModeAtomicCommit(c->drm_fd, req, 0, c)) {
+                perror("ml-pipeline: atomic commit(no-signal)");
+            }
+            drmModeAtomicFree(req);
+        }
+    } else if (drmModeSetCrtc(c->drm_fd, c->crtc_id, c->idle_fb, 0, 0, &c->conn_id, 1, &c->mode)) {
+        perror("ml-pipeline: drmModeSetCrtc(no-signal)");
+    }
+
+    /* Wait past the shadow latch before releasing the old frame. */
+    usleep(2 * 1000000 / RF_FPS);
+    ditem_release(&c->prev_it);
+    ditem_release(&c->front_it);
+    ditem_release(&c->pending_it);
+}
+
 static void *drm_disp_run(void *arg)
 {
     struct ctx *c = arg;
@@ -213,6 +267,12 @@ static void *drm_disp_run(void *arg)
             continue;               /* a flip is in flight; wait for its completion event */
         }
 
+        if (c->show_idle && !c->idle_shown) {
+            /* Live link dropped: park on the no-signal splash. */
+            drm_show_idle(c);
+            c->idle_shown = 1;
+        }
+
         pthread_mutex_lock(&c->disp_lock);
         struct ditem it = c->next_it;
         memset(&c->next_it, 0, sizeof c->next_it);
@@ -221,6 +281,9 @@ static void *drm_disp_run(void *arg)
         if (ditem_empty(&it)) {
             continue;
         }
+
+        /* A real frame is here: video is back, drop the splash. */
+        c->show_idle = c->idle_shown = 0;
 
         if (c->planes_on) {
             if (!c->modeset_done) {
@@ -286,8 +349,7 @@ void drm_disp_submit(struct ctx *c, const struct ditem *it, GstClockTime pts)
         ditem_release(&displaced);     /* never shown -> released (pool / decoder) */
     }
 
-    char w = 1;
-    if (write(c->wake_w, &w, 1) < 0) { }
+    pipe_wake(c->wake_w);
 }
 
 /* Resolve the video0/video1 overlay planes (type OVERLAY, YUV420-capable, this CRTC) and
@@ -478,9 +540,10 @@ int drm_make_idle_fb(struct ctx *c)
 
     guint8 *m = mmap(NULL, COMP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (m != MAP_FAILED) {
-        /* Fill with the vendor no-signal splash (I420 1920x1080 == COMP_SIZE) so parking here on a
-         * swap - and returning to live with no RF frame - shows the mountain, not black. Falls back
-         * to black if the image is missing. */
+        /* Fill with the no-signal splash (I420 1920x1080 == COMP_SIZE) so parking here on a swap -
+         * and returning to live with no RF frame - shows the splash, not black. Falls back to black
+         * if the image is missing.
+         */
         const char *sp = getenv("ML_NOSIGNAL") ? getenv("ML_NOSIGNAL") : "/usr/local/share/nosignal.yuv";
         int imgfd = open(sp, O_RDONLY);
         size_t got = 0;
@@ -519,6 +582,9 @@ int drm_disp_init(struct ctx *c)
     c->next_it.cbi = c->front_it.cbi = c->pending_it.cbi = c->prev_it.cbi = -1;
     c->retire_dumps = getenv("ML_DUMP_RETIRE") ? atoi(getenv("ML_DUMP_RETIRE")) : 0;
     c->modeset_done = 0;   /* re-modeset the first frame of each (re)init - modes swap at runtime */
+
+    /* A fresh graph starts live, not parked on the splash. */
+    c->show_idle = c->idle_shown = 0;
     pthread_mutex_init(&c->disp_lock, NULL);
 
     if (pipe2(p, O_NONBLOCK | O_CLOEXEC)) {
@@ -556,10 +622,8 @@ int drm_disp_init(struct ctx *c)
 
 void drm_disp_shutdown(struct ctx *c)
 {
-    char w = 1;
-
     c->disp_run = 0;
-    if (write(c->wake_w, &w, 1) < 0) { }
+    pipe_wake(c->wake_w);
 
     pthread_join(c->disp_thread, NULL);
 

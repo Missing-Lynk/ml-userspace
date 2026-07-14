@@ -105,6 +105,10 @@ enum mlm_cmd_type {
     MLM_CMD_STOP       = 6, /* stop playback and return to the live stream */
     MLM_CMD_SPEED      = 7, /* set play speed; arg = signed multiplier (int32 bit-cast): 1 = normal,
                             *  2/4/8 fast-forward, -2/-4/-8 rewind. Realised as a rate seek. */
+    MLM_CMD_SHOW_IDLE  = 8, /* park the display on the no-signal splash instead of the last decoded
+                            *  frame (the live RF link dropped). The HUD sends this off ml-linkd's
+                            *  connection state; a returning video frame clears it. Ignored during
+                            *  playback (a file owns the display). */
 };
 
 struct mlm_cmd {

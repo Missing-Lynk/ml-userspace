@@ -234,6 +234,9 @@ static int rf_display_init(struct ctx *c, int drm_fd)
          */
         c->skew_max = 3;
         c->inflight_max = 4;
+
+        /* The no-signal splash the display parks on when the link drops. */
+        drm_make_idle_fb(c);
         printf("ml-pipeline: rf -> PLANE SCANOUT (video0/video1 atomic pairs), drm fd %d, :%d\n",
                drm_fd, RF_VIDEO_PORT);
     } else {

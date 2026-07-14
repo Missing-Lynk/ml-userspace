@@ -38,3 +38,9 @@ void pipecmd_playback_speed(int speed)
 {
     mlm_ctrl_send(MLM_CMD_SPEED, (uint32_t) speed, NULL);
 }
+
+/* Park the display on the no-signal splash (the live link dropped); a returning frame clears it. */
+void pipecmd_show_nosignal(void)
+{
+    mlm_ctrl_send(MLM_CMD_SHOW_IDLE, 0, NULL);
+}
