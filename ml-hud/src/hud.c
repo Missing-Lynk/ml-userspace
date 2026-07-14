@@ -68,6 +68,7 @@ typedef struct {
     uint32_t       back_down_ms;     /* when BACK went down */
     uint32_t       alarm_next_ms;    /* next low-voltage alarm check */
     uint32_t       sysosd_next_ms;   /* next System OSD telemetry refresh */
+    int            rec_autostop_sent; /* latch: the "stream lost" record-stop toggle was already sent */
     long           osd_frames;
     long           rendered;
     uint16_t       last_voltage_mV;
@@ -147,10 +148,14 @@ static void on_button(void *ctx, hud_button_t button, hud_button_edge_t edge)
 
     /* Record works whether or not the menu is open (you record while flying), so it is handled before
      * the menu-open gate below. The pipeline is the source of truth: this just sends a toggle, and the
-     * REC indicator follows the pipeline's reported state (see linkstate/sysosd).
+     * REC indicator follows the pipeline's reported state (see linkstate/sysosd). Recording only makes
+     * sense with a live feed, so the toggle is ignored with no stream (there is nothing to capture, and
+     * a running recording is auto-stopped on stream loss by the main loop).
      */
     if (button == HUD_BTN_RECORD && edge == HUD_EDGE_DOWN) {
-        pipecmd_record_toggle();
+        if (linkstate_airunit_connected()) {
+            pipecmd_record_toggle();
+        }
         return;
     }
 
@@ -416,8 +421,20 @@ int main(int argc, char **argv)
 
         /* drain link/telemetry datagrams; updates air-unit + pipeline state */
         linkstate_poll(link_fd);
+
+        /* Stop a running recording the moment the stream drops: the pipeline would otherwise keep
+         * muxing a dead feed. Latched, because the command is a toggle - send it once per loss and
+         * clear the latch when the pipeline confirms it left RECORDING. */
+        int recording = linkstate_pipeline_state() == MLM_STATE_RECORDING;
+        if (recording && !linkstate_airunit_connected() && !h.rec_autostop_sent) {
+            pipecmd_record_toggle();
+            h.rec_autostop_sent = 1;
+        } else if (!recording) {
+            h.rec_autostop_sent = 0;
+        }
+
         if (have_drm) {
-            sysosd_set_recording(linkstate_pipeline_state() == MLM_STATE_RECORDING);
+            sysosd_set_recording(recording);
 
             /* track the playback scrubber at loop rate, not the 1 s OSD cadence */
             menu_playback_tick();
