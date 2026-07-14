@@ -41,6 +41,7 @@ typedef struct {
     /* device nodes */
     const char *input_device;           /* /dev/input/eventN (the keypad) */
     const char *sdcard_mount;           /* where the DVR SD card mounts */
+    const char *sdio_rx_bytes_path;     /* netdev RX byte counter for the air-unit downlink (sdio0) */
 
     /* battery (ADC) */
     /* The driver's calibrated PROCESSED node (in_voltageN_input, mV): per-channel ADC gain+offset

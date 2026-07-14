@@ -10,6 +10,9 @@ static const board_profile_t betafpv_p1_hd = {
 
     .input_device = "/dev/input/event0",
     .sdcard_mount = "/mnt/sdcard",
+    /* The air unit's H.265 downlink arrives as UDP over the AR8030 SDIO netdev; its RX byte counter
+     * is the incoming-video byte source (ml-pipeline binds :10001 on this interface). */
+    .sdio_rx_bytes_path = "/sys/class/net/sdio0/statistics/rx_bytes",
 
     /* pack_volts = in_voltage1_input (calibrated pin mV) * divider / 1000; divider is the board
      * resistor ratio.
