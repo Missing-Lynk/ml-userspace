@@ -9,6 +9,7 @@
 #include "backlight.h"
 #include "buzzer.h"
 #include "i18n.h"
+#include "linkcmd.h"
 #include "linkstate.h"
 #include "recordings.h"
 
@@ -31,6 +32,7 @@
 
 #define GOG_SECTION          "goggle"   /* every Goggles-menu setting lives in this JSON section */
 #define DVR_SECTION          "dvr"      /* every DVR-menu setting lives in this JSON section */
+#define AIRUNIT_SECTION      "air_unit" /* every Air-Unit-menu setting lives in this JSON section */
 
 /* item model */
 typedef enum {
@@ -85,6 +87,12 @@ static const gog_item_t g_dvr_items[] = {
     { ITEM_ACTION,   "dvr.format",      NULL,         NULL,               0, 0, "format" },
 };
 #define DVR_ITEM_COUNT ((int) (sizeof(g_dvr_items) / sizeof(g_dvr_items[0])))
+
+/* Air-unit settings; the list is shown only while the air unit is linked (render_air_unit). */
+static const gog_item_t g_airunit_items[] = {
+    { ITEM_TOGGLE, "air_unit.standby", "standby", NULL, 0, 1, "standby" },
+};
+#define AIRUNIT_ITEM_COUNT ((int) (sizeof(g_airunit_items) / sizeof(g_airunit_items[0])))
 
 /* Catalog search order: an on-device override, the dev staging dir, the shipped rootfs path, then
  * the build tree.
@@ -216,7 +224,15 @@ static void feed_key(uint32_t key)
  */
 static const char *section_key(void)
 {
-    return g_section == SECTION_DVR ? DVR_SECTION : GOG_SECTION;
+    if (g_section == SECTION_DVR) {
+        return DVR_SECTION;
+    }
+
+    if (g_section == SECTION_AIRUNIT) {
+        return AIRUNIT_SECTION;
+    }
+
+    return GOG_SECTION;
 }
 
 /* option helpers */
@@ -418,6 +434,8 @@ static void apply_item(const gog_item_t *item, const char *value)
         tone_beep(lv_tick_get());         /* confirm the new volume with a beep */
     } else if (strcmp(item->action, "language") == 0) {
         set_language(value);
+    } else if (strcmp(item->action, "standby") == 0) {
+        linkcmd_set_standby(strcmp(value, "on") == 0);   /* arm/disarm the air unit's standby */
     }
 }
 
@@ -664,7 +682,7 @@ static int menu_is_linked(void)
 }
 
 /* The air-unit section: gated on a live link. With no link it is a dim "no air unit" hint (and the
- * sidebar entry is dimmed too, update_air_unit_dim); linked, it shows a placeholder.
+ * sidebar entry is dimmed too, update_air_unit_dim); linked, it shows the air-unit settings list.
  */
 static void render_air_unit(void)
 {
@@ -673,7 +691,7 @@ static void render_air_unit(void)
         return;
     }
 
-    render_centered_hint(T("air_unit.connected"));
+    render_settings_list(g_airunit_items, AIRUNIT_ITEM_COUNT, NULL);
 }
 
 /* Dim the Air Unit sidebar entry when the link is down, so it reads as inactive until the air unit
@@ -1110,13 +1128,17 @@ void menu_left(void)
     if (!g_is_open) {
         return;
     }
+
+    /* navigation frozen while a clip loads */
     if (player_is_loading()) {
-        return;   /* navigation frozen while a clip loads */
+        return;
     }
+
     if (player_is_open()) {
         player_key_left();
         return;
     }
+
     feed_key(LV_KEY_LEFT);
 }
 
@@ -1125,13 +1147,17 @@ void menu_right(void)
     if (!g_is_open) {
         return;
     }
+
+    /* navigation frozen while a clip loads */
     if (player_is_loading()) {
-        return;   /* navigation frozen while a clip loads */
+        return;
     }
+
     if (player_is_open()) {
         player_key_right();
         return;
     }
+
     feed_key(LV_KEY_RIGHT);
 }
 

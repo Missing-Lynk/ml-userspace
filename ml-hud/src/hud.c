@@ -18,6 +18,7 @@
 #include "hal/telemetry.h"
 #include "hud_state.h"
 #include "osd/btfl_osd.h"
+#include "services/linkcmd.h"
 #include "services/linkstate.h"
 #include "services/pipecmd.h"
 #include "settings/settings.h"
@@ -72,6 +73,7 @@ typedef struct {
     int            rec_autostart_sent; /* latch: the "stream up" auto-record start toggle was already sent */
     int            rec_is_auto;        /* the current recording was started by auto-record (not the button) */
     int            nosignal_sent;      /* latch: the "stream lost" no-signal-splash command was already sent */
+    int            standby_asserted;   /* latch: the air-unit standby state was pushed for this link-up */
     long           osd_frames;
     long           rendered;
     uint16_t       last_voltage_mV;  /* air-unit pack mV, from the 0x09/0x11 status frames */
@@ -464,6 +466,16 @@ int main(int argc, char **argv)
 
         if (!connected) {
             h.rec_autostart_sent = 0;
+        }
+
+        /* Push the air-unit standby state once per link-up. The menu default is armed, so a user who
+         * never touches the toggle still needs it asserted; ml-linkd applies it and re-applies on its
+         * own session restarts. Latched to fire once; the latch clears on disconnect. */
+        if (connected && !h.standby_asserted) {
+            linkcmd_set_standby(settings_get_bool_in(h.settings, "air_unit", "standby", 1));
+            h.standby_asserted = 1;
+        } else if (!connected) {
+            h.standby_asserted = 0;
         }
 
         /* Turning auto-record off stops the recording it started (never a manual one). Level-checked

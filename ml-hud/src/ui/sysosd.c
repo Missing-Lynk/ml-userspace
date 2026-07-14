@@ -161,16 +161,17 @@ void sysosd_create(lv_obj_t *parent)
     lv_obj_add_flag(g_lbl_rec, LV_OBJ_FLAG_HIDDEN);    /* shown only while recording */
 
     /* RIGHT: air unit. Battery + temperature ride the :10000 status frames; distance is a local
-     * baseband reading via ml-linkd. Standby has no data source yet (needs an armed capture), so it
-     * stays hidden - a placeholder for when the arm/standby field is decoded.
-     * Temperature is the LEFTMOST field: the group is pinned to the bar's right edge, so hiding the
-     * left field (Show Temperature off) leaves the battery/distance fields to its right in place
-     * instead of shifting them. Standby is hidden, so it takes no layout space until it has data. */
+     * baseband reading via ml-linkd; standby is the air's work-mode readback (SetStandyMode 0x12),
+     * shown only when the air reports standby.
+     * Standby is the OUTERMOST (leftmost) field, then temperature: the group is pinned to the bar's
+     * right edge, so hiding a left field leaves the fields to its right in place instead of shifting
+     * them. Standby toggles with the air's arm state, so putting it leftmost keeps the rest of the
+     * air group steady as it appears/disappears; temperature (Show Temperature) sits just inside it. */
     g_group_right = make_group();
-    g_lbl_quad_temp = add_field(g_group_right, NULL, "--°C", COLOR_TEXT_DIM);
-    lv_obj_add_flag(g_lbl_quad_temp, LV_OBJ_FLAG_HIDDEN);
     g_lbl_standby = add_field(g_group_right, LV_SYMBOL_POWER, "", COLOR_PARTIAL);
     lv_obj_add_flag(g_lbl_standby, LV_OBJ_FLAG_HIDDEN);
+    g_lbl_quad_temp = add_field(g_group_right, NULL, "--°C", COLOR_TEXT_DIM);
+    lv_obj_add_flag(g_lbl_quad_temp, LV_OBJ_FLAG_HIDDEN);
     g_lbl_quad_battery = add_field(g_group_right, LV_SYMBOL_BATTERY_2, "--.-V", COLOR_TEXT_DIM);
     g_lbl_distance = add_field(g_group_right, LV_SYMBOL_GPS, "-- m", COLOR_TEXT_DIM);
 
@@ -278,6 +279,14 @@ static void update_link_fields(int connected)
     } else {
         lv_label_set_text_fmt(g_lbl_distance, "%s -- m", LV_SYMBOL_GPS);
         lv_obj_set_style_text_color(g_lbl_distance, COLOR_TEXT_DIM, 0);
+    }
+
+    /* Standby cue: the power glyph, shown only when the air reports standby (quad disarmed +
+     * standby armed). Hidden otherwise, so the bar is unchanged when the air is active. */
+    if (connected && linkstate_standby()) {
+        lv_obj_remove_flag(g_lbl_standby, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(g_lbl_standby, LV_OBJ_FLAG_HIDDEN);
     }
 }
 

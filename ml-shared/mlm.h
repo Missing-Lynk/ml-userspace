@@ -42,6 +42,7 @@ enum mlm_type {
     MLM_T_CMD        = 0x0007, /* HUD -> ml-pipeline (ctrl.sock): a control command */
     MLM_T_STATE      = 0x0008, /* ml-pipeline -> HUD (telemetry.sock): current pipeline mode */
     MLM_T_LINKINFO   = 0x0009, /* ml-linkd -> HUD (telemetry.sock): local baseband link metrics */
+    MLM_T_RFCMD      = 0x000a, /* HUD -> ml-linkd (link.sock): air-unit RF config command */
 };
 
 struct mlm_hdr {
@@ -88,8 +89,12 @@ struct mlm_linkinfo {
     int32_t  channel;      /* display channel number (1..16), or MLM_LINKINFO_NONE */
     int32_t  snr_db;       /* link SNR in dB (from Get1V1Info), or MLM_LINKINFO_NONE */
     int32_t  distance_m;   /* RF-ranging distance in metres, or MLM_LINKINFO_NONE (not ranging) */
-    uint32_t flags;        /* reserved for future validity/quality bits */
+    uint32_t flags;        /* MLM_LINKINFO_F_* validity/state bits */
 } __attribute__((packed));
+
+/* The air unit is currently in standby (its work-mode sync, :10000 SetStandyMode 0x12, reports
+ * standby - the quad is disarmed and standby is armed). The HUD shows the standby glyph. */
+#define MLM_LINKINFO_F_STANDBY 0x1
 
 /* MLM_T_LED payload (any producer -> ml-ledd). ml-ledd renders the animation itself
  * (the WS2812 LED has no hardware ramp), so a command is just the target pattern; the
@@ -160,6 +165,49 @@ struct mlm_state {
 #define MLM_STATE_F_RENDERING 0x4 /* first decoded frame is on the display (the clip is visible); before
                                    *  this the HUD keeps the menu up with a loading spinner. */
 
+/* MLM_T_RFCMD payload (HUD -> ml-linkd on link.sock). ml-linkd owns /dev/artosyn_sdio and the
+ * :10000 message channel, so the HUD never touches the air directly: it sends intent, and ml-linkd
+ * translates it into the air's config datagrams and re-applies it after a session restart. The HUD
+ * re-asserts on every link-up edge so the air converges to the menu's state (a default that was
+ * never toggled still needs pushing). New cmds append; ml-linkd ignores unknown values.
+ */
+enum mlm_rfcmd_type {
+    MLM_RF_SET_STANDBY = 1, /* arg = 1 arm standby, 0 disarm. Rides SetTranParm (:10000 msg 0x0D)
+                             * byte[8] = u8StandbyModeEn; the air's automatic arm/disarm handshake
+                             * (0x12/0x1b) does the actual power-save entry/exit. */
+};
+
+struct mlm_rfcmd {
+    uint32_t cmd; /* enum mlm_rfcmd_type */
+    uint32_t arg; /* command-specific */
+} __attribute__((packed));
+
+/* Send one MLM_T_RFCMD to ml-linkd's link.sock. Connectionless DGRAM: returns 0 if the datagram
+ * went out, -1 otherwise (a down ml-linkd just means nobody is bound; the HUD re-asserts on the
+ * next link-up edge regardless). */
+static inline int mlm_rfcmd_send(uint32_t cmd, uint32_t arg)
+{
+    struct { struct mlm_hdr h; struct mlm_rfcmd cmd; } __attribute__((packed)) frame;
+    frame.h.magic = MLM_MAGIC;
+    frame.h.type = MLM_T_RFCMD;
+    frame.h.flags = 0;
+    frame.cmd.cmd = cmd;
+    frame.cmd.arg = arg;
+
+    int sock = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        return -1;
+    }
+
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    strncpy(addr.sun_path, MLM_LINK_SOCK, sizeof addr.sun_path - 1);
+    int ok = sendto(sock, &frame, sizeof frame, 0, (struct sockaddr *)&addr, sizeof addr)
+             == (ssize_t) sizeof frame ? 0 : -1;
+    close(sock);
+
+    return ok;
+}
+
 /* SCM_RIGHTS fd passing over drm.sock */
 static inline int mlm_send_fd(int sock, int fd)
 {
@@ -188,7 +236,7 @@ static inline int mlm_recv_fd(int sock)
     struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1,
                           .msg_control = control.buf, .msg_controllen = sizeof control.buf };
 
-                          if (recvmsg(sock, &msg, 0) != 1) {
+    if (recvmsg(sock, &msg, 0) != 1) {
         return -1;
     }
 

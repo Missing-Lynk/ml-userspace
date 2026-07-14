@@ -35,6 +35,10 @@ int linkstate_channel(void);
 int linkstate_snr_db(void);
 int linkstate_distance_m(void);
 
+/** @brief Whether the air unit is currently in standby (quad disarmed + standby armed), from
+ *  ml-linkd's SetStandyMode readback. 0 when active or no link. */
+int linkstate_standby(void);
+
 /** @brief ml-pipeline's last-reported mode (MLM_STATE_* from ml-shared/mlm.h). Defaults to
  *  MLM_STATE_IDLE until the pipeline broadcasts. The pipeline re-asserts every second, so this
  *  reconverges after a HUD or pipeline restart. */

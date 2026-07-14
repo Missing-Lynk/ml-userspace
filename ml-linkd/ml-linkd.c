@@ -59,6 +59,7 @@
 #define AIR_LOSS_MS      5000             /* :10000 silence in STEADY => air lost */
 #define HELLO_IVL_MS     300              /* :20001 hello cadence (~3 Hz) */
 #define PARAMS_IVL_MS    2000             /* :10000 request cadence (vendor 2 s) */
+#define STANDBY_IVL_MS   2000             /* :10000 SetTranParm re-send cadence while armed (~2 s) */
 #define ACK_GRACE_MS     6000             /* re-poll grace after a type3 ACK */
 #define LED_ASSERT_MS    1000             /* LED re-assert cadence (~1 Hz) */
 #define LED_BREATHE_MS   3000             /* breathe-red period */
@@ -99,6 +100,23 @@
 #define AIR_MSP          0x10             /* MSP DisplayPort canvas */
 #define AIR_STATUS_A     0x09
 #define AIR_STATUS_B     0x11
+#define AIR_STANDBY      0x12             /* SetStandyMode: air's work-mode sync (body[0]: 1=standby) */
+#define STANDBY_OFF_MODE 20               /* body offset 0 = datagram offset 20 (u32 work-mode) */
+#define STANDBY_MODE_ON  1                /* work-mode 1 = standby (0 = normal, 2 = airscrew/armed) */
+
+/* :10000 SetTranParm (msg 0x0D) - the air's TX-power + standby-arm datagram. Byte layout is the
+ * HW-confirmed vendor tuple (see plans/rf-air-config.md): a 34-byte payload, 10-byte body at payload
+ * offset 20. body[0] = TX power dBm, body[1] = 0x04 (const), body[8] = u8StandbyModeEn. We send the
+ * known-good tuple verbatim and vary only power (body[0]) and standby (body[8]); fabricating other
+ * RF bytes can reboot the goggle, so nothing else is touched. */
+#define MP_SETTRANPARM   0x0D
+#define STP_LEN          34               /* full :10000 SetTranParm payload */
+#define STP_OFF_BODY     20               /* body starts here (0x0D uses the [20..23] word) */
+#define STP_OFF_POWER    (STP_OFF_BODY + 0)  /* body[0]: TX power in dBm */
+#define STP_OFF_CONST    (STP_OFF_BODY + 1)  /* body[1]: 0x04, constant in every captured frame */
+#define STP_OFF_STANDBY  (STP_OFF_BODY + 8)  /* body[8]: u8StandbyModeEn (0/1) */
+#define STP_BODY_LEN     0x0A             /* header length field (payload off 16) */
+#define AIR_TX_DBM       0x14             /* 100 mW: the vendor MID default power (no power row yet) */
 
 /* datagram buffer sizes */
 #define PKT_MAX          600              /* receive buffer */
@@ -127,6 +145,13 @@ static volatile long g_last_ack_ms;         /* last type3 ACK sent */
  * until a reply lands. */
 static volatile int g_snr_db = MLM_LINKINFO_NONE;
 static volatile int g_distance_m = MLM_LINKINFO_NONE;
+
+/* Air-unit RF config the HUD has commanded (MLM_T_RFCMD on link.sock). -1 = never commanded, so
+ * nothing is pushed to the air until the HUD asserts it; the HUD re-asserts on every link-up edge.
+ * ml-linkd re-sends the SetTranParm on a steady cadence while linked, so no per-change latch is
+ * needed - a toggle or a returning air unit is picked up by the next tick. */
+static volatile int g_standby_arm = -1;     /* 0/1 = HUD-commanded u8StandbyModeEn, -1 = unknown */
+static volatile int g_standby_state;        /* air's LIVE work-mode from SetStandyMode (0x12): 1 = in standby */
 
 static void on_sig(int sig)
 {
@@ -382,7 +407,7 @@ static void *udp_thread(void *arg)
     struct sockaddr_in local, air_hello, air_params;
     struct sockaddr_un link_un = { .sun_family = AF_UNIX };
     uint8_t hello[HELLO_LEN], params_req[PARAMS_LEN], params_ack[PARAMS_LEN];
-    long last_hello = 0, last_req = 0, last_led = 0;
+    long last_hello = 0, last_req = 0, last_led = 0, last_stp = 0;
 
     (void)arg;
     setsockopt(hello_sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
@@ -432,15 +457,31 @@ static void *udp_thread(void *arg)
         clock_gettime(CLOCK_MONOTONIC, &t);
         stamp_us = (uint32_t)(t.tv_sec * 1000000ULL + t.tv_nsec / 1000);
 
-        /* READY heartbeats from the consumer (nonblocking drain) */
+        /* link.sock datagrams: consumer READY heartbeats + HUD RF commands (nonblocking drain) */
         while ((n = recv(link_sock, rx, sizeof rx, MSG_DONTWAIT)) > 0) {
             struct mlm_hdr *hdr = (struct mlm_hdr *)rx;
 
-            if ((size_t)n < sizeof *hdr + sizeof(struct mlm_ready) || hdr->magic != MLM_MAGIC) {
+            if ((size_t)n < sizeof *hdr || hdr->magic != MLM_MAGIC) {
                 continue;
             }
 
-            if (hdr->type != MLM_T_READY) {
+            /* HUD -> air config: record the desired state; the periodic sender below pushes it. */
+            if (hdr->type == MLM_T_RFCMD
+                && (size_t)n >= sizeof *hdr + sizeof(struct mlm_rfcmd)) {
+                struct mlm_rfcmd *rc = (struct mlm_rfcmd *)(rx + sizeof *hdr);
+                if (rc->cmd == MLM_RF_SET_STANDBY) {
+                    int arm = rc->arg ? 1 : 0;
+                    if (arm != g_standby_arm) {
+                        printf(TAG " rfcmd: standby arm=%d\n", arm);
+                        fflush(stdout);
+                    }
+                    g_standby_arm = arm;
+                }
+                continue;
+            }
+
+            if (hdr->type != MLM_T_READY
+                || (size_t)n < sizeof *hdr + sizeof(struct mlm_ready)) {
                 continue;
             }
 
@@ -515,6 +556,7 @@ static void *udp_thread(void *arg)
                 g_air_lost = 0;
                 link_event(MLM_LINK_SESSION_RESTART, "TX unit returned, re-handshaking");
                 led_cmd(MLM_LED_BREATHE, 0xff, 0x00, 0x00, LED_BREATHE_MS);
+                /* the periodic sender re-applies the standby-arm on its own once the air is back */
             }
 
             if ((size_t)n < 4) {
@@ -537,6 +579,14 @@ static void *udp_thread(void *arg)
                 mlm_pub(MLM_OSD_SOCK, MLM_T_MSP, rx, n);
             } else if (msg_type == AIR_STATUS_A || msg_type == AIR_STATUS_B) {
                 mlm_pub(MLM_TELEMETRY_SOCK, MLM_T_STATUS, rx, n);
+            } else if (msg_type == AIR_STANDBY && n >= STANDBY_OFF_MODE + 4) {
+                /* the air reports its live work-mode on every change; latch it for the HUD icon */
+                uint32_t wm;
+                memcpy(&wm, rx + STANDBY_OFF_MODE, 4);
+                g_standby_state = (wm == STANDBY_MODE_ON);
+                if (g_verbose) {
+                    fprintf(stderr, TAG " standby work-mode=%u\n", wm);
+                }
             }
         }
 
@@ -549,6 +599,32 @@ static void *udp_thread(void *arg)
             g_video_confirmed = 0;
             link_event(MLM_LINK_TX_LOST, "no :10000 traffic for 5 s");
             led_cmd(MLM_LED_BREATHE, 0xff, 0x00, 0x00, LED_BREATHE_MS);
+        }
+
+        /* Keep the air's standby-arm asserted while it is reachable. The air only enters standby when
+         * u8StandbyModeEn (SetTranParm body[8]) is set AND its own RC link is disarmed, so we re-send
+         * on a steady cadence - a single frame can race association or be dropped, and the air
+         * re-evaluates on every SetTranParm. The SetTranParm also carries TX power (body[0]); with no
+         * power row yet we send the vendor default, holding the air at 100 mW - the byte the power
+         * row will own. */
+        if (g_standby_arm >= 0 && g_hs_done && !g_air_lost && now - last_stp >= STANDBY_IVL_MS) {
+            uint8_t stp[STP_LEN];
+
+            memset(stp, 0, sizeof stp);
+            stp[0] = MP_SETTRANPARM;
+            stp[16] = STP_BODY_LEN;
+            memcpy(stp + 8, &stamp_us, 4);
+            stp[STP_OFF_POWER]   = AIR_TX_DBM;
+            stp[STP_OFF_CONST]   = 0x04;
+            stp[STP_OFF_STANDBY] = (uint8_t) g_standby_arm;
+            sendto(params_sock, stp, sizeof stp, 0,
+                   (struct sockaddr *)&air_params, sizeof air_params);
+            last_stp = now;
+
+            if (g_verbose) {
+                fprintf(stderr, TAG " tx SetTranParm standby=%d power=0x%02x\n",
+                        g_standby_arm, AIR_TX_DBM);
+            }
         }
 
         /* re-assert the LED ~1 Hz so a late-started/restarted ml-ledd reconverges;
@@ -708,7 +784,7 @@ int main(int argc, char **argv)
                 .channel = chnidx_to_display(OPEN_CHNIDX),
                 .snr_db = g_air_lost ? MLM_LINKINFO_NONE : g_snr_db,
                 .distance_m = g_air_lost ? MLM_LINKINFO_NONE : g_distance_m,
-                .flags = 0,
+                .flags = (!g_air_lost && g_standby_state) ? MLM_LINKINFO_F_STANDBY : 0,
             };
 
             mlm_pub(MLM_TELEMETRY_SOCK, MLM_T_LINKINFO, &info, sizeof info);

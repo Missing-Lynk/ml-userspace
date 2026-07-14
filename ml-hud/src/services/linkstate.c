@@ -32,6 +32,7 @@ static void *g_osd_ctx;
 static int g_channel = MLM_LINKINFO_NONE;
 static int g_snr_db = MLM_LINKINFO_NONE;
 static int g_distance_m = MLM_LINKINFO_NONE;
+static int g_standby;   /* air is in standby (MLM_LINKINFO_F_STANDBY): quad disarmed + standby armed */
 
 static uint32_t now_ms(void)
 {
@@ -102,6 +103,7 @@ void linkstate_poll(int fd)
             g_channel = info.channel;
             g_snr_db = info.snr_db;
             g_distance_m = info.distance_m;
+            g_standby = (info.flags & MLM_LINKINFO_F_STANDBY) != 0;
         } else if (hdr.type == MLM_T_STATE
                    && n >= (ssize_t) (sizeof hdr + sizeof(struct mlm_state))) {
             struct mlm_state st;   /* ml-pipeline's current mode (idle / recording / playback) */
@@ -176,6 +178,11 @@ int linkstate_snr_db(void)
 int linkstate_distance_m(void)
 {
     return g_distance_m;
+}
+
+int linkstate_standby(void)
+{
+    return g_standby;
 }
 
 void linkstate_close(int fd)

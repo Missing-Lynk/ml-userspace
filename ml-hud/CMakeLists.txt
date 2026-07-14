@@ -68,6 +68,7 @@ add_executable(hud
     src/services/recordings.c
     src/services/linkstate.c
     src/services/pipecmd.c
+    src/services/linkcmd.c
     src/ui/display.c
     src/ui/tone.c
     src/ui/menu.c
