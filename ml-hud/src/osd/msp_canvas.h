@@ -5,7 +5,7 @@
  *
  * The canvas is Betaflight MSP DisplayPort glyph data in Artosyn's length-chained packing: 0xff
  * separators, then `b6 03 <row> <col> <attr> <glyphs...> <next_len>` records. See
- * docs/reference/msp-osd-format.md.
+ * docs/msp-osd-format.md.
  *
  * VERBATIM COPY of libre/ipc/msp_canvas.h so hud/ owns its decoder and libre stays untouched.
  */

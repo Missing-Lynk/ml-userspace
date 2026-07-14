@@ -6,7 +6,7 @@
 #include <stddef.h>
 
 /* The canvas is Betaflight MSP DisplayPort glyph data in Artosyn's packing (see
- * docs/reference/msp-osd-format.md): 0xff-separated bytes that, once stripped, form records of a
+ * docs/msp-osd-format.md): 0xff-separated bytes that, once stripped, form records of a
  * 2-byte marker, a 3-byte header (row, col, attr), then the row's glyph bytes.
  */
 #define CANVAS_SEPARATOR          0xff   /* stripped before parsing */

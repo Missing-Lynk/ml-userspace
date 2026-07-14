@@ -6,7 +6,7 @@
  * vertically (256 per page; we use page 0). The MSP DisplayPort canvas references glyphs by MAX7456
  * index (0..255); this maps an index to its 24x36 RGBA bitmap (white glyph + black outline +
  * transparent). The SAME loader serves the bundled default and a user's custom font from the SD, so
- * there is one glyph path, not two (see docs/reference/msp-osd-format.md).
+ * there is one glyph path, not two (see docs/msp-osd-format.md).
  *
  * The bundled default (`font_BTFL_hd.png`) is generated from `assets/osd-fonts/betaflight.mcm` by
  * `assets/osd-fonts/mcm2png.py`. The font is a SEPARATE FILE shipped to the device, never baked in.

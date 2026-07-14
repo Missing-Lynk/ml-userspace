@@ -1,7 +1,7 @@
 # OSD glyph fonts (MSP / FC OSD)
 
 Source glyph fonts for the MSP DisplayPort / FC OSD renderer (see
-`docs/reference/msp-osd-format.md`). These are **source assets**; the menu loads a
+`docs/msp-osd-format.md`). These are **source assets**; the menu loads a
 converted runtime atlas (a separate file shipped to the device), never a font baked
 into the binary. Users can later supply their own font (the custom-font-from-SD
 feature, deferred).

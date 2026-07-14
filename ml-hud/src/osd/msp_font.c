@@ -1,4 +1,4 @@
-/** @file msp_font.c @brief Implementation; see msp_font.h and docs/reference/msp-osd-format.md.
+/** @file msp_font.c @brief Implementation; see msp_font.h and docs/msp-osd-format.md.
  *  VERBATIM COPY of libre/app/osd/msp_font.c (libre stays untouched). */
 #include "msp_font.h"
 #include "lodepng.h"

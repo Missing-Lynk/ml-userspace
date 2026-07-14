@@ -3,7 +3,7 @@
  *
  * These builders emit the bb-socket control-plane frames written to /dev/artosyn_sdio; they
  * configure THIS unit's radio and are NOT commands to the air unit (air config rides UDP :10000,
- * see docs/reference/rf-air-config.md).
+ * see docs/rf-video-downlink.md).
  *
  * Each builder writes one frame into `frame` (which must hold plen + 19 bytes) and returns its
  * length, so the caller owns transmission:

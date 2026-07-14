@@ -12,7 +12,7 @@ The open user-space stack for Artosyn Proxima-9311 + AR8030 devices: the video p
 | `ml-ledd/` | The status-LED daemon: renders off/solid/breathe/blink on the WS2812 chain; a command sink any producer can drive. |
 | `ml-shared/` | `mlm.h`, the MissingLynk Messaging (MLM) wire contract every component includes. |
 | `assets/` | The boot splash and the OSD font, rendered by the user-space binaries and staged into the rootfs. |
-| `docs/reference/` | The component internals and the vendor interfaces they consume: codec APIs (`vdec`/`venc`/`mpp-buffers`), the decode-display pipeline, RF video downlink / modes / channels, the MSP OSD format, and the RF-reached air unit. |
+| `docs/` | The component internals and the vendor interfaces they consume: codec APIs (`vdec`/`venc`/`mpp-buffers`), the decode-display pipeline, RF video downlink / modes / channels, the MSP OSD format, and the RF-reached air unit. |
 
 Every program includes `ml-shared/mlm.h`, so they live in one repo: the wire contract stays a normal in-tree include instead of a cross-repo version-skew problem.
 

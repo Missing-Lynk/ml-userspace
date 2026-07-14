@@ -3,7 +3,7 @@
 Convert a Betaflight .mcm (MAX7456: 256 glyphs, 12x18, 2 bpp) to the HD MSP-OSD font PNG
 (font_<fcid>_hd.png): 24x36 glyphs (2x), stacked vertically, RGBA (white glyph, black
 outline, transparent background). This is the runtime font format documented in
-docs/reference/msp-osd-format.md.
+docs/msp-osd-format.md.
 """
 import sys
 from PIL import Image
