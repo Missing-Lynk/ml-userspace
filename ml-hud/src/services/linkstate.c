@@ -20,6 +20,7 @@
 
 static uint32_t g_last_seen_ms;   /* monotonic ms of the last air-liveness datagram; 0 = never/lost */
 static uint32_t g_pipeline_state; /* last MLM_T_STATE from ml-pipeline; defaults to MLM_STATE_IDLE (0) */
+static int      g_pipeline_seen;  /* a real MLM_T_STATE has arrived (else g_pipeline_state is the default) */
 static uint32_t g_pb_flags;       /* playback flags (MLM_STATE_F_PAUSED) from the last MLM_T_STATE */
 static uint32_t g_pb_pos_ms;      /* playback position (ms) */
 static uint32_t g_pb_dur_ms;      /* playback duration (ms) */
@@ -94,6 +95,7 @@ void linkstate_poll(int fd)
             struct mlm_state st;   /* ml-pipeline's current mode (idle / recording / playback) */
             memcpy(&st, buf + sizeof hdr, sizeof st);
             g_pipeline_state = st.state;
+            g_pipeline_seen = 1;
             g_pb_flags = st.flags;
             g_pb_pos_ms = st.pos_ms;
             g_pb_dur_ms = st.dur_ms;
@@ -110,6 +112,11 @@ void linkstate_set_osd_cb(const osd_channel_cb_t *cb, void *ctx)
 int linkstate_pipeline_state(void)
 {
     return (int) g_pipeline_state;
+}
+
+int linkstate_pipeline_seen(void)
+{
+    return g_pipeline_seen;
 }
 
 int linkstate_playback(int *paused, unsigned *pos_ms, unsigned *dur_ms)

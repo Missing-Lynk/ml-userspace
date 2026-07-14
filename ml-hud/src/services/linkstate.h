@@ -34,6 +34,13 @@ int linkstate_airunit_connected(void);
 int linkstate_pipeline_state(void);
 
 /**
+ * @brief Whether a real MLM_T_STATE from ml-pipeline has been received yet. Until it has,
+ *  linkstate_pipeline_state() returns the default (IDLE), which callers must not act on - e.g.
+ *  auto-record must wait for the true state so it does not toggle a recording it cannot yet see.
+ */
+int linkstate_pipeline_seen(void);
+
+/**
  * @brief Playback progress from the pipeline's MLM_T_STATE.
  * @param paused  out: 1 if playback is paused (may be NULL).
  * @param pos_ms  out: current position in ms (may be NULL).

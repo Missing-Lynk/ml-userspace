@@ -68,7 +68,9 @@ typedef struct {
     uint32_t       back_down_ms;     /* when BACK went down */
     uint32_t       alarm_next_ms;    /* next low-voltage alarm check */
     uint32_t       sysosd_next_ms;   /* next System OSD telemetry refresh */
-    int            rec_autostop_sent; /* latch: the "stream lost" record-stop toggle was already sent */
+    int            rec_autostop_sent;  /* latch: the "stream lost" record-stop toggle was already sent */
+    int            rec_autostart_sent; /* latch: the "stream up" auto-record start toggle was already sent */
+    int            rec_is_auto;        /* the current recording was started by auto-record (not the button) */
     long           osd_frames;
     long           rendered;
     uint16_t       last_voltage_mV;
@@ -155,6 +157,7 @@ static void on_button(void *ctx, hud_button_t button, hud_button_edge_t edge)
     if (button == HUD_BTN_RECORD && edge == HUD_EDGE_DOWN) {
         if (linkstate_airunit_connected()) {
             pipecmd_record_toggle();
+            h->rec_is_auto = 0;   /* manual control: this recording is not auto-record's to stop */
         }
         return;
     }
@@ -422,15 +425,47 @@ int main(int argc, char **argv)
         /* drain link/telemetry datagrams; updates air-unit + pipeline state */
         linkstate_poll(link_fd);
 
-        /* Stop a running recording the moment the stream drops: the pipeline would otherwise keep
-         * muxing a dead feed. Latched, because the command is a toggle - send it once per loss and
-         * clear the latch when the pipeline confirms it left RECORDING. */
-        int recording = linkstate_pipeline_state() == MLM_STATE_RECORDING;
-        if (recording && !linkstate_airunit_connected() && !h.rec_autostop_sent) {
+        /* Auto record and auto stop, both keyed off ml-linkd's connection state - the single source
+         * of truth for whether a stream is present:
+         *   - stop a running recording the moment the stream drops (the pipeline would otherwise keep
+         *     muxing a dead feed);
+         *   - start one when the stream comes up if the DVR auto-record setting is on (and at once if
+         *     it is switched on while a stream is already live).
+         * Each command is a toggle, so both are latched + state-guarded to fire once. The auto-start
+         * latch clears on disconnect, so a manual stop while still connected is respected - not
+         * overridden until the link drops and comes back.
+         */
+        int state = linkstate_pipeline_state();
+        int recording = (state == MLM_STATE_RECORDING);
+        int connected = linkstate_airunit_connected();
+        int autorecord = settings_get_bool_in(h.settings, "dvr", "autostart", 0);
+
+        if (recording && !connected && !h.rec_autostop_sent) {
             pipecmd_record_toggle();
             h.rec_autostop_sent = 1;
+            h.rec_is_auto = 0;
         } else if (!recording) {
             h.rec_autostop_sent = 0;
+        }
+
+        if (autorecord && connected && linkstate_pipeline_seen() && state == MLM_STATE_IDLE
+            && !h.rec_autostart_sent) {
+            pipecmd_record_toggle();   /* idle-guarded: a toggle from idle starts recording */
+            h.rec_autostart_sent = 1;
+            h.rec_is_auto = 1;         /* auto-record owns this recording */
+        }
+
+        if (!connected) {
+            h.rec_autostart_sent = 0;
+        }
+
+        /* Turning auto-record off stops the recording it started (never a manual one). Level-checked
+         * and cleared after the toggle, so it fires once - and also catches a recording that was
+         * still starting when the toggle flipped (it stops once the pipeline reports RECORDING).
+         */
+        if (!autorecord && recording && h.rec_is_auto) {
+            pipecmd_record_toggle();
+            h.rec_is_auto = 0;
         }
 
         if (have_drm) {
