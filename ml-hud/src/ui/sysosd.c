@@ -1,14 +1,21 @@
 /** @file sysosd.c @brief See sysosd.h. */
 #include "sysosd.h"
 
+#include "linkstate.h"
+
+#include "../../../ml-shared/mlm.h"
+
 #include <stdlib.h>
 #include <string.h>
 
-/* Palette + spacing, matching the menu/libre look. */
+/* Palette + spacing, matching the menu/libre look (libre app/menu_config.h). */
 #define COLOR_OSD       lv_color_hex(0x0E141E)
+#define COLOR_GREEN     lv_color_hex(0x46D17B)
 #define COLOR_TEXT      lv_color_hex(0xE6EAF0)
+#define COLOR_TEXT_DIM  lv_color_hex(0x7A8497)   /* placeholder / no-link value */
 #define COLOR_WARN      lv_color_hex(0xE0633A)
 #define COLOR_REC       lv_color_hex(0xFF0000)   /* System OSD "REC" indicator (matches libre) */
+#define COLOR_PARTIAL   lv_color_hex(0xD99A2B)   /* orange: standby cue */
 #define OSD_PAD_HOR     44
 #define OSD_FIELD_GAP   36
 #define OSD_BATTERY_WIDTH 170   /* fixed (fits "25.2V (6S)"), so the value changing does not reflow */
@@ -17,14 +24,23 @@
 /* Low-battery blink: half-period of the battery-icon blink while the alarm is active. */
 #define ALARM_TICK_MS   250
 
+#define SIGNAL_MAX      4          /* SNR is mapped onto 0..SIGNAL_MAX bars purely for the field colour */
+
 #define GOG_SECTION     "goggle"   /* the goggle settings section (mirrors menu.c) */
 
 static lv_obj_t *g_osd;              /* the bar; child of the screen */
-static lv_obj_t *g_group_left;       /* goggle telemetry group */
-static lv_obj_t *g_lbl_battery;
+static lv_obj_t *g_group_left;       /* goggle + connection group */
+static lv_obj_t *g_group_right;      /* air-unit (quad) group */
+static lv_obj_t *g_lbl_channel;      /* RF channel (services/linkstate) */
+static lv_obj_t *g_lbl_battery;      /* goggle pack */
+static lv_obj_t *g_lbl_link;         /* WIFI + SNR (services/linkstate) */
 static lv_obj_t *g_lbl_sdcard;
-static lv_obj_t *g_lbl_temp;         /* SoC temperature; gated by the Show Temperature setting */
+static lv_obj_t *g_lbl_temp;         /* goggle SoC temperature; gated by the Show Temperature setting */
 static lv_obj_t *g_lbl_rec;          /* red "REC"; shown only while ml-pipeline reports recording */
+static lv_obj_t *g_lbl_standby;      /* power glyph at the left of the air group; shown only in standby */
+static lv_obj_t *g_lbl_quad_battery; /* air-unit pack (:10000 status frame) */
+static lv_obj_t *g_lbl_distance;     /* RF-ranging distance (services/linkstate) */
+static lv_obj_t *g_lbl_quad_temp;    /* air-unit temperature (:10000 @98); gated by Show Temperature */
 
 static int g_menu_open;
 static int g_force_hidden;            /* playback hides the whole bar, overriding the setting */
@@ -53,14 +69,47 @@ static const char *battery_icon_for(float per_cell_volts)
     return LV_SYMBOL_BATTERY_EMPTY;
 }
 
-static lv_obj_t *add_field(lv_obj_t *group, const char *text, lv_color_t color)
+/* Worst=red .. best=green over a 0..max level (libre signal_color). */
+static lv_color_t signal_color(int level, int max)
+{
+    if (level < 0 || max <= 0) {
+        return COLOR_TEXT_DIM;
+    }
+
+    if (level > max) {
+        level = max;
+    }
+
+    int hue = level * 120 / max;   /* 0deg = red, 60 = yellow, 120 = green */
+    return lv_color_hsv_to_rgb((uint16_t) hue, 80, 95);
+}
+
+static lv_obj_t *add_field(lv_obj_t *group, const char *icon, const char *value, lv_color_t color)
 {
     lv_obj_t *label = lv_label_create(group);
-    lv_label_set_text(label, text);
+    if (icon != NULL) {
+        lv_label_set_text_fmt(label, "%s %s", icon, value);
+    } else {
+        lv_label_set_text(label, value);
+    }
+
     lv_obj_set_style_text_font(label, OSD_FONT, 0);
     lv_obj_set_style_text_color(label, color, 0);
 
     return label;
+}
+
+static lv_obj_t *make_group(void)
+{
+    lv_obj_t *group = lv_obj_create(g_osd);
+    lv_obj_remove_style_all(group);
+    lv_obj_remove_flag(group, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(group, LV_SIZE_CONTENT, lv_pct(100));   /* hug the fields, do not clip */
+    lv_obj_set_flex_flow(group, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(group, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(group, OSD_FIELD_GAP, 0);
+
+    return group;
 }
 
 /* Blink the battery icon while the low-battery alarm is active. Opacity (not hide) is toggled so the
@@ -87,26 +136,39 @@ void sysosd_create(lv_obj_t *parent)
     lv_obj_align(g_osd, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_remove_flag(g_osd, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_flex_flow(g_osd, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(g_osd, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_flex_align(g_osd, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_hor(g_osd, OSD_PAD_HOR, 0);
     lv_obj_set_style_bg_color(g_osd, COLOR_OSD, 0);
     lv_obj_set_style_bg_opa(g_osd, LV_OPA_TRANSP, 0);   /* transparent until the menu opens */
 
-    g_group_left = lv_obj_create(g_osd);
-    lv_obj_remove_style_all(g_group_left);
-    lv_obj_remove_flag(g_group_left, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_size(g_group_left, LV_SIZE_CONTENT, lv_pct(100));
-    lv_obj_set_flex_flow(g_group_left, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(g_group_left, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(g_group_left, OSD_FIELD_GAP, 0);
-
-    g_lbl_battery = add_field(g_group_left, LV_SYMBOL_BATTERY_FULL " --.-V", COLOR_TEXT);
+    /* LEFT: goggle + connection. Channel and link come from ml-linkd (services/linkstate); battery,
+     * SD and temperature are goggle-local (hal/telemetry). */
+    g_group_left = make_group();
+    g_lbl_channel = add_field(g_group_left, NULL, "CH --", COLOR_TEXT_DIM);
+    g_lbl_battery = add_field(g_group_left, LV_SYMBOL_BATTERY_FULL, "--.-V", COLOR_TEXT);
     lv_obj_set_width(g_lbl_battery, OSD_BATTERY_WIDTH);   /* fixed width: no reflow on value change */
-    g_lbl_sdcard = add_field(g_group_left, LV_SYMBOL_SD_CARD " --", COLOR_TEXT);
-    g_lbl_temp = add_field(g_group_left, "--°C", COLOR_TEXT);
+    g_lbl_link = add_field(g_group_left, LV_SYMBOL_WIFI, "No Link", COLOR_WARN);
+    g_lbl_sdcard = add_field(g_group_left, LV_SYMBOL_SD_CARD, "--", COLOR_TEXT);
+    g_lbl_temp = add_field(g_group_left, NULL, "--°C", COLOR_TEXT);
     lv_obj_add_flag(g_lbl_temp, LV_OBJ_FLAG_HIDDEN);   /* shown only when enabled and a reading exists */
-    g_lbl_rec = add_field(g_group_left, "REC", COLOR_REC);
+    /* Last in the goggle group: toggling REC grows into the middle slack instead of shifting the
+     * other fields, so the bar does not jump when recording starts/stops. */
+    g_lbl_rec = add_field(g_group_left, NULL, "REC", COLOR_REC);
     lv_obj_add_flag(g_lbl_rec, LV_OBJ_FLAG_HIDDEN);    /* shown only while recording */
+
+    /* RIGHT: air unit. Battery + temperature ride the :10000 status frames; distance is a local
+     * baseband reading via ml-linkd. Standby has no data source yet (needs an armed capture), so it
+     * stays hidden - a placeholder for when the arm/standby field is decoded.
+     * Temperature is the LEFTMOST field: the group is pinned to the bar's right edge, so hiding the
+     * left field (Show Temperature off) leaves the battery/distance fields to its right in place
+     * instead of shifting them. Standby is hidden, so it takes no layout space until it has data. */
+    g_group_right = make_group();
+    g_lbl_quad_temp = add_field(g_group_right, NULL, "--°C", COLOR_TEXT_DIM);
+    lv_obj_add_flag(g_lbl_quad_temp, LV_OBJ_FLAG_HIDDEN);
+    g_lbl_standby = add_field(g_group_right, LV_SYMBOL_POWER, "", COLOR_PARTIAL);
+    lv_obj_add_flag(g_lbl_standby, LV_OBJ_FLAG_HIDDEN);
+    g_lbl_quad_battery = add_field(g_group_right, LV_SYMBOL_BATTERY_2, "--.-V", COLOR_TEXT_DIM);
+    g_lbl_distance = add_field(g_group_right, LV_SYMBOL_GPS, "-- m", COLOR_TEXT_DIM);
 
     lv_timer_create(alarm_tick_cb, ALARM_TICK_MS, NULL);
 }
@@ -153,7 +215,96 @@ void sysosd_invalidate(void)
     }
 }
 
-void sysosd_update(const telemetry_t *telemetry, settings_t *settings)
+/* Update the goggle battery field + the low-battery alarm flag. */
+static void update_goggle_battery(const telemetry_t *telemetry, settings_t *settings)
+{
+    if (!telemetry->have_battery) {
+        g_alarm_active = 0;
+        lv_label_set_text(g_lbl_battery, LV_SYMBOL_BATTERY_FULL " --.-V");
+        return;
+    }
+
+    float per_cell = (telemetry->cell_count > 0)
+                     ? telemetry->pack_volts / telemetry->cell_count
+                     : telemetry->pack_volts;
+    int volts_tenths = (int) (telemetry->pack_volts * 10.0f + 0.5f);
+
+    int alarm_on = settings_get_bool_in(settings, GOG_SECTION, "low_voltage_alarm", 1);
+    float threshold = (float) atof(settings_get_string_in(settings, GOG_SECTION, "min_cell_voltage", "3.4V"));
+    g_alarm_active = (alarm_on && per_cell < threshold);
+    lv_obj_set_style_text_color(g_lbl_battery, g_alarm_active ? COLOR_WARN : COLOR_TEXT, 0);
+
+    if (telemetry->cell_count > 0) {
+        lv_label_set_text_fmt(g_lbl_battery, "%s %d.%dV (%dS)", battery_icon_for(per_cell),
+                              volts_tenths / 10, volts_tenths % 10, telemetry->cell_count);
+    } else {
+        lv_label_set_text_fmt(g_lbl_battery, "%s %d.%dV", battery_icon_for(per_cell),
+                              volts_tenths / 10, volts_tenths % 10);
+    }
+}
+
+/* Update the RF fields from ml-linkd (channel, SNR, distance). Dim placeholders when the link is down
+ * or a value has not arrived. */
+static void update_link_fields(int connected)
+{
+    int channel = linkstate_channel();
+    if (connected && channel != MLM_LINKINFO_NONE) {
+        lv_label_set_text_fmt(g_lbl_channel, "CH %d", channel);
+        lv_obj_set_style_text_color(g_lbl_channel, COLOR_GREEN, 0);
+    } else {
+        lv_label_set_text(g_lbl_channel, "CH --");
+        lv_obj_set_style_text_color(g_lbl_channel, COLOR_TEXT_DIM, 0);
+    }
+
+    int snr = linkstate_snr_db();
+    if (connected && snr != MLM_LINKINFO_NONE) {
+        lv_label_set_text_fmt(g_lbl_link, "%s %d dB", LV_SYMBOL_WIFI, snr);
+        /* Map SNR onto 0..SIGNAL_MAX bars for the colour only: ~0 dB red .. >=20 dB green. */
+        int level = snr <= 0 ? 0 : snr >= 20 ? SIGNAL_MAX : snr / 5;
+        lv_obj_set_style_text_color(g_lbl_link, signal_color(level, SIGNAL_MAX), 0);
+    } else {
+        lv_label_set_text_fmt(g_lbl_link, "%s No Link", LV_SYMBOL_WIFI);
+        lv_obj_set_style_text_color(g_lbl_link, COLOR_WARN, 0);
+    }
+
+    int distance = linkstate_distance_m();
+    if (connected && distance != MLM_LINKINFO_NONE) {
+        lv_label_set_text_fmt(g_lbl_distance, "%s %d m", LV_SYMBOL_GPS, distance);
+        lv_obj_set_style_text_color(g_lbl_distance, COLOR_TEXT, 0);
+    } else {
+        lv_label_set_text_fmt(g_lbl_distance, "%s -- m", LV_SYMBOL_GPS);
+        lv_obj_set_style_text_color(g_lbl_distance, COLOR_TEXT_DIM, 0);
+    }
+}
+
+/* Update the air-unit battery + temperature from the :10000 status frames. @p show_temp gates the
+ * temperature field (the Show Temperature setting), matching the goggle temp. */
+static void update_air_fields(const air_telem_t *air, int show_temp)
+{
+    if (air->have_voltage) {
+        int cv = air->voltage_mV / 10;   /* mV -> centivolts, e.g. 7420 -> 742 -> "7.42V" */
+        lv_label_set_text_fmt(g_lbl_quad_battery, "%s %d.%02dV", LV_SYMBOL_BATTERY_2, cv / 100, cv % 100);
+        lv_obj_set_style_text_color(g_lbl_quad_battery, COLOR_TEXT, 0);
+    } else {
+        lv_label_set_text_fmt(g_lbl_quad_battery, "%s --.-V", LV_SYMBOL_BATTERY_2);
+        lv_obj_set_style_text_color(g_lbl_quad_battery, COLOR_TEXT_DIM, 0);
+    }
+
+    if (show_temp) {
+        if (air->have_temp) {
+            lv_label_set_text_fmt(g_lbl_quad_temp, "%d°C", air->temp_c);
+            lv_obj_set_style_text_color(g_lbl_quad_temp, COLOR_TEXT, 0);
+        } else {
+            lv_label_set_text(g_lbl_quad_temp, "--°C");
+            lv_obj_set_style_text_color(g_lbl_quad_temp, COLOR_TEXT_DIM, 0);
+        }
+        lv_obj_remove_flag(g_lbl_quad_temp, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(g_lbl_quad_temp, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+void sysosd_update(const telemetry_t *telemetry, const air_telem_t *air, settings_t *settings)
 {
     if (g_osd == NULL) {
         return;
@@ -174,29 +325,12 @@ void sysosd_update(const telemetry_t *telemetry, settings_t *settings)
         return;
     }
 
-    /* LVGL's built-in printf has no %f, so format the floats with integer math. */
-    if (telemetry->have_battery) {
-        float per_cell = (telemetry->cell_count > 0)
-                         ? telemetry->pack_volts / telemetry->cell_count
-                         : telemetry->pack_volts;
-        int volts_tenths = (int) (telemetry->pack_volts * 10.0f + 0.5f);
+    int connected = linkstate_airunit_connected();
+    int show_temp = settings_get_bool_in(settings, GOG_SECTION, "show_temperature", 1);
 
-        int alarm_on = settings_get_bool_in(settings, GOG_SECTION, "low_voltage_alarm", 1);
-        float threshold = (float) atof(settings_get_string_in(settings, GOG_SECTION, "min_cell_voltage", "3.4V"));
-        g_alarm_active = (alarm_on && per_cell < threshold);
-        lv_obj_set_style_text_color(g_lbl_battery, g_alarm_active ? COLOR_WARN : COLOR_TEXT, 0);
-
-        if (telemetry->cell_count > 0) {
-            lv_label_set_text_fmt(g_lbl_battery, "%s %d.%dV (%dS)", battery_icon_for(per_cell),
-                                  volts_tenths / 10, volts_tenths % 10, telemetry->cell_count);
-        } else {
-            lv_label_set_text_fmt(g_lbl_battery, "%s %d.%dV", battery_icon_for(per_cell),
-                                  volts_tenths / 10, volts_tenths % 10);
-        }
-    } else {
-        g_alarm_active = 0;
-        lv_label_set_text(g_lbl_battery, LV_SYMBOL_BATTERY_FULL " --.-V");
-    }
+    update_goggle_battery(telemetry, settings);
+    update_link_fields(connected);
+    update_air_fields(air, show_temp);
 
     if (telemetry->have_sdcard) {
         lv_label_set_text_fmt(g_lbl_sdcard, "%s %dG", LV_SYMBOL_SD_CARD, (int) (telemetry->sd_free_gb + 0.5f));
@@ -204,8 +338,7 @@ void sysosd_update(const telemetry_t *telemetry, settings_t *settings)
         lv_label_set_text(g_lbl_sdcard, LV_SYMBOL_SD_CARD " --");
     }
 
-    /* Temperature: shown only when the Show Temperature setting is on and a reading exists. */
-    int show_temp = settings_get_bool_in(settings, GOG_SECTION, "show_temperature", 1);
+    /* Goggle SoC temperature, shown only when the Show Temperature setting is on and a reading exists. */
     if (show_temp && telemetry->have_temp) {
         lv_label_set_text_fmt(g_lbl_temp, "%d°C", telemetry->temp_c);
         lv_obj_remove_flag(g_lbl_temp, LV_OBJ_FLAG_HIDDEN);

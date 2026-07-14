@@ -43,12 +43,12 @@ enum {
     OSD10K_PERIODIC_OFF_VOLTAGE_MV = 4,     /* u16 */
 };
 
-/* type 0x09 (version) payload (see the RE note; link metrics are LIKELY RSSI, still not anchored): */
+/* type 0x09 (version) payload: */
 enum {
     OSD10K_VERSION_OFF_HW         = 0,      /* char[16] */
     OSD10K_VERSION_OFF_FW         = 32,     /* char[16] */
     OSD10K_VERSION_OFF_VOLTAGE_MV = 96,     /* u16 */
-    OSD10K_VERSION_OFF_LINK_A     = 98,     /* u16, LIKELY RSSI / link-quality */
+    OSD10K_VERSION_OFF_TEMP_C     = 98,     /* u16, air-unit temperature in deg C */
     OSD10K_VERSION_OFF_LINK_B     = 116,    /* u8,  candidate SNR / link-quality */
 };
 
@@ -69,8 +69,8 @@ typedef struct {
     char     hw[17];        /* NUL-terminated */
     char     fw[17];        /* NUL-terminated */
     uint16_t voltage_mV;
-    uint16_t link_a;        /* LIKELY RSSI / link-quality */
-    uint8_t  link_b;        /* candidate SNR */
+    uint16_t air_temp_c;    /* @98: air-unit temperature in deg C */
+    uint8_t  link_b;        /* @116: candidate SNR / link-quality */
 } osd_version_t;
 
 #endif /* HUD_OSD_PROTO_H */

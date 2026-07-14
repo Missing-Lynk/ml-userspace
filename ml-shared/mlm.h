@@ -41,6 +41,7 @@ enum mlm_type {
     MLM_T_LED        = 0x0006, /* any producer -> ml-ledd: set the status LED pattern */
     MLM_T_CMD        = 0x0007, /* HUD -> ml-pipeline (ctrl.sock): a control command */
     MLM_T_STATE      = 0x0008, /* ml-pipeline -> HUD (telemetry.sock): current pipeline mode */
+    MLM_T_LINKINFO   = 0x0009, /* ml-linkd -> HUD (telemetry.sock): local baseband link metrics */
 };
 
 struct mlm_hdr {
@@ -71,6 +72,23 @@ enum mlm_link_state {
 struct mlm_link {
     uint32_t state; /* enum mlm_link_state */
     uint32_t reserved;
+} __attribute__((packed));
+
+/* MLM_T_LINKINFO payload (ml-linkd -> HUD on telemetry.sock). The local AR8030 baseband link
+ * metrics ml-linkd reads from its GET replies, republished ~1 Hz so the HUD's System OSD can show
+ * the air-unit side. These are LOCAL-goggle readings (RF ranging + link quality), distinct from the
+ * air unit's own :10000 status frames (voltage/temperature) that ride MLM_T_STATUS. Each field is
+ * self-describing: a sentinel means "not known yet / no link", so the HUD renders a dim placeholder.
+ */
+/* channel/snr/distance sentinel: unknown or no link. INT32_MIN (not -1) so it never collides with a
+ * valid reading - SNR in dB can legitimately be negative on a weak link. */
+#define MLM_LINKINFO_NONE INT32_MIN
+
+struct mlm_linkinfo {
+    int32_t  channel;      /* display channel number (1..16), or MLM_LINKINFO_NONE */
+    int32_t  snr_db;       /* link SNR in dB (from Get1V1Info), or MLM_LINKINFO_NONE */
+    int32_t  distance_m;   /* RF-ranging distance in metres, or MLM_LINKINFO_NONE (not ranging) */
+    uint32_t flags;        /* reserved for future validity/quality bits */
 } __attribute__((packed));
 
 /* MLM_T_LED payload (any producer -> ml-ledd). ml-ledd renders the animation itself

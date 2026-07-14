@@ -28,6 +28,13 @@ void linkstate_set_osd_cb(const osd_channel_cb_t *cb, void *ctx);
 /** @brief Whether the air unit is currently connected (its telemetry seen within the staleness window). */
 int linkstate_airunit_connected(void);
 
+/** @brief Local baseband link metrics from ml-linkd's MLM_T_LINKINFO. Each returns MLM_LINKINFO_NONE
+ *  (-1) until a value has been received / while the link is down, so the System OSD shows a dim
+ *  placeholder. Channel is the display number (1..16); SNR is in dB; distance is in metres. */
+int linkstate_channel(void);
+int linkstate_snr_db(void);
+int linkstate_distance_m(void);
+
 /** @brief ml-pipeline's last-reported mode (MLM_STATE_* from ml-shared/mlm.h). Defaults to
  *  MLM_STATE_IDLE until the pipeline broadcasts. The pipeline re-asserts every second, so this
  *  reconverges after a HUD or pipeline restart. */
