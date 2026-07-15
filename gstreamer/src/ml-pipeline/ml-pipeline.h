@@ -192,6 +192,7 @@ struct ctx {
     } next_it,                          /* mailbox: newest frame awaiting flip */
       front_it, pending_it,             /* display-thread-only: on-screen / flip-in-flight */
       prev_it;                          /* retired one flip late, see drm_flip_handler */
+    gint64 pending_since;               /* monotonic us when pending_it's flip was submitted */
     GstClockTime next_pts;
     int wake_r, wake_w;                 /* self-pipe to kick the display thread */
 
