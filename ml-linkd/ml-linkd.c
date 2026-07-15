@@ -104,6 +104,15 @@
 #define STANDBY_OFF_MODE 20               /* body offset 0 = datagram offset 20 (u32 work-mode) */
 #define STANDBY_MODE_ON  1                /* work-mode 1 = standby (0 = normal, 2 = airscrew/armed) */
 
+/* STB_EVENT_ACK (msg 0x1b): the goggle->air ack that COMPLETES the air's standby entry. Without it the
+ * air holds at full fps - it hard-gates its fps/power drop on receiving this ack (air StbThread checks
+ * handle+0x188, set only by StbAck / FSM case 0x1b). Stock sends one per standby transition. Empty body:
+ * just the 24-byte header with msg_type 0x1b + timestamp. Verified by HW capture (slota-airconfig
+ * `1b0000...`) and static RE (AR_LOWDELAY_RX_SYSCTRL_StbThread @004392a8; air StbAck @42327 gates fps
+ * @40566). */
+#define MP_STBACK        0x1b
+#define STBACK_LEN       24               /* header only, no body */
+
 /* :10000 SetTranParm (msg 0x0D) - the air's TX-power + standby-arm datagram. Byte layout is the
  * HW-confirmed vendor tuple (see plans/rf-air-config.md): a 34-byte payload, 10-byte body at payload
  * offset 20. body[0] = TX power dBm, body[1] = 0x04 (const), body[8] = u8StandbyModeEn. We send the
@@ -630,6 +639,21 @@ static void *udp_thread(void *arg)
                 if (g_verbose) {
                     fprintf(stderr, TAG " standby work-mode=%u\n", wm);
                 }
+
+                /* Ack a standby entry so the air actually drops to its low-power fps - it gates that
+                 * drop on this 0x1b and holds full fps until it arrives (see MP_STBACK). The air only
+                 * emits 0x12 on a work-mode change, so one ack per standby-mode report matches stock. */
+                if (wm == STANDBY_MODE_ON) {
+                    uint8_t ack[STBACK_LEN];
+                    memset(ack, 0, sizeof ack);
+                    ack[0] = MP_STBACK;
+                    memcpy(ack + 8, &stamp_us, 4);
+                    sendto(params_sock, ack, sizeof ack, 0,
+                           (struct sockaddr *)&air_params, sizeof air_params);
+                    if (g_verbose) {
+                        fprintf(stderr, TAG " tx StbAck (0x1b)\n");
+                    }
+                }
             }
         }
 
@@ -796,8 +820,10 @@ int main(int argc, char **argv)
                                          bf->seq, bf->payload, bf->plen), "open");
         usleep(OPEN_STEP_US);
     }
+
     send_frame(frame, bb_set_power(frame, RF_TX, 0x17, seq_video++), "tx-power");          /* 23 dBm */
     usleep(20000);
+
     send_frame(frame, bb_set_power_auto(frame, 1, seq_video++), "tx-power-auto");
     usleep(20000);
 
