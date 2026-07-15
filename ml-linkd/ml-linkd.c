@@ -45,6 +45,7 @@
 
 #include "../ml-shared/mlm.h"
 #include "bb-cmd.h"
+#include "mp-cmd.h"
 
 #define TAG              "[ml-linkd]"
 #define DEV_NODE         "/dev/artosyn_sdio"
@@ -92,39 +93,10 @@
 #define DIST_OFF_RESULT  0x00
 #define DIST_NONE        0xFFFFFFFFu   /* GetDistance result when no ranging fix (bench / no GPS) */
 
-/* :10000 params-handshake message types (LE u32, byte 0) */
-#define MP_REQUEST       1
-#define MP_REPLY         2
-#define MP_ACK           3
-/* :10000 air-to-goggle telemetry types */
-#define AIR_MSP          0x10             /* MSP DisplayPort canvas */
-#define AIR_STATUS_A     0x09
-#define AIR_STATUS_B     0x11
-#define AIR_STANDBY      0x12             /* SetStandyMode: air's work-mode sync (body[0]: 1=standby) */
-#define STANDBY_OFF_MODE 20               /* body offset 0 = datagram offset 20 (u32 work-mode) */
+/* :10000 message types + goggle->air builders live in mp-cmd.h. These are the receive-parse details
+ * for the air's SetStandyMode (0x12) work-mode word. */
+#define STANDBY_OFF_MODE 20               /* work-mode u32 at datagram offset 20 (body offset 0) */
 #define STANDBY_MODE_ON  1                /* work-mode 1 = standby (0 = normal, 2 = airscrew/armed) */
-
-/* STB_EVENT_ACK (msg 0x1b): the goggle->air ack that COMPLETES the air's standby entry. Without it the
- * air holds at full fps - it hard-gates its fps/power drop on receiving this ack (air StbThread checks
- * handle+0x188, set only by StbAck / FSM case 0x1b). Stock sends one per standby transition. Empty body:
- * just the 24-byte header with msg_type 0x1b + timestamp. Verified by HW capture (slota-airconfig
- * `1b0000...`) and static RE (AR_LOWDELAY_RX_SYSCTRL_StbThread @004392a8; air StbAck @42327 gates fps
- * @40566). */
-#define MP_STBACK        0x1b
-#define STBACK_LEN       24               /* header only, no body */
-
-/* :10000 SetTranParm (msg 0x0D) - the air's TX-power + standby-arm datagram. Byte layout is the
- * HW-confirmed vendor tuple (see plans/rf-air-config.md): a 34-byte payload, 10-byte body at payload
- * offset 20. body[0] = TX power dBm, body[1] = 0x04 (const), body[8] = u8StandbyModeEn. We send the
- * known-good tuple verbatim and vary only power (body[0]) and standby (body[8]); fabricating other
- * RF bytes can reboot the goggle, so nothing else is touched. */
-#define MP_SETTRANPARM   0x0D
-#define STP_LEN          34               /* full :10000 SetTranParm payload */
-#define STP_OFF_BODY     20               /* body starts here (0x0D uses the [20..23] word) */
-#define STP_OFF_POWER    (STP_OFF_BODY + 0)  /* body[0]: TX power in dBm */
-#define STP_OFF_CONST    (STP_OFF_BODY + 1)  /* body[1]: 0x04, constant in every captured frame */
-#define STP_OFF_STANDBY  (STP_OFF_BODY + 8)  /* body[8]: u8StandbyModeEn (0/1) */
-#define STP_BODY_LEN     0x0A             /* header length field (payload off 16) */
 
 /* HW-confirmed mW -> dBm values for SetTranParm body[0] (plans/rf-air-config.md §2). Only these three
  * levels are valid; a fabricated dBm can reboot the goggle, so map_power_dbm returns -1 for anything
@@ -139,7 +111,6 @@ enum air_tx_dbm {
 /* datagram buffer sizes */
 #define PKT_MAX          600              /* receive buffer */
 #define HELLO_LEN        520              /* :20001 hello datagram */
-#define PARAMS_LEN       24               /* :10000 params message */
 
 static volatile int g_run = 1;
 static int g_fd = -1;                       /* /dev/artosyn_sdio */
@@ -447,7 +418,7 @@ static void *udp_thread(void *arg)
     int one = 1;
     struct sockaddr_in local, air_hello, air_params;
     struct sockaddr_un link_un = { .sun_family = AF_UNIX };
-    uint8_t hello[HELLO_LEN], params_req[PARAMS_LEN], params_ack[PARAMS_LEN];
+    uint8_t hello[HELLO_LEN];
     long last_hello = 0, last_req = 0, last_led = 0, last_stp = 0;
 
     (void)arg;
@@ -483,10 +454,6 @@ static void *udp_thread(void *arg)
     }
 
     memset(hello, 0, sizeof hello);
-    memset(params_req, 0, sizeof params_req);
-    params_req[0] = MP_REQUEST;
-    memset(params_ack, 0, sizeof params_ack);
-    params_ack[0] = MP_ACK;
 
     while (g_run) {
         long now = now_ms();
@@ -589,8 +556,8 @@ static void *udp_thread(void *arg)
         if ((g_no_gate || g_ready) && g_hs_done && !g_video_confirmed
             && (!g_params_acked || now - g_last_ack_ms > ACK_GRACE_MS)
             && now - last_req >= PARAMS_IVL_MS) {
-            memcpy(params_req + 8, &stamp_us, 4);
-            sendto(params_sock, params_req, sizeof params_req, 0,
+            uint8_t frame[MP_HDR_LEN];
+            sendto(params_sock, frame, mp_params_request(frame, stamp_us), 0,
                    (struct sockaddr *)&air_params, sizeof air_params);
             last_req = now;
 
@@ -617,8 +584,8 @@ static void *udp_thread(void *arg)
 
             memcpy(&msg_type, rx, 4);       /* LE u32 msg type, common to both families */
             if (msg_type == MP_REPLY) {     /* MEDIA_PARAMS reply -> type3 ACK, video starts */
-                memcpy(params_ack + 8, &stamp_us, 4);
-                sendto(params_sock, params_ack, sizeof params_ack, 0,
+                uint8_t frame[MP_HDR_LEN];
+                sendto(params_sock, frame, mp_params_ack(frame, stamp_us), 0,
                        (struct sockaddr *)&air_params, sizeof air_params);
                 g_last_ack_ms = now;
 
@@ -627,11 +594,11 @@ static void *udp_thread(void *arg)
                     link_event(MLM_LINK_PARAMS_ACKED, "MEDIA_PARAMS acked, video should start");
                     led_cmd(MLM_LED_SOLID, 0x00, 0xff, 0x00, 0);
                 }
-            } else if (msg_type == AIR_MSP) {
+            } else if (msg_type == MP_MSP) {
                 mlm_pub(MLM_OSD_SOCK, MLM_T_MSP, rx, n);
-            } else if (msg_type == AIR_STATUS_A || msg_type == AIR_STATUS_B) {
+            } else if (msg_type == MP_STATUS_A || msg_type == MP_STATUS_B) {
                 mlm_pub(MLM_TELEMETRY_SOCK, MLM_T_STATUS, rx, n);
-            } else if (msg_type == AIR_STANDBY && n >= STANDBY_OFF_MODE + 4) {
+            } else if (msg_type == MP_STANDBY && n >= STANDBY_OFF_MODE + 4) {
                 /* the air reports its live work-mode on every change; latch it for the HUD icon */
                 uint32_t wm;
                 memcpy(&wm, rx + STANDBY_OFF_MODE, 4);
@@ -644,11 +611,8 @@ static void *udp_thread(void *arg)
                  * drop on this 0x1b and holds full fps until it arrives (see MP_STBACK). The air only
                  * emits 0x12 on a work-mode change, so one ack per standby-mode report matches stock. */
                 if (wm == STANDBY_MODE_ON) {
-                    uint8_t ack[STBACK_LEN];
-                    memset(ack, 0, sizeof ack);
-                    ack[0] = MP_STBACK;
-                    memcpy(ack + 8, &stamp_us, 4);
-                    sendto(params_sock, ack, sizeof ack, 0,
+                    uint8_t frame[MP_HDR_LEN];
+                    sendto(params_sock, frame, mp_stb_ack(frame, stamp_us), 0,
                            (struct sockaddr *)&air_params, sizeof air_params);
                     if (g_verbose) {
                         fprintf(stderr, TAG " tx StbAck (0x1b)\n");
@@ -676,18 +640,11 @@ static void *udp_thread(void *arg)
          * 100 mW / disarmed) so a fabricated byte never reaches the air. */
         if ((g_standby_arm >= 0 || g_power_dbm >= 0)
             && g_hs_done && !g_air_lost && now - last_stp >= STANDBY_IVL_MS) {
-            uint8_t stp[STP_LEN];
+            uint8_t frame[MP_STP_LEN];
             uint8_t power   = (g_power_dbm >= 0) ? (uint8_t) g_power_dbm : AIR_TX_DBM;
             uint8_t standby = (g_standby_arm >= 0) ? (uint8_t) g_standby_arm : 0;
 
-            memset(stp, 0, sizeof stp);
-            stp[0] = MP_SETTRANPARM;
-            stp[16] = STP_BODY_LEN;
-            memcpy(stp + 8, &stamp_us, 4);
-            stp[STP_OFF_POWER]   = power;
-            stp[STP_OFF_CONST]   = 0x04;
-            stp[STP_OFF_STANDBY] = standby;
-            sendto(params_sock, stp, sizeof stp, 0,
+            sendto(params_sock, frame, mp_set_tran_parm(frame, power, standby, stamp_us), 0,
                    (struct sockaddr *)&air_params, sizeof air_params);
             last_stp = now;
 
@@ -821,7 +778,8 @@ int main(int argc, char **argv)
         usleep(OPEN_STEP_US);
     }
 
-    send_frame(frame, bb_set_power(frame, RF_TX, 0x17, seq_video++), "tx-power");          /* 23 dBm */
+    /* 23 dBm */
+    send_frame(frame, bb_set_power(frame, RF_TX, 0x17, seq_video++), "tx-power");
     usleep(20000);
 
     send_frame(frame, bb_set_power_auto(frame, 1, seq_video++), "tx-power-auto");
