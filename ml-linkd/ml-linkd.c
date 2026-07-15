@@ -116,6 +116,9 @@ static volatile int g_run = 1;
 static int g_fd = -1;                       /* /dev/artosyn_sdio */
 static int g_verbose;
 static int g_no_gate;
+static int g_send_ldcfg;   /* opt-in (--ldcfg): push the SetLdCfg association blob. OFF by default: it
+                            * carries stock-captured config and is the suspected air-wedge, so only
+                            * send it under a deliberate, watched test. */
 
 /* handshake/link state shared between the FSM tick (main) and the UDP thread.
  * All plain ints/timestamps, single writer per field, so volatile is enough. */
@@ -514,7 +517,7 @@ static void *udp_thread(void *arg)
             if (((struct mlm_ready *)(rx + sizeof *hdr))->frames_seen
                 && g_params_acked && !g_video_confirmed) {
                 g_video_confirmed = 1;
-                printf(TAG " consumer confirms frames arriving; type1 poll stops\n");
+                printf(TAG " consumer confirms frames arriving\n");
                 fflush(stdout);
             }
         }
@@ -527,7 +530,7 @@ static void *udp_thread(void *arg)
 
         /* :20001 hello until the 3-way is done (vendor goes quiet after) */
         if (!g_hs_done && now - last_hello >= HELLO_IVL_MS) {
-            sendto(hello_sock, hello, sizeof hello, 0,
+            sendto(hello_sock, hello, sizeof hello, MSG_DONTWAIT,
                    (struct sockaddr *)&air_hello, sizeof air_hello);
             last_hello = now;
         }
@@ -542,7 +545,7 @@ static void *udp_thread(void *arg)
                     ack[5] = 0x00;
                 }
 
-                sendto(hello_sock, ack, n, 0, (struct sockaddr *)&air_hello, sizeof air_hello);
+                sendto(hello_sock, ack, n, MSG_DONTWAIT, (struct sockaddr *)&air_hello, sizeof air_hello);
                 if (!g_hs_done) {
                     g_hs_done = 1;
                     printf(TAG " :20001 3-way done (air identity %zd B, type2 ACK sent)\n", n);
@@ -551,13 +554,19 @@ static void *udp_thread(void *arg)
             }
         }
 
-        /* :10000 params request: READY-gated, vendor 2 s rate, quiet once the consumer
-         * confirmed frames, grace after each type3 ACK before re-polling */
-        if ((g_no_gate || g_ready) && g_hs_done && !g_video_confirmed
-            && (!g_params_acked || now - g_last_ack_ms > ACK_GRACE_MS)
+        /* :10000 poll: a type-1 request every 2 s for the WHOLE session, matching the vendor's
+         * ParamsTimerEvent (which never stops). The air replies 0x02 to each - harmless, no air-side
+         * state change (RE of AR_FSM_TX_ProcessParamsRequest) - and those replies keep :10000 RX
+         * fresh so the air-loss watch below only trips on a real baseband drop. We used to STOP this
+         * poll once the consumer reported frames (g_video_confirmed); that let the air's :10000
+         * telemetry go quiet and tripped a FALSE air-loss every ~5 s, so video cut out and re-
+         * handshook in a ~10 s loop. Pre-media the poll is READY-gated so the air's first IDR lands
+         * with a bound consumer; once acked it is the ungated keepalive (the air's 0x02 reply then
+         * drives the type-3 ACK below, i.e. the vendor's steady-state 2 s :10000 datagram). */
+        if (g_hs_done && (g_no_gate || g_ready || g_params_acked)
             && now - last_req >= PARAMS_IVL_MS) {
             uint8_t frame[MP_HDR_LEN];
-            sendto(params_sock, frame, mp_params_request(frame, stamp_us), 0,
+            sendto(params_sock, frame, mp_params_request(frame, stamp_us), MSG_DONTWAIT,
                    (struct sockaddr *)&air_params, sizeof air_params);
             last_req = now;
 
@@ -583,9 +592,26 @@ static void *udp_thread(void *arg)
             }
 
             memcpy(&msg_type, rx, 4);       /* LE u32 msg type, common to both families */
-            if (msg_type == MP_REPLY) {     /* MEDIA_PARAMS reply -> type3 ACK, video starts */
+            if (msg_type == MP_REPLY) {     /* MEDIA_PARAMS reply -> [SetLdCfg] -> type3 ACK, video starts */
+                /* Match the vendor's per-cycle sequence exactly: after the air's 0x02 reply the goggle
+                 * sends SetLdCfg (0x0A), THEN the 0x03 ack that starts video (capture: 01 -> 02 -> 0a ->
+                 * 03 -> 15). Sending it here - as part of the handshake, before video - is the vendor
+                 * placement; sending it post-ack (mid-stream) reconfigured a live encoder and wedged the
+                 * air. Opt-in (--ldcfg) until the vendor-correct timing is HW-validated. The
+                 * !g_params_acked guard makes it fire ONCE per session (the first 0x02): now that the
+                 * poll runs for the whole session, 0x02 replies arrive every 2 s, and re-sending
+                 * SetLdCfg on each would be exactly that mid-stream reconfig. */
+                if (!g_params_acked && g_send_ldcfg && g_power_dbm >= 0) {
+                    uint8_t cfg[MP_LDCFG_LEN];
+                    sendto(params_sock, cfg, mp_set_ld_cfg(cfg, (uint8_t) g_power_dbm, 0, stamp_us), MSG_DONTWAIT,
+                           (struct sockaddr *)&air_params, sizeof air_params);
+                    if (g_verbose) {
+                        fprintf(stderr, TAG " tx SetLdCfg (power=0x%02x)\n", g_power_dbm);
+                    }
+                }
+
                 uint8_t frame[MP_HDR_LEN];
-                sendto(params_sock, frame, mp_params_ack(frame, stamp_us), 0,
+                sendto(params_sock, frame, mp_params_ack(frame, stamp_us), MSG_DONTWAIT,
                        (struct sockaddr *)&air_params, sizeof air_params);
                 g_last_ack_ms = now;
 
@@ -612,7 +638,7 @@ static void *udp_thread(void *arg)
                  * emits 0x12 on a work-mode change, so one ack per standby-mode report matches stock. */
                 if (wm == STANDBY_MODE_ON) {
                     uint8_t frame[MP_HDR_LEN];
-                    sendto(params_sock, frame, mp_stb_ack(frame, stamp_us), 0,
+                    sendto(params_sock, frame, mp_stb_ack(frame, stamp_us), MSG_DONTWAIT,
                            (struct sockaddr *)&air_params, sizeof air_params);
                     if (g_verbose) {
                         fprintf(stderr, TAG " tx StbAck (0x1b)\n");
@@ -644,7 +670,7 @@ static void *udp_thread(void *arg)
             uint8_t power   = (g_power_dbm >= 0) ? (uint8_t) g_power_dbm : AIR_TX_DBM;
             uint8_t standby = (g_standby_arm >= 0) ? (uint8_t) g_standby_arm : 0;
 
-            sendto(params_sock, frame, mp_set_tran_parm(frame, power, standby, stamp_us), 0,
+            sendto(params_sock, frame, mp_set_tran_parm(frame, power, standby, stamp_us), MSG_DONTWAIT,
                    (struct sockaddr *)&air_params, sizeof air_params);
             last_stp = now;
 
@@ -652,6 +678,9 @@ static void *udp_thread(void *arg)
                 fprintf(stderr, TAG " tx SetTranParm standby=%d power=0x%02x\n", standby, power);
             }
         }
+
+        /* (SetLdCfg is sent in the MEDIA_PARAMS 0x02-reply handler above, before the 0x03 ack, to match
+         * the vendor's per-cycle 01->02->0a->03 sequence - not here.) */
 
         /* re-assert the LED ~1 Hz so a late-started/restarted ml-ledd reconverges;
          * also paints breathe-red from the first tick, before any link is up */
@@ -722,8 +751,10 @@ int main(int argc, char **argv)
             g_no_gate = 1;
         } else if (!strcmp(argv[i], "-v")) {
             g_verbose = 1;
+        } else if (!strcmp(argv[i], "--ldcfg")) {
+            g_send_ldcfg = 1;
         } else {
-            fprintf(stderr, "usage: ml-linkd [-d /dev/artosyn_sdio] [--no-gate] [-v]\n");
+            fprintf(stderr, "usage: ml-linkd [-d /dev/artosyn_sdio] [--no-gate] [-v] [--ldcfg]\n");
             return 2;
         }
     }

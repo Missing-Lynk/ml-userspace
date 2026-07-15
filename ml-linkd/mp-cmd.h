@@ -14,6 +14,7 @@
 #ifndef MP_CMD_H
 #define MP_CMD_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -86,6 +87,132 @@ static inline int mp_set_tran_parm(uint8_t *frame, uint8_t dbm, uint8_t standby,
     frame[MP_OFF_BODY + 1] = 0x04;      /* body[1]: const */
     frame[MP_OFF_BODY + 8] = standby;   /* body[8]: u8StandbyModeEn (0/1) */
     return MP_STP_LEN;
+}
+
+/* SetLdCfg (0x0A): the low-delay/video config the goggle sends at ASSOCIATION. It seeds the air's
+ * handle+0x118 (from the power byte) on every (re)association, so it is the DURABLE TX-power lever -
+ * SetTranParm's live write is otherwise clobbered here.
+ *
+ * The datagram is a 20-byte header + a 192-byte (0xC0) BODY at wire offset 0x14 + 4 ignored trailer
+ * bytes = 216. The air does memcpy(handle+0xb0, body, 0xc0), so struct offset S -> handle 0xb0+S. The
+ * body is decoded below as `struct mp_ldcfg` (field-by-field RE in re/ghidra ar_lowdelay SetLdCfg
+ * @004487a0 + cross-diff of glue/capture/out/ldcfg-*.hex; full table in plans/rf-air-config.md).
+ *
+ * We only SET the two CONFIRMED, cleanly-decoded levers (tx_power_dbm, bitrate_q); everything else is
+ * sent verbatim from a known-good capture, because most fields are camera/OSD/rate-control state whose
+ * exact encoding is undecoded and a fabricated RF/config byte can reboot the goggle. */
+#define MP_LDCFG_LEN       216
+#define MP_LDCFG_BODY_OFF  0x14   /* body (struct mp_ldcfg) starts here in the datagram */
+
+/* Decoded SetLdCfg body (192 B). Only fields marked [SET] are varied by ml-linkd; the rest ride the
+ * captured default. Named fields are CONFIRMED (HW cross-diff or a direct handle-offset RE read);
+ * `reservedNN` gaps are undecoded vendor state sent byte-for-byte. Offsets are asserted below. */
+/* [C]=CONFIRMED (HW cross-diff / direct handle-offset RE); [I]=INFERRED (an ar_lowdelay setter writes
+ * this handle offset); [?]=undecoded, sent verbatim. Only [SET] fields are varied by ml-linkd. */
+struct __attribute__((packed)) mp_ldcfg {
+    uint8_t  valid;             /* 0x00  config-present/version flag (=1)                         [I] */
+    uint8_t  caps_flags1;       /* 0x01  session capability bitfield (=0x0f; NOT the ROI enable)  [C] */
+    uint16_t brightness;        /* 0x02  ISP brightness (SetCameraInfo sel0)                      [I] */
+    uint16_t exposure_manual;   /* 0x04  ISP AE manual flag (sel1)                                [I] */
+    uint16_t exposure_time;     /* 0x06  ISP exposure us (sel1; =16666 ~ 1/60 s)                  [I] */
+    uint16_t cam_unk08;         /* 0x08  ISP misc (=14)                                           [?] */
+    uint16_t reserved0a;        /* 0x0a                                                           [?] */
+    uint16_t saturation;        /* 0x0c  ISP saturation (sel2)                                    [I] */
+    uint16_t sharpness;         /* 0x0e  ISP sharpness (sel3)                                     [I] */
+    uint16_t wb_manual;         /* 0x10  ISP white-balance manual flag (sel4)                     [I] */
+    uint16_t white_balance;     /* 0x12  ISP WB color temp K (sel4; =5000)                        [I] */
+    uint16_t rotation;          /* 0x14  image rotation (sel5)                                    [I] */
+    uint16_t aspect_ratio;      /* 0x16  aspect ratio (sel6)                                      [I] */
+    uint16_t nr3d_en;           /* 0x18  3D-DNR enable (sel7)                                     [I] */
+    uint16_t nr2d_en;           /* 0x1a  2D-DNR enable (sel8)                                     [I] */
+    uint16_t iso;               /* 0x1c  ISO (sel9; =100)                                         [I] */
+    uint16_t cam_unk1e;         /* 0x1e  ISO/gain related (=6300)                                 [?] */
+    uint16_t cam_unk20;         /* 0x20  (=100)                                                   [?] */
+    uint16_t contrast;          /* 0x22  contrast (sel10)                                         [I] */
+    uint8_t  scale_mode;        /* 0x24  VIN scale/aspect flag                                    [I] */
+    uint8_t  scale_unk25;       /* 0x25                                                           [I] */
+    uint16_t reserved26;        /* 0x26                                                           [?] */
+    float    zoom_factor;       /* 0x28  VIN zoom (=1.0 = none)                                   [I] */
+    uint8_t  reserved2c[4];     /* 0x2c  (=01 01 06 00)                                           [?] */
+    uint16_t osd_unk30;         /* 0x30  OSD param block                                          [I] */
+    uint16_t osd_unk32;         /* 0x32  OSD param block                                          [I] */
+    uint16_t canvas_w;          /* 0x34  OSD canvas width  (=53; UpdateCanvasInfo)                [I] */
+    uint16_t canvas_h;          /* 0x36  OSD canvas height (=20; UpdateCanvasInfo)                [I] */
+    uint16_t reserved38;        /* 0x38                                                           [?] */
+    uint16_t osd_rect[4];       /* 0x3a  OSD/viewfinder rect (=475,270,910,545; per-session)      [I] */
+    uint8_t  reserved42;        /* 0x42                                                           [?] */
+    uint8_t  roi_enable;        /* 0x43  air ROI/focus gate (=0 off; handle+0xf3)                 [C] */
+    uint8_t  unk44;             /* 0x44  codec/scan? (=1)                                         [?] */
+    uint8_t  unk45;             /* 0x45  framerate? (=4)                                          [?] */
+    uint16_t rec_width;         /* 0x46  encode/record width  (=1920)                             [C] */
+    uint16_t rec_height;        /* 0x48  encode/record height (=1080)                             [C] */
+    uint16_t unk4a;             /* 0x4a  (=316)                                                   [?] */
+    uint16_t reserved4c;        /* 0x4c                                                           [?] */
+    uint16_t unk4e;             /* 0x4e  (=264)                                                   [?] */
+    uint32_t reserved50;        /* 0x50                                                           [?] */
+    uint32_t threshold54;       /* 0x54  auto-ROI/skip threshold (=0x7fffffff = off/max)          [I] */
+    uint8_t  venc_flags58[13];  /* 0x58  VENC rate-control flags (undecoded)                      [?] */
+    uint16_t bitrate_q;         /* 0x65  bitrate in 250 kbps units (= Mbps * 4)          [C][SET]     */
+    uint8_t  reserved67;        /* 0x67                                                           [?] */
+    uint8_t  tx_power_dbm;      /* 0x68  TX power dBm (25=0x0e,100=0x14,200=0x17)        [C][SET]     */
+    uint8_t  tran_bw_mcs;       /* 0x69  SetTranParm mirror [1] bandwidth/MCS (verbatim)          [C] */
+    uint16_t tran_blk2;         /* 0x6a  SetTranParm mirror [2:3] (cold-boot=1920; verbatim)      [C] */
+    uint16_t tran_blk4;         /* 0x6c  SetTranParm mirror [4:5] (cold-boot=1080; verbatim)      [C] */
+    uint8_t  tran_blk6;         /* 0x6e  SetTranParm mirror [6] (verbatim)                        [I] */
+    uint8_t  tran_blk7;         /* 0x6f  SetTranParm mirror [7] (verbatim)                        [I] */
+    uint8_t  standby_mode_en;   /* 0x70  u8StandbyModeEn (handle+0x120; verbatim here)            [C] */
+    uint8_t  flags71[2];        /* 0x71  (=01 01)                                                 [?] */
+    uint8_t  caps_flags2;       /* 0x73  session capability bitfield (=0x12; NOT ROI)             [C] */
+    uint8_t  unk74;             /* 0x74  (=0x10)                                                  [?] */
+    char     dvr_path[0x40];    /* 0x75  air DVR record dir ("/tmp/sdcard/", NUL-terminated)      [C] */
+    uint8_t  tail_flags[11];    /* 0xB5  trailing flags (01 at 0xB5,0xB6,0xBB)                    [?] */
+};
+_Static_assert(sizeof(struct mp_ldcfg) == 0xC0, "mp_ldcfg body must be 192 bytes");
+_Static_assert(offsetof(struct mp_ldcfg, roi_enable)      == 0x43, "roi_enable offset");
+_Static_assert(offsetof(struct mp_ldcfg, rec_width)       == 0x46, "rec_width offset");
+_Static_assert(offsetof(struct mp_ldcfg, bitrate_q)       == 0x65, "bitrate_q offset");
+_Static_assert(offsetof(struct mp_ldcfg, tx_power_dbm)    == 0x68, "tx_power_dbm offset");
+_Static_assert(offsetof(struct mp_ldcfg, standby_mode_en) == 0x70, "standby_mode_en offset");
+_Static_assert(offsetof(struct mp_ldcfg, dvr_path)        == 0x75, "dvr_path offset");
+
+static const uint8_t mp_ldcfg_base[MP_LDCFG_LEN] = {
+    0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x01, 0x0f, 0x01, 0x00,
+    0x00, 0x00, 0x1a, 0x41, 0x0e, 0x00, 0x00, 0x00, 0x32, 0x00, 0x37, 0x00,
+    0x00, 0x00, 0x88, 0x13, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
+    0x64, 0x00, 0x9c, 0x18, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x80, 0x3f, 0x01, 0x01, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x35, 0x00, 0x14, 0x00, 0x00, 0x00, 0xdb, 0x01, 0x0e, 0x01, 0x8e, 0x03,
+    0x21, 0x02, 0x00, 0x00, 0x01, 0x04, 0x80, 0x07, 0x38, 0x04, 0x3c, 0x01,
+    0x00, 0x00, 0x08, 0x01, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0x7f,
+    0x00, 0xc8, 0x00, 0x00, 0x01, 0x00, 0x0a, 0x01, 0x01, 0x01, 0x01, 0x00,
+    0x00, 0x60, 0x00, 0x00, 0x17, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x01, 0x01, 0x12, 0x10, 0x2f, 0x74, 0x6d, 0x70, 0x2f, 0x73, 0x64,
+    0x63, 0x61, 0x72, 0x64, 0x2f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+
+/* Build a SetLdCfg from the captured base, varying only the decoded fields via the struct overlay.
+ * Pass dbm/mbps = 0 to keep the base value for that field. */
+static inline int mp_set_ld_cfg(uint8_t *frame, uint8_t dbm, uint8_t mbps, uint32_t stamp)
+{
+    memcpy(frame, mp_ldcfg_base, MP_LDCFG_LEN);
+    memcpy(frame + MP_OFF_STAMP, &stamp, 4);
+
+    struct mp_ldcfg *cfg = (struct mp_ldcfg *) (frame + MP_LDCFG_BODY_OFF);
+    if (dbm) {
+        cfg->tx_power_dbm = dbm;
+    }
+
+    if (mbps) {
+        cfg->bitrate_q = (uint16_t) (mbps * 4);      /* 250 kbps units */
+    }
+
+    return MP_LDCFG_LEN;
 }
 
 #endif /* MP_CMD_H */
