@@ -74,6 +74,7 @@ typedef struct {
     int            rec_is_auto;        /* the current recording was started by auto-record (not the button) */
     int            nosignal_sent;      /* latch: the "stream lost" no-signal-splash command was already sent */
     int            standby_asserted;   /* latch: the air-unit standby state was pushed for this link-up */
+    int            power_asserted;     /* latch: the air-unit TX power was pushed for this link-up */
     long           osd_frames;
     long           rendered;
     uint16_t       last_voltage_mV;  /* air-unit pack mV, from the 0x09/0x11 status frames */
@@ -476,6 +477,16 @@ int main(int argc, char **argv)
             h.standby_asserted = 1;
         } else if (!connected) {
             h.standby_asserted = 0;
+        }
+
+        /* Same once-per-link-up assertion for TX power: the menu default is 100 mW, so a user who
+         * never touches the row still needs it pushed. The stored value is the level label; linkcmd
+         * maps it to mW and ml-linkd re-applies it on its own session restarts. */
+        if (connected && !h.power_asserted) {
+            linkcmd_set_power(settings_get_string_in(h.settings, "air_unit", "power", "100 mW"));
+            h.power_asserted = 1;
+        } else if (!connected) {
+            h.power_asserted = 0;
         }
 
         /* Turning auto-record off stops the recording it started (never a manual one). Level-checked

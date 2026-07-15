@@ -88,9 +88,12 @@ static const gog_item_t g_dvr_items[] = {
 };
 #define DVR_ITEM_COUNT ((int) (sizeof(g_dvr_items) / sizeof(g_dvr_items[0])))
 
+static const char *const power_options[] = { "25 mW", "100 mW", "200 mW", NULL };
+
 /* Air-unit settings; the list is shown only while the air unit is linked (render_air_unit). */
 static const gog_item_t g_airunit_items[] = {
-    { ITEM_TOGGLE, "air_unit.standby", "standby", NULL, 0, 1, "standby" },
+    { ITEM_STEPPER, "air_unit.power",   "power",   power_options, 1, 0, "power" },
+    { ITEM_TOGGLE,  "air_unit.standby", "standby", NULL,          0, 1, "standby" },
 };
 #define AIRUNIT_ITEM_COUNT ((int) (sizeof(g_airunit_items) / sizeof(g_airunit_items[0])))
 
@@ -430,12 +433,19 @@ static void apply_item(const gog_item_t *item, const char *value)
     if (strcmp(item->action, "brightness") == 0) {
         backlight_set_percent(atoi(value));   /* atoi("60%") -> 60 */
     } else if (strcmp(item->action, "buzzer") == 0) {
-        buzzer_set_volume(atoi(value));   /* "Off" -> 0, "1".."10" */
-        tone_beep(lv_tick_get());         /* confirm the new volume with a beep */
+        /* "Off" -> 0, "1".."10" */
+        buzzer_set_volume(atoi(value));
+
+        /* confirm the new volume with a beep */
+        tone_beep(lv_tick_get());
     } else if (strcmp(item->action, "language") == 0) {
         set_language(value);
     } else if (strcmp(item->action, "standby") == 0) {
-        linkcmd_set_standby(strcmp(value, "on") == 0);   /* arm/disarm the air unit's standby */
+        /* arm/disarm the air unit's standby */
+        linkcmd_set_standby(strcmp(value, "on") == 0);
+    } else if (strcmp(item->action, "power") == 0) {
+        /* the level label ("100 mW"); linkcmd maps it to mW */
+        linkcmd_set_power(value);
     }
 }
 

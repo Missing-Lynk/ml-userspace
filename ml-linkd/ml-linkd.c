@@ -116,7 +116,16 @@
 #define STP_OFF_CONST    (STP_OFF_BODY + 1)  /* body[1]: 0x04, constant in every captured frame */
 #define STP_OFF_STANDBY  (STP_OFF_BODY + 8)  /* body[8]: u8StandbyModeEn (0/1) */
 #define STP_BODY_LEN     0x0A             /* header length field (payload off 16) */
-#define AIR_TX_DBM       0x14             /* 100 mW: the vendor MID default power (no power row yet) */
+
+/* HW-confirmed mW -> dBm values for SetTranParm body[0] (plans/rf-air-config.md §2). Only these three
+ * levels are valid; a fabricated dBm can reboot the goggle, so map_power_dbm returns -1 for anything
+ * else and the command is dropped. */
+enum air_tx_dbm {
+    AIR_TX_DBM_25  = 0x0e,   /* 25 mW  */
+    AIR_TX_DBM_100 = 0x14,   /* 100 mW */
+    AIR_TX_DBM_200 = 0x17,   /* 200 mW */
+};
+#define AIR_TX_DBM AIR_TX_DBM_100         /* vendor MID default, sent until the HUD commands a level */
 
 /* datagram buffer sizes */
 #define PKT_MAX          600              /* receive buffer */
@@ -151,7 +160,30 @@ static volatile int g_distance_m = MLM_LINKINFO_NONE;
  * ml-linkd re-sends the SetTranParm on a steady cadence while linked, so no per-change latch is
  * needed - a toggle or a returning air unit is picked up by the next tick. */
 static volatile int g_standby_arm = -1;     /* 0/1 = HUD-commanded u8StandbyModeEn, -1 = unknown */
+static volatile int g_power_dbm = -1;        /* HUD-commanded TX power (dBm) for SetTranParm body[0], -1 = unset */
 static volatile int g_standby_state;        /* air's LIVE work-mode from SetStandyMode (0x12): 1 = in standby */
+
+/* Map a HUD-commanded mW level to the air's SetTranParm dBm byte; -1 rejects anything not captured. */
+static int map_power_dbm(uint32_t mw)
+{
+    switch (mw) {
+        case 25: {
+            return AIR_TX_DBM_25;
+        } break;
+
+        case 100: {
+            return AIR_TX_DBM_100;
+        } break;
+
+        case 200: {
+            return AIR_TX_DBM_200;
+        } break;
+
+        default: {
+            return -1;
+        } break;
+    }
+}
 
 static void on_sig(int sig)
 {
@@ -476,6 +508,17 @@ static void *udp_thread(void *arg)
                         fflush(stdout);
                     }
                     g_standby_arm = arm;
+                } else if (rc->cmd == MLM_RF_SET_POWER) {
+                    int dbm = map_power_dbm(rc->arg);
+                    if (dbm < 0) {
+                        fprintf(stderr, TAG " rfcmd: ignoring bad power %u mW\n", rc->arg);
+                    } else {
+                        if (dbm != g_power_dbm) {
+                            printf(TAG " rfcmd: power %u mW (0x%02x dBm)\n", rc->arg, dbm);
+                            fflush(stdout);
+                        }
+                        g_power_dbm = dbm;
+                    }
                 }
                 continue;
             }
@@ -601,29 +644,31 @@ static void *udp_thread(void *arg)
             led_cmd(MLM_LED_BREATHE, 0xff, 0x00, 0x00, LED_BREATHE_MS);
         }
 
-        /* Keep the air's standby-arm asserted while it is reachable. The air only enters standby when
-         * u8StandbyModeEn (SetTranParm body[8]) is set AND its own RC link is disarmed, so we re-send
-         * on a steady cadence - a single frame can race association or be dropped, and the air
-         * re-evaluates on every SetTranParm. The SetTranParm also carries TX power (body[0]); with no
-         * power row yet we send the vendor default, holding the air at 100 mW - the byte the power
-         * row will own. */
-        if (g_standby_arm >= 0 && g_hs_done && !g_air_lost && now - last_stp >= STANDBY_IVL_MS) {
+        /* Keep the air's TX power + standby-arm asserted while it is reachable. Both ride this one
+         * SetTranParm (body[0] = TX power dBm, body[8] = u8StandbyModeEn). The air only enters standby
+         * when the arm bit is set AND its own RC link is disarmed, and it re-evaluates on every frame,
+         * so we re-send on a steady cadence - a single frame can race association or be dropped. Send
+         * once either has been commanded by the HUD; the other falls back to a safe default (vendor
+         * 100 mW / disarmed) so a fabricated byte never reaches the air. */
+        if ((g_standby_arm >= 0 || g_power_dbm >= 0)
+            && g_hs_done && !g_air_lost && now - last_stp >= STANDBY_IVL_MS) {
             uint8_t stp[STP_LEN];
+            uint8_t power   = (g_power_dbm >= 0) ? (uint8_t) g_power_dbm : AIR_TX_DBM;
+            uint8_t standby = (g_standby_arm >= 0) ? (uint8_t) g_standby_arm : 0;
 
             memset(stp, 0, sizeof stp);
             stp[0] = MP_SETTRANPARM;
             stp[16] = STP_BODY_LEN;
             memcpy(stp + 8, &stamp_us, 4);
-            stp[STP_OFF_POWER]   = AIR_TX_DBM;
+            stp[STP_OFF_POWER]   = power;
             stp[STP_OFF_CONST]   = 0x04;
-            stp[STP_OFF_STANDBY] = (uint8_t) g_standby_arm;
+            stp[STP_OFF_STANDBY] = standby;
             sendto(params_sock, stp, sizeof stp, 0,
                    (struct sockaddr *)&air_params, sizeof air_params);
             last_stp = now;
 
             if (g_verbose) {
-                fprintf(stderr, TAG " tx SetTranParm standby=%d power=0x%02x\n",
-                        g_standby_arm, AIR_TX_DBM);
+                fprintf(stderr, TAG " tx SetTranParm standby=%d power=0x%02x\n", standby, power);
             }
         }
 

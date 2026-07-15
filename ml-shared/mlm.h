@@ -175,6 +175,9 @@ enum mlm_rfcmd_type {
     MLM_RF_SET_STANDBY = 1, /* arg = 1 arm standby, 0 disarm. Rides SetTranParm (:10000 msg 0x0D)
                              * byte[8] = u8StandbyModeEn; the air's automatic arm/disarm handshake
                              * (0x12/0x1b) does the actual power-save entry/exit. */
+    MLM_RF_SET_POWER   = 2, /* arg = the air's TX power in mW, one of {25,100,200}. Rides the same
+                             * SetTranParm (:10000 msg 0x0D) byte[0]; ml-linkd maps mW -> dBm
+                             * (25->0x0e, 100->0x14, 200->0x17) and rejects any other value. */
 };
 
 struct mlm_rfcmd {

@@ -14,4 +14,9 @@
 /** @brief Arm (1) or disarm (0) the air unit's standby mode (rides SetTranParm byte[8]). */
 void linkcmd_set_standby(int arm);
 
+/** @brief Set the air unit's TX power from a menu level label ("25 mW"/"100 mW"/"200 mW"); rides
+ *  SetTranParm byte[0]. The label -> mW map is the single source of truth (linkcmd.c); an unknown
+ *  label falls back to 100 mW. ml-linkd maps the mW to dBm and drops any value it does not know. */
+void linkcmd_set_power(const char *level);
+
 #endif /* HUD_LINKCMD_H */
