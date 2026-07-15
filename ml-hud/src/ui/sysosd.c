@@ -351,8 +351,10 @@ void sysosd_update(const telemetry_t *telemetry, const air_telem_t *air, setting
         lv_label_set_text(g_lbl_sdcard, LV_SYMBOL_SD_CARD " --");
     }
 
-    /* Incoming-video bitrate: shown live only while the downlink is up (its byte rate is otherwise 0). */
-    if (connected && telemetry->have_bitrate) {
+    /* Incoming-video bitrate: driven by the actual sdio0 byte flow (telemetry.c smooths it and holds
+     * the last value across brief gaps), NOT the link-liveness flag - the air throttles its status
+     * cadence in standby, which would otherwise blank a steadily-arriving video rate. */
+    if (telemetry->have_bitrate) {
         int tenths = (int) (telemetry->bitrate_mbps * 10.0f + 0.5f);
         lv_label_set_text_fmt(g_lbl_bitrate, "%s %d.%d Mbps", LV_SYMBOL_DOWNLOAD, tenths / 10, tenths % 10);
         lv_obj_set_style_text_color(g_lbl_bitrate, COLOR_TEXT, 0);
