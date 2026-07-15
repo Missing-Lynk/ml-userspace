@@ -27,6 +27,7 @@
  * SAFETY: userspace only, sends exactly the frames the vendor stack sends; slot B only.
  * Usage: ml-linkd [-d /dev/artosyn_sdio] [--no-gate] [-v]
  */
+#define _GNU_SOURCE                       /* pthread_timedjoin_np */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,6 +64,7 @@
 #define STANDBY_IVL_MS   2000             /* :10000 SetTranParm re-send cadence while armed (~2 s) */
 #define ACK_GRACE_MS     6000             /* re-poll grace after a type3 ACK */
 #define LED_ASSERT_MS    1000             /* LED re-assert cadence (~1 Hz) */
+#define BIND_RETRY_MS    1000             /* unbound-socket rebind cadence */
 #define LED_BREATHE_MS   3000             /* breathe-red period */
 
 /* frame pacing (us) */
@@ -413,33 +415,35 @@ static void *reader(void *arg)
 
 /* UDP thread: :20001 hello/ack, :10000 handshake + telemetry, link.sock gate. */
 
+/* Bind an AF_INET dgram socket to LOCAL_ADDR:port. */
+static int bind_local(int sock, int port)
+{
+    struct sockaddr_in local;
+
+    memset(&local, 0, sizeof local);
+    local.sin_family = AF_INET;
+    inet_pton(AF_INET, LOCAL_ADDR, &local.sin_addr);
+    local.sin_port = htons(port);
+
+    return bind(sock, (struct sockaddr *)&local, sizeof local);
+}
+
 static void *udp_thread(void *arg)
 {
     int hello_sock = socket(AF_INET, SOCK_DGRAM, 0);
     int params_sock = socket(AF_INET, SOCK_DGRAM, 0);
     int link_sock = socket(AF_UNIX, SOCK_DGRAM, 0);
+    int hello_bound = 0, params_bound = 0, link_bound = 0;
+    unsigned bind_tries = 0;
     int one = 1;
-    struct sockaddr_in local, air_hello, air_params;
+    struct sockaddr_in air_hello, air_params;
     struct sockaddr_un link_un = { .sun_family = AF_UNIX };
     uint8_t hello[HELLO_LEN];
-    long last_hello = 0, last_req = 0, last_led = 0, last_stp = 0;
+    long last_hello = 0, last_req = 0, last_led = 0, last_stp = 0, last_bind = -BIND_RETRY_MS;
 
     (void)arg;
     setsockopt(hello_sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
     setsockopt(params_sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    memset(&local, 0, sizeof local);
-    local.sin_family = AF_INET;
-    inet_pton(AF_INET, LOCAL_ADDR, &local.sin_addr);
-    local.sin_port = htons(HELLO_PORT);
-    if (bind(hello_sock, (struct sockaddr *)&local, sizeof local) < 0) {
-        fprintf(stderr, TAG " bind :%d: %s (is sdio0 up as %s?)\n",
-                HELLO_PORT, strerror(errno), LOCAL_ADDR);
-    }
-
-    local.sin_port = htons(PARAMS_PORT);
-    if (bind(params_sock, (struct sockaddr *)&local, sizeof local) < 0) {
-        fprintf(stderr, TAG " bind :%d: %s\n", PARAMS_PORT, strerror(errno));
-    }
 
     memset(&air_hello, 0, sizeof air_hello);
     air_hello.sin_family = AF_INET;
@@ -449,17 +453,62 @@ static void *udp_thread(void *arg)
     air_params.sin_port = htons(PARAMS_PORT);
 
     /* link.sock: the READY-gate seam; linkd binds, consumers send heartbeats */
-    mkdir(MLM_RUN_DIR, 0755);
-    unlink(MLM_LINK_SOCK);
     strncpy(link_un.sun_path, MLM_LINK_SOCK, sizeof link_un.sun_path - 1);
-    if (bind(link_sock, (struct sockaddr *)&link_un, sizeof link_un) < 0) {
-        fprintf(stderr, TAG " bind %s: %s\n", MLM_LINK_SOCK, strerror(errno));
-    }
 
     memset(hello, 0, sizeof hello);
 
     while (g_run) {
         long now = now_ms();
+
+        /* sdio0's 10.0.0.1 exists only after ml-rf-bringup configures the interface, so a bind can
+         * fail at startup; retry until every socket is bound instead of running the whole session
+         * on unbound sockets. The send sites below are gated on the bound flags: a sendto on an
+         * unbound AF_INET socket would auto-bind it to an ephemeral port and make the real bind
+         * fail forever. Log the first failed round and then every OPEN_RETRY_EVERY-th. */
+        if ((!hello_bound || !params_bound || !link_bound) && now - last_bind >= BIND_RETRY_MS) {
+            int log_this = (bind_tries == 0 || (bind_tries % OPEN_RETRY_EVERY) == 0);
+
+            last_bind = now;
+            bind_tries++;
+            if (!hello_bound) {
+                if (bind_local(hello_sock, HELLO_PORT) == 0) {
+                    hello_bound = 1;
+                    if (bind_tries > 1) {
+                        printf(TAG " bind :%d ok\n", HELLO_PORT);
+                        fflush(stdout);
+                    }
+                } else if (log_this) {
+                    fprintf(stderr, TAG " bind :%d: %s (is sdio0 up as %s?), retrying\n",
+                            HELLO_PORT, strerror(errno), LOCAL_ADDR);
+                }
+            }
+
+            if (!params_bound) {
+                if (bind_local(params_sock, PARAMS_PORT) == 0) {
+                    params_bound = 1;
+                    if (bind_tries > 1) {
+                        printf(TAG " bind :%d ok\n", PARAMS_PORT);
+                        fflush(stdout);
+                    }
+                } else if (log_this) {
+                    fprintf(stderr, TAG " bind :%d: %s, retrying\n", PARAMS_PORT, strerror(errno));
+                }
+            }
+
+            if (!link_bound) {
+                mkdir(MLM_RUN_DIR, 0755);
+                unlink(MLM_LINK_SOCK);
+                if (bind(link_sock, (struct sockaddr *)&link_un, sizeof link_un) == 0) {
+                    link_bound = 1;
+                    if (bind_tries > 1) {
+                        printf(TAG " bind %s ok\n", MLM_LINK_SOCK);
+                        fflush(stdout);
+                    }
+                } else if (log_this) {
+                    fprintf(stderr, TAG " bind %s: %s, retrying\n", MLM_LINK_SOCK, strerror(errno));
+                }
+            }
+        }
         uint32_t stamp_us;
         struct timespec t;
         uint8_t rx[PKT_MAX];
@@ -529,7 +578,7 @@ static void *udp_thread(void *arg)
         }
 
         /* :20001 hello until the 3-way is done (vendor goes quiet after) */
-        if (!g_hs_done && now - last_hello >= HELLO_IVL_MS) {
+        if (hello_bound && !g_hs_done && now - last_hello >= HELLO_IVL_MS) {
             sendto(hello_sock, hello, sizeof hello, MSG_DONTWAIT,
                    (struct sockaddr *)&air_hello, sizeof air_hello);
             last_hello = now;
@@ -563,7 +612,7 @@ static void *udp_thread(void *arg)
          * handshook in a ~10 s loop. Pre-media the poll is READY-gated so the air's first IDR lands
          * with a bound consumer; once acked it is the ungated keepalive (the air's 0x02 reply then
          * drives the type-3 ACK below, i.e. the vendor's steady-state 2 s :10000 datagram). */
-        if (g_hs_done && (g_no_gate || g_ready || g_params_acked)
+        if (params_bound && g_hs_done && (g_no_gate || g_ready || g_params_acked)
             && now - last_req >= PARAMS_IVL_MS) {
             uint8_t frame[MP_HDR_LEN];
             sendto(params_sock, frame, mp_params_request(frame, stamp_us), MSG_DONTWAIT,
@@ -664,7 +713,7 @@ static void *udp_thread(void *arg)
          * so we re-send on a steady cadence - a single frame can race association or be dropped. Send
          * once either has been commanded by the HUD; the other falls back to a safe default (vendor
          * 100 mW / disarmed) so a fabricated byte never reaches the air. */
-        if ((g_standby_arm >= 0 || g_power_dbm >= 0)
+        if (params_bound && (g_standby_arm >= 0 || g_power_dbm >= 0)
             && g_hs_done && !g_air_lost && now - last_stp >= STANDBY_IVL_MS) {
             uint8_t frame[MP_STP_LEN];
             uint8_t power   = (g_power_dbm >= 0) ? (uint8_t) g_power_dbm : AIR_TX_DBM;
@@ -740,6 +789,7 @@ int main(int argc, char **argv)
 {
     const char *node = DEV_NODE;
     pthread_t reader_th, udp_th;
+    struct sigaction sa;
     uint8_t frame[64], ff02[19];
     uint32_t seq_link = SEQ_START, seq_video = SEQ_START;
     unsigned long ticks = 0;
@@ -758,8 +808,12 @@ int main(int argc, char **argv)
             return 2;
         }
     }
-    signal(SIGINT, on_sig);
-    signal(SIGTERM, on_sig);
+    /* no SA_RESTART: a signal must interrupt the blocking device read (EINTR) so shutdown
+     * cannot hang in the reader thread; glibc signal() would install the handler restarting */
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_sig;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
 
     g_mlm = socket(AF_UNIX, SOCK_DGRAM, 0);
@@ -859,7 +913,27 @@ int main(int argc, char **argv)
     }
 
     g_run = 0;
-    pthread_join(reader_th, NULL);
+
+    /* The reader may be blocked in read() on the device; a SIGTERM directed at the thread
+     * interrupts it with EINTR (SA_RESTART is off) and it exits on the g_run check. Re-send
+     * until the join lands: a signal that arrives just before the thread re-enters read() is
+     * consumed without unblocking it. */
+    for (;;) {
+        struct timespec deadline;
+
+        pthread_kill(reader_th, SIGTERM);
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_nsec += 100000000L;
+        if (deadline.tv_nsec >= 1000000000L) {
+            deadline.tv_sec++;
+            deadline.tv_nsec -= 1000000000L;
+        }
+
+        if (pthread_timedjoin_np(reader_th, NULL, &deadline) == 0) {
+            break;
+        }
+    }
+
     pthread_join(udp_th, NULL);
     close(g_fd);
 
