@@ -31,12 +31,25 @@ fi
 # Persist the clone + build tree in the (gitignored) build/ dir so re-runs reconfigure
 # incrementally instead of re-cloning and rebuilding all 555 targets.
 SRC=/w/gstreamer/build/gst-src
+PATCHES=/w/gstreamer/patches
 if [ ! -d "$SRC/.git" ]; then
     rm -rf "$SRC"
     git clone --depth 1 --branch "$GST_TAG" \
         https://gitlab.freedesktop.org/gstreamer/gstreamer.git "$SRC"
 fi
 cd "$SRC"
+
+# Apply the local gst patches (gstreamer/patches/*.patch, unified diffs against the pinned
+# tag). Idempotent: a patch that reverse-applies is already in the tree and is skipped.
+for p in "$PATCHES"/*.patch; do
+    [ -e "$p" ] || continue
+    if patch -R -p1 --dry-run -f < "$p" >/dev/null 2>&1; then
+        echo "=== patch $(basename "$p") already applied ==="
+    else
+        echo "=== applying $(basename "$p") ==="
+        patch -p1 -f < "$p"
+    fi
+done
 
 # Skip the ~555-target gst rebuild when the aggregate lib already exists (fast link iteration).
 # The curated plugin set is defined by the -D<subproject>:<plugin>=enabled flags; auto_features=

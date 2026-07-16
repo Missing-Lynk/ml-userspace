@@ -1,0 +1,36 @@
+Why: gst_v4l2_allocator_qbuf refreshes each plane's bytesused from
+gst_memory_get_sizes(mem, NULL, NULL) immediately before VIDIOC_QBUF,
+which returns only the memory's size and discards its offset. A
+dmabuf-import buffer whose memories carry an offset (several V4L2
+planes sharing one dmabuf; offset -> plane data_offset, set correctly
+at import time in gst_v4l2_allocator_import_dmabuf as size + offset)
+is then submitted with bytesused smaller than data_offset, and the
+kernel's __verify_length rejects the QBUF with EINVAL
+(data_offset >= bytesused). Include the offset in the refresh,
+mirroring the import path.
+
+--- a/subprojects/gst-plugins-good/sys/v4l2/gstv4l2allocator.c
++++ b/subprojects/gst-plugins-good/sys/v4l2/gstv4l2allocator.c
+@@ -1263,13 +1263,19 @@
+     goto done;
+   }
+ 
+   /* update sizes */
+   if (V4L2_TYPE_IS_MULTIPLANAR (obj->type)) {
+-    for (i = 0; i < group->n_mem; i++)
++    for (i = 0; i < group->n_mem; i++) {
++      gsize offset;
++
+       group->planes[i].bytesused =
+-          gst_memory_get_sizes (group->mem[i], NULL, NULL);
++          gst_memory_get_sizes (group->mem[i], &offset, NULL) + offset;
++    }
+   } else {
+-    group->buffer.bytesused = gst_memory_get_sizes (group->mem[0], NULL, NULL);
++    gsize offset;
++
++    group->buffer.bytesused =
++        gst_memory_get_sizes (group->mem[0], &offset, NULL) + offset;
+   }
+ 
+   /* Ensure the memory will stay around and is RO */

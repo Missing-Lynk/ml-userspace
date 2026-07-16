@@ -68,18 +68,19 @@ int rec_start(struct ctx *c, const char *path)
         snprintf(scale, sizeof scale, "! videoscale ! video/x-raw,width=1280,height=720 ");
     }
 
-    /* Copy mode is the working default: the encoder runs its own MMAP input pool (from the
-     * wave5 device pool) and gst copies each frame into it (~3 MiB memcpy at the encoder's
-     * rate). Zero-copy dmabuf-import (ML_DVR_IMPORT=1) still fails inside gst's buffer-pool
-     * layer before any V4L2 call (encoder never issues REQBUFS) - under investigation with a
-     * standalone V4L2 harness; buffer sizing (COMP_ALLOC) and wave5 data_offset support are
-     * already in place for it.
+    /* Zero-copy dmabuf-import is the default: the encoder imports the composite buffers
+     * directly (no MMAP input pool from the wave5 device pool, no 3 MiB/frame copy). Needs
+     * COMP_ALLOC buffer sizing, the 3-plane wrap in rec_push, wave5 plane data_offset
+     * support (kernel patch 0013), and the gst qbuf bytesused-offset fix
+     * (gstreamer/patches/0001). ML_DVR_NO_IMPORT=1 falls back to copy mode (the encoder's
+     * own MMAP pool + per-frame memcpy); the 720p videoscale path always copies (scale
+     * output is system memory).
      *
      * Import mode: a queued buffer pins a composite pool slot (display holds 4 of the ~10),
      * so the appsrc queue stays shallow and a lagging encoder drops frames instead of
      * starving the display. Copy mode pins nothing; keep the deeper queue.
      */
-    c->rec_import = scale[0] == '\0' && getenv("ML_DVR_IMPORT") != NULL;
+    c->rec_import = scale[0] == '\0' && getenv("ML_DVR_NO_IMPORT") == NULL;
     c->rec_qmax = c->rec_import ? 3 : 6;
 
     /* Feed the encoder the composite dmabufs themselves (output-io-mode=dmabuf-import): the
@@ -218,7 +219,36 @@ void rec_push(struct ctx *c, GstBuffer *buf, GstClockTime pts)
         c->rec_epoch_set = TRUE;
     }
 
-    rb = gst_buffer_ref(buf);
+    if (c->rec_import) {
+        /* The driver negotiates 3 V4L2 planes (gst prefers the non-contiguous variant), and
+         * gst's dmabuf import demands one memory per plane. All three share the pool buffer's
+         * fd: each memory's offset becomes the plane's data_offset (wave5 applies it, kernel
+         * patch 0013), and its maxsize (COMP_ALLOC) covers every plane's 16-row-aligned
+         * minimum length. The pool buffer rides as qdata so the slot returns only when the
+         * encoder is done with the frame.
+         */
+        static const gsize offs[3] = { 0, COMP_UOFF, COMP_VOFF };
+        static const gsize sizes[3] = { COMP_YSIZE, COMP_USIZE, COMP_USIZE };
+        gsize voffs[GST_VIDEO_MAX_PLANES] = { 0, COMP_UOFF, COMP_VOFF };
+        gint strd[GST_VIDEO_MAX_PLANES] = { COMP_LSTRIDE, COMP_CSTRIDE, COMP_CSTRIDE };
+        int fd = gst_dmabuf_memory_get_fd(gst_buffer_peek_memory(buf, 0));
+
+        rb = gst_buffer_new();
+        for (int p = 0; p < 3; p++) {
+            GstMemory *mem = gst_dmabuf_allocator_alloc(c->comp_alloc, dup(fd), COMP_ALLOC);
+            gst_memory_resize(mem, offs[p], sizes[p]);
+            gst_buffer_append_memory(rb, mem);
+        }
+
+        gst_buffer_add_video_meta_full(rb, GST_VIDEO_FRAME_FLAG_NONE,
+                                       GST_VIDEO_FORMAT_I420, COMP_W, COMP_H, 3, voffs, strd);
+        gst_mini_object_set_qdata(GST_MINI_OBJECT(rb),
+                                  g_quark_from_static_string("ml-comp-pin"),
+                                  gst_buffer_ref(buf), (GDestroyNotify)gst_buffer_unref);
+    } else {
+        rb = gst_buffer_ref(buf);
+    }
+
     GST_BUFFER_PTS(rb) = (pts != GST_CLOCK_TIME_NONE && pts >= c->rec_pts0) ? pts - c->rec_pts0 : 0;
     GST_BUFFER_DTS(rb) = GST_CLOCK_TIME_NONE;
     if (gst_app_src_push_buffer(c->rec_src, rb) != GST_FLOW_OK) {   /* consumes the ref */
