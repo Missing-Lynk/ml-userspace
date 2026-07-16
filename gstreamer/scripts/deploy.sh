@@ -25,13 +25,14 @@ sshg() { sshpass -p "$PASS" ssh -o StrictHostKeyChecking=no -o LogLevel=ERROR -o
 sshg true || { echo "ERROR: cannot SSH root@$DEVICE_IP" >&2; exit 1; }
 
 # The SD controller itself is modular and the slim rootfs ships no /lib/modules, so the
-# card is unreachable on a fresh boot until these three load (chicken-and-egg with the
-# squashfs ON the card - they must come over SSH). Idempotent. The card enumerates as
-# mmcblk0 or mmcblk1 depending on whether the RF/SDIO side is up, so probe both.
+# card is unreachable on a fresh boot until these load (chicken-and-egg with the
+# squashfs ON the card - they must come over SSH). Idempotent; the mmc nodes are in the
+# boot DTB. The card enumerates as mmcblk0 or mmcblk1 depending on whether the RF/SDIO
+# side is up, so probe both.
 echo "[*] bootstrapping SD-controller modules ..."
 source "$REPO/kernel/scripts/pin.env"
 KBASE="${BUILD_DIR:-/media/home-ext/_kernel-m1/repro-${KERNEL_VERSION}}"
-for ko in artosyn_gpio dw_mci-artosyn ar_dtbo_sdio; do
+for ko in artosyn_gpio dw_mci-artosyn; do
   sshg "cat > /tmp/$ko.ko" < "$KBASE/ml-modules/$ko.ko"
 done
 
@@ -43,7 +44,7 @@ sshg "cat > /tmp/artosyn_vo.ko" < "$KBASE/ml-modules/rootfs/lib/modules/${KERNEL
 # rebuilt decoder (e.g. the multi-instance RESULT_NOT_READY retry fix) reaches the device
 # without re-pushing the squashfs. Only takes effect on a FRESH boot (wave5 will not warm-reload).
 sshg "cat > /tmp/wave5.ko" < "$KBASE/ml-modules/rootfs/lib/modules/${KERNEL_VERSION}/kernel/wave5.ko"
-sshg 'for ko in artosyn_gpio dw_mci-artosyn ar_dtbo_sdio; do
+sshg 'for ko in artosyn_gpio dw_mci-artosyn; do
         name="$(echo "$ko" | tr - _)"
         grep -q "^$name " /proc/modules || insmod /tmp/$ko.ko
       done'

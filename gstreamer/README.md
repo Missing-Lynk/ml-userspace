@@ -59,7 +59,7 @@ How it is slim: the SD squashfs is 156 MB not from plugin code (all 238 plugins 
 - **`ml-splash`**: one-shot boot splash - paints the vendor mountain (`nosignal.yuv`, raw I420 1920x1080, staged into `missinglynk/share/` from your own dump, git-ignored) on the DRM primary via the broker fd and exits; the frame persists on the broker's fd and later video/OSD planes cover it, exactly stock's no-signal behavior. Raw DRM ioctls, fully static - it also ships ON the rootfs together with `ml-drmfd` and runs at boot via the `ml-display` OpenRC service (`rootfs/`), which makes the boot-started broker the session anchor. Manual runner: `runtime/splash-up.sh` (skips an already-running broker).
 - **`ml-shared/mlm.h`** (top level, moved from `src/`): the cross-component wire contract (record framing, socket paths, fd passing) - also used by the top-level `ml-linkd/` RF link daemon, which `build-prefix.sh` builds and stages into the squashfs bin dir alongside these tools.
 
-`deploy.sh` is re-runnable (checksum-skips an unchanged image) and handles a virgin boot: it pushes and loads `artosyn_gpio`/`dw_mci-artosyn`/`ar_dtbo_sdio` over SSH first (the SD controller is modular and the rootfs ships no /lib/modules - the image with the module is ON the card, hence the SSH bootstrap).
+`deploy.sh` is re-runnable (checksum-skips an unchanged image) and handles a virgin boot: it pushes and loads `artosyn_gpio`/`dw_mci-artosyn` over SSH first (the SD controller is modular and the rootfs ships no /lib/modules - the image with the module is ON the card, hence the SSH bootstrap; the mmc nodes themselves are in the boot DTB).
 
 ## RF mode: two-tile decode + display (`ml-pipeline rf`, 60 fps end-to-end validated 2026-07-07)
 
