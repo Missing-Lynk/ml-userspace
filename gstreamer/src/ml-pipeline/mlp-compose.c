@@ -118,7 +118,10 @@ gboolean comp_pool_init(struct ctx *c)
     }
 
     for (int i = 0; i < cap; i++) {
-        int fd = ml_heap_alloc(COMP_SIZE);
+        /* COMP_ALLOC, not COMP_SIZE: the encoder's dmabuf import demands its 16-row-aligned
+         * sizeimage; the content layout stays COMP_SIZE (the tail is padding).
+         */
+        int fd = ml_heap_alloc(COMP_ALLOC);
         guint8 *m;
 
         if (fd < 0) {
@@ -203,7 +206,7 @@ GstBuffer *comp_get(struct ctx *c, int *idx_out)
     ml_dmabuf_sync(cb->fd, 1);              /* begin CPU write access */
 
     b = gst_buffer_new();
-    mem = gst_dmabuf_allocator_alloc(c->comp_alloc, dup(cb->fd), COMP_SIZE);
+    mem = gst_dmabuf_allocator_alloc(c->comp_alloc, dup(cb->fd), COMP_ALLOC);
     gst_buffer_append_memory(b, mem);
     gst_buffer_add_video_meta_full(b, GST_VIDEO_FRAME_FLAG_NONE,
                                    GST_VIDEO_FORMAT_I420, COMP_W, COMP_H, 3, offs, strd);

@@ -1,6 +1,43 @@
 /* ml-pipeline record: DVR branch (zero-copy composite -> H.264 MP4) + HUD ctrl seam. */
 #include "ml-pipeline.h"
 
+/* Record-bin bus watch: errors on this bus previously vanished (nothing read it), so a failed
+ * encoder recorded a 0-byte file with no trace. Log the error and tear the recording down from
+ * the main loop (rec_stop from inside the watch would re-enter the bus).
+ */
+static gboolean rec_stop_idle(gpointer u)
+{
+    struct ctx *c = u;
+
+    rec_stop(c);
+    send_state(c);
+
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean rec_bus_cb(GstBus *bus, GstMessage *msg, gpointer u)
+{
+    struct ctx *c = u;
+
+    (void)bus;
+    if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) {
+        GError *e = NULL;
+        gchar *dbg = NULL;
+
+        gst_message_parse_error(msg, &e, &dbg);
+        fprintf(stderr, "ml-pipeline: DVR record ERROR: %s (%s)\n",
+                e ? e->message : "?", dbg ? dbg : "-");
+        if (e) {
+            g_error_free(e);
+        }
+
+        g_free(dbg);
+        g_idle_add(rec_stop_idle, c);
+    }
+
+    return TRUE;
+}
+
 /* Build and start the record bin. The encoder imports the composite dma-buf (output-io-mode=
  * dmabuf-import), so its input pool allocates NO CMA and there is no per-frame copy. H.264 to
  * match the vendor DVR and the scripts/dvr-frame.sh tooling.
@@ -31,24 +68,43 @@ int rec_start(struct ctx *c, const char *path)
         snprintf(scale, sizeof scale, "! videoscale ! video/x-raw,width=1280,height=720 ");
     }
 
-    /* Feed the encoder system-memory I420. The composite dmabufs are CPU-mappable (CMA), so
-     * pushing them under plain video/x-raw caps makes the encoder's mmap input pool map+copy each
-     * frame (one 3 MiB memcpy at the encoder's own rate; the composite ring absorbs any lag). The
-     * zero-copy dmabuf-import path (DMA_DRM/YU12) is a follow-up optimization.
+    /* Copy mode is the working default: the encoder runs its own MMAP input pool (from the
+     * wave5 device pool) and gst copies each frame into it (~3 MiB memcpy at the encoder's
+     * rate). Zero-copy dmabuf-import (ML_DVR_IMPORT=1) still fails inside gst's buffer-pool
+     * layer before any V4L2 call (encoder never issues REQBUFS) - under investigation with a
+     * standalone V4L2 harness; buffer sizing (COMP_ALLOC) and wave5 data_offset support are
+     * already in place for it.
+     *
+     * Import mode: a queued buffer pins a composite pool slot (display holds 4 of the ~10),
+     * so the appsrc queue stays shallow and a lagging encoder drops frames instead of
+     * starving the display. Copy mode pins nothing; keep the deeper queue.
+     */
+    c->rec_import = scale[0] == '\0' && getenv("ML_DVR_IMPORT") != NULL;
+    c->rec_qmax = c->rec_import ? 3 : 6;
+
+    /* Feed the encoder the composite dmabufs themselves (output-io-mode=dmabuf-import): the
+     * encoder QBUFs each buffer's fd instead of allocating an MMAP input pool and copying. That
+     * saves a ~3 MiB memcpy per frame AND the ~19 MiB input pool, which comes from the wave5
+     * device's dedicated coherent pool - the allocation that silently failed (0-byte file, wedged
+     * VPU command queue) once the composite pool shared that same pool. The buffers already carry
+     * dmabuf memory + I420 VideoMeta in the exact single-fd planar layout wave5 derives.
+     * The videoscale (720p) path copies to system memory, so import cannot be forced there; it
+     * keeps the encoder's own pool.
      */
     desc = g_strdup_printf(
         "appsrc name=recsrc is-live=true format=time do-timestamp=false "
-        "max-buffers=6 leaky-type=downstream block=false "
+        "max-buffers=%d leaky-type=downstream block=false "
         "! video/x-raw,format=I420,width=%d,height=%d,framerate=60/1 "
         "%s%s"
-        "! v4l2h264enc "
+        "! v4l2h264enc %s "
 
         /* Fragmented MP4 (moof/mdat every 1 s): the file on disk is playable up to the last
          * complete fragment even if the process is SIGKILLed (OOM) - which no signal handler can
          * catch. A clean stop (rec_stop EOS) still finalizes normally. Costs at most ~1 s of tail.
          */
         "! h264parse ! mp4mux fragment-duration=1000 ! filesink location=%s",
-        COMP_W, COMP_H, rate, scale, path);
+        c->rec_qmax, COMP_W, COMP_H, rate, scale,
+        c->rec_import ? "output-io-mode=dmabuf-import" : "", path);
 
     c->rec_bin = gst_parse_launch(desc, &err);
     g_free(desc);
@@ -60,6 +116,12 @@ int rec_start(struct ctx *c, const char *path)
         }
 
         return 1;
+    }
+
+    {
+        GstBus *b = gst_element_get_bus(c->rec_bin);
+        gst_bus_add_watch(b, rec_bus_cb, c);
+        gst_object_unref(b);
     }
 
     src = gst_bin_get_by_name(GST_BIN(c->rec_bin), "recsrc");
@@ -97,6 +159,15 @@ void rec_stop(struct ctx *c)
     }
 
     c->rec_on = 0;
+    {
+        /* The watch comes off first: a bus refuses timed_pop while a watch is installed,
+         * and the error-start path (rec_src NULL) must not leak it either.
+         */
+        GstBus *b = gst_element_get_bus(c->rec_bin);
+        gst_bus_remove_watch(b);
+        gst_object_unref(b);
+    }
+
     if (c->rec_src) {
         gst_app_src_end_of_stream(c->rec_src);
         {
@@ -123,8 +194,11 @@ void rec_stop(struct ctx *c)
 }
 
 /* Feed one completed composite to the encoder, zero-copy. Shares the pool GstBuffer (a ref holds
- * the pool slot until the encoder releases it), so a slow encoder is bounded: if the queue is
- * backed up we DROP this frame rather than pin pool buffers and starve the display.
+ * the pool slot until the encoder releases it); the encoder negotiates single-plane I420 and
+ * imports the buffer's one dmabuf directly - possible because the pool allocates COMP_ALLOC (the
+ * encoder's 16-row-aligned sizeimage) while addressing planes at the plain COMP_* offsets.
+ * A slow encoder is bounded: if the queue is backed up we DROP this frame rather than pin pool
+ * buffers and starve the display.
  */
 void rec_push(struct ctx *c, GstBuffer *buf, GstClockTime pts)
 {
@@ -134,7 +208,7 @@ void rec_push(struct ctx *c, GstBuffer *buf, GstClockTime pts)
         return;
     }
 
-    if (gst_app_src_get_current_level_buffers(c->rec_src) >= 6) {
+    if (gst_app_src_get_current_level_buffers(c->rec_src) >= (guint)c->rec_qmax) {
         c->rec_dropped++;
         return;
     }
