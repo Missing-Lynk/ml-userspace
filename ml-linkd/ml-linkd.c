@@ -118,9 +118,6 @@ static volatile int g_run = 1;
 static int g_fd = -1;                       /* /dev/artosyn_sdio */
 static int g_verbose;
 static int g_no_gate;
-static int g_send_ldcfg;   /* opt-in (--ldcfg): push the SetLdCfg association blob. OFF by default: it
-                            * carries stock-captured config and is the suspected air-wedge, so only
-                            * send it under a deliberate, watched test. */
 
 /* handshake/link state shared between the FSM tick (main) and the UDP thread.
  * All plain ints/timestamps, single writer per field, so volatile is enough. */
@@ -146,6 +143,7 @@ static volatile int g_distance_m = MLM_LINKINFO_NONE;
  * needed - a toggle or a returning air unit is picked up by the next tick. */
 static volatile int g_standby_arm = -1;     /* 0/1 = HUD-commanded u8StandbyModeEn, -1 = unknown */
 static volatile int g_power_dbm = -1;        /* HUD-commanded TX power (dBm) for SetTranParm body[0], -1 = unset */
+static volatile int g_bitrate_mbps;         /* HUD-commanded bitrate (Mbps) for SetLdCfg bitrate_q, 0 = unset */
 static volatile int g_standby_state;        /* air's LIVE work-mode from SetStandyMode (0x12): 1 = in standby */
 
 /* Map a HUD-commanded mW level to the air's SetTranParm dBm byte; -1 rejects anything not captured. */
@@ -547,6 +545,18 @@ static void *udp_thread(void *arg)
                         }
                         g_power_dbm = dbm;
                     }
+                } else if (rc->cmd == MLM_RF_SET_BITRATE) {
+                    /* Applied via SetLdCfg at association (the air latches it there), so a change
+                     * takes effect on the next session; only the stock-menu levels are valid. */
+                    if (rc->arg != 8 && rc->arg != 16 && rc->arg != 24) {
+                        fprintf(stderr, TAG " rfcmd: ignoring bad bitrate %u Mbps\n", rc->arg);
+                    } else {
+                        if ((int)rc->arg != g_bitrate_mbps) {
+                            printf(TAG " rfcmd: bitrate %u Mbps (next session)\n", rc->arg);
+                            fflush(stdout);
+                        }
+                        g_bitrate_mbps = (int)rc->arg;
+                    }
                 }
                 continue;
             }
@@ -646,16 +656,19 @@ static void *udp_thread(void *arg)
                  * sends SetLdCfg (0x0A), THEN the 0x03 ack that starts video (capture: 01 -> 02 -> 0a ->
                  * 03 -> 15). Sending it here - as part of the handshake, before video - is the vendor
                  * placement; sending it post-ack (mid-stream) reconfigured a live encoder and wedged the
-                 * air. Opt-in (--ldcfg) until the vendor-correct timing is HW-validated. The
-                 * !g_params_acked guard makes it fire ONCE per session (the first 0x02): now that the
-                 * poll runs for the whole session, 0x02 replies arrive every 2 s, and re-sending
-                 * SetLdCfg on each would be exactly that mid-stream reconfig. */
-                if (!g_params_acked && g_send_ldcfg && g_power_dbm >= 0) {
+                 * air. Sent whenever the HUD has commanded a lever it carries (TX power and/or bitrate;
+                 * both stay at the captured base when unset). The !g_params_acked guard makes it fire
+                 * ONCE per session (the first 0x02): the poll runs for the whole session, 0x02 replies
+                 * arrive every 2 s, and re-sending SetLdCfg on each would be exactly that mid-stream
+                 * reconfig. */
+                if (!g_params_acked && (g_power_dbm >= 0 || g_bitrate_mbps > 0)) {
                     uint8_t cfg[MP_LDCFG_LEN];
-                    sendto(params_sock, cfg, mp_set_ld_cfg(cfg, (uint8_t) g_power_dbm, 0, stamp_us), MSG_DONTWAIT,
-                           (struct sockaddr *)&air_params, sizeof air_params);
+                    uint8_t dbm = g_power_dbm >= 0 ? (uint8_t) g_power_dbm : 0;
+                    sendto(params_sock, cfg, mp_set_ld_cfg(cfg, dbm, (uint8_t) g_bitrate_mbps, stamp_us),
+                           MSG_DONTWAIT, (struct sockaddr *)&air_params, sizeof air_params);
                     if (g_verbose) {
-                        fprintf(stderr, TAG " tx SetLdCfg (power=0x%02x)\n", g_power_dbm);
+                        fprintf(stderr, TAG " tx SetLdCfg (power=0x%02x bitrate=%d Mbps)\n",
+                                dbm, g_bitrate_mbps);
                     }
                 }
 
@@ -801,10 +814,8 @@ int main(int argc, char **argv)
             g_no_gate = 1;
         } else if (!strcmp(argv[i], "-v")) {
             g_verbose = 1;
-        } else if (!strcmp(argv[i], "--ldcfg")) {
-            g_send_ldcfg = 1;
         } else {
-            fprintf(stderr, "usage: ml-linkd [-d /dev/artosyn_sdio] [--no-gate] [-v] [--ldcfg]\n");
+            fprintf(stderr, "usage: ml-linkd [-d /dev/artosyn_sdio] [--no-gate] [-v]\n");
             return 2;
         }
     }

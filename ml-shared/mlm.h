@@ -178,6 +178,10 @@ enum mlm_rfcmd_type {
     MLM_RF_SET_POWER   = 2, /* arg = the air's TX power in mW, one of {25,100,200}. Rides the same
                              * SetTranParm (:10000 msg 0x0D) byte[0]; ml-linkd maps mW -> dBm
                              * (25->0x0e, 100->0x14, 200->0x17) and rejects any other value. */
+    MLM_RF_SET_BITRATE = 3, /* arg = the air's video bitrate in Mbps, one of {8,16,24}. Rides
+                             * SetLdCfg (:10000 msg 0x0A) bitrate_q (Mbps * 4, 250 kbps units);
+                             * the air latches it at association, so a change takes effect on the
+                             * next session. ml-linkd rejects any other value. */
 };
 
 struct mlm_rfcmd {
