@@ -271,8 +271,13 @@ static void led_cmd(uint8_t mode, uint8_t r, uint8_t g, uint8_t b, uint16_t peri
 static void led_assert(void)
 {
     if (g_params_acked && !g_air_lost) {
-        /* link up, video flowing */
-        led_cmd(MLM_LED_SOLID, 0x00, 0xff, 0x00, 0);
+        if (g_standby_state) {
+            /* link up, air in standby */
+            led_cmd(MLM_LED_BREATHE, 0xff, 0x50, 0x00, LED_BREATHE_MS);
+        } else {
+            /* link up, video flowing */
+            led_cmd(MLM_LED_SOLID, 0x00, 0xff, 0x00, 0);
+        }
     } else {
         /* no usable link yet */
         led_cmd(MLM_LED_BREATHE, 0xff, 0x00, 0x00, LED_BREATHE_MS);
