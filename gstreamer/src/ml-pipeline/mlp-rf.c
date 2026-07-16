@@ -560,9 +560,15 @@ void *rf_rx(void *arg)
              */
             GstClockTime skew_ns = gst_util_uint64_scale(c->skew_max, GST_SECOND, RF_FPS);
 
+            /* The queue-depth bound reads the appsrc level directly: a sent[]-samples[]
+             * count delta ratchets whenever the decoder consumes an AU without emitting
+             * output (session restart, corrupt AU) and then holds tile 0 against a debt
+             * that can never clear - the same count-vs-position disease as the old skew
+             * gate. The appsrc level is the actual backlog and cannot drift.
+             */
             if (c->t0_nhold > 0
                 || c->out_pts[0] > c->out_pts[1] + skew_ns
-                || c->sent[0] > c->samples[0] + c->inflight_max) {
+                || gst_app_src_get_current_level_buffers(c->src[0]) > (guint64)c->inflight_max) {
                 if (c->t0_nhold < (int)(sizeof c->t0_hold / sizeof c->t0_hold[0])) {
                     c->t0_hold[c->t0_nhold++] = buf;
                     continue;
@@ -585,7 +591,7 @@ void *rf_rx(void *arg)
 
         for (int k = 0; k < 8 && c->t0_nhold > 0
                         && c->out_pts[0] <= c->out_pts[1] + drain_skew_ns
-                        && c->sent[0] <= c->samples[0] + c->inflight_max; k++) {
+                        && gst_app_src_get_current_level_buffers(c->src[0]) <= (guint64)c->inflight_max; k++) {
             push_au(c, 0, c->t0_hold[0]);
             c->t0_nhold--;
             memmove(&c->t0_hold[0], &c->t0_hold[1], c->t0_nhold * sizeof c->t0_hold[0]);
