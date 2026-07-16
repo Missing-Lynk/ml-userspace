@@ -31,6 +31,7 @@ dvr.format_prompt = 格式化 SD 卡？
 air_unit.no_link = 未连接天空端
 air_unit.connected = 天空端已连接
 air_unit.power = 功率
+air_unit.bitrate = 码率
 air_unit.standby = 待机
 
 # 回放

@@ -19,4 +19,10 @@ void linkcmd_set_standby(int arm);
  *  label falls back to 100 mW. ml-linkd maps the mW to dBm and drops any value it does not know. */
 void linkcmd_set_power(const char *level);
 
+/** @brief Set the air unit's video bitrate from a menu level label ("8 Mbps"/"16 Mbps"/"24 Mbps");
+ *  rides SetLdCfg bitrate_q at association, so it takes effect on the next session. The label ->
+ *  Mbps map is the single source of truth (linkcmd.c); an unknown label falls back to 24 Mbps.
+ *  ml-linkd drops any value it does not know. */
+void linkcmd_set_bitrate(const char *level);
+
 #endif /* HUD_LINKCMD_H */

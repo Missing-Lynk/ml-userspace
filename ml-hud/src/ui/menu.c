@@ -10,7 +10,6 @@
 #include "buzzer.h"
 #include "i18n.h"
 #include "linkcmd.h"
-#include "linkstate.h"
 #include "recordings.h"
 
 #include "lvgl.h"
@@ -88,12 +87,14 @@ static const gog_item_t g_dvr_items[] = {
 };
 #define DVR_ITEM_COUNT ((int) (sizeof(g_dvr_items) / sizeof(g_dvr_items[0])))
 
-static const char *const power_options[] = { "25 mW", "100 mW", "200 mW", NULL };
+static const char *const power_options[]   = { "25 mW", "100 mW", "200 mW", NULL };
+static const char *const bitrate_options[] = { "8 Mbps", "16 Mbps", "24 Mbps", NULL };
 
-/* Air-unit settings; the list is shown only while the air unit is linked (render_air_unit). */
+/* Air-unit settings; stored on the goggle and latched by the air unit at association (render_air_unit). */
 static const gog_item_t g_airunit_items[] = {
-    { ITEM_STEPPER, "air_unit.power",   "power",   power_options, 1, 0, "power" },
-    { ITEM_TOGGLE,  "air_unit.standby", "standby", NULL,          0, 1, "standby" },
+    { ITEM_STEPPER, "air_unit.power",   "power",   power_options,   1, 0, "power" },
+    { ITEM_STEPPER, "air_unit.bitrate", "bitrate", bitrate_options, 2, 0, "bitrate" },
+    { ITEM_TOGGLE,  "air_unit.standby", "standby", NULL,            0, 1, "standby" },
 };
 #define AIRUNIT_ITEM_COUNT ((int) (sizeof(g_airunit_items) / sizeof(g_airunit_items[0])))
 
@@ -111,7 +112,7 @@ static const char *const LANG_DIRS[] = {
 typedef enum {
     SECTION_GOGGLES = 0,   /* the goggle settings list */
     SECTION_DVR,           /* the DVR settings list */
-    SECTION_AIRUNIT,       /* air-unit settings; gated on a live RF link (dimmed when down) */
+    SECTION_AIRUNIT,       /* air-unit settings; always editable, pushed to the air at association */
     SECTION_PLAYBACK,      /* the SD-card recordings list */
     NUM_SECTIONS,
 } section_t;
@@ -162,8 +163,6 @@ static void render_content(void);
 static void render_centered_hint(const char *text);
 static void enter_sidebar_zone(void);
 static void enter_content_zone(void);
-static int  menu_is_linked(void);
-static void update_air_unit_dim(void);
 
 /* The recordings player (transport bar + playback state) lives in player.c; menu.c drives it through
  * player.h and hands it the shared menu objects via g_player_host below. */
@@ -446,6 +445,10 @@ static void apply_item(const gog_item_t *item, const char *value)
     } else if (strcmp(item->action, "power") == 0) {
         /* the level label ("100 mW"); linkcmd maps it to mW */
         linkcmd_set_power(value);
+    } else if (strcmp(item->action, "bitrate") == 0) {
+        /* the level label ("24 Mbps"); linkcmd maps it to Mbps. The air latches bitrate at
+         * association, so the new value takes effect on the next session. */
+        linkcmd_set_bitrate(value);
     }
 }
 
@@ -582,8 +585,6 @@ static void build_sidebar(void)
         lv_obj_add_event_cb(button, sidebar_focused_cb, LV_EVENT_FOCUSED, (void *) (intptr_t) i);
         g_sidebar_buttons[i] = button;
     }
-
-    update_air_unit_dim();   /* start the link-gated entry dimmed unless the air unit is already up */
 }
 
 /* content renderers (each fills the cleared g_content with rows) */
@@ -685,32 +686,13 @@ static void render_centered_hint(const char *text)
     g_content_focusable = 0;
 }
 
-/* Whether the air unit is currently reachable (ml-linkd telemetry seam, non-blocking cached read). */
-static int menu_is_linked(void)
-{
-    return linkstate_airunit_connected();
-}
-
-/* The air-unit section: gated on a live link. With no link it is a dim "no air unit" hint (and the
- * sidebar entry is dimmed too, update_air_unit_dim); linked, it shows the air-unit settings list.
+/* The air-unit section: always editable. The settings live on the goggle and are pushed to the air
+ * unit at association (the air latches them during the handshake), so they are prepared here whether
+ * or not the link is currently up.
  */
 static void render_air_unit(void)
 {
-    if (!menu_is_linked()) {
-        render_centered_hint(T("air_unit.no_link"));
-        return;
-    }
-
     render_settings_list(g_airunit_items, AIRUNIT_ITEM_COUNT, NULL);
-}
-
-/* Dim the Air Unit sidebar entry when the link is down, so it reads as inactive until the air unit
- * connects. Cheap restyle only (no rebuild), safe to call on a timer while the menu is open.
- */
-static void update_air_unit_dim(void)
-{
-    lv_opa_t opa = menu_is_linked() ? LV_OPA_COVER : LV_OPA_50;
-    lv_obj_set_style_opa(g_sidebar_buttons[SECTION_AIRUNIT], opa, 0);
 }
 
 /* Clear the content pane and render the current section into it. Called with focus in the sidebar
@@ -751,7 +733,6 @@ static void enter_sidebar_zone(void)
 
     g_section = section;
     lv_group_focus_obj(g_sidebar_buttons[section]);
-    update_air_unit_dim();   /* the link may have changed while focus was in the content */
 }
 
 static void enter_content_zone(void)
@@ -1068,16 +1049,6 @@ void menu_close_all(void)
 int menu_is_open(void)
 {
     return g_is_open;
-}
-
-/* Refresh the Air Unit sidebar dim from the live link. Cheap + safe to call on a timer while the menu
- * is open: it only restyles the sidebar entry, never rebuilds focused content.
- */
-void menu_refresh_link(void)
-{
-    if (g_is_open && g_sidebar != NULL) {
-        update_air_unit_dim();
-    }
 }
 
 void menu_playback_tick(void)

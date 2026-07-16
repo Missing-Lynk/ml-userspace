@@ -75,6 +75,7 @@ typedef struct {
     int            nosignal_sent;      /* latch: the "stream lost" no-signal-splash command was already sent */
     int            standby_asserted;   /* latch: the air-unit standby state was pushed for this link-up */
     int            power_asserted;     /* latch: the air-unit TX power was pushed for this link-up */
+    int            bitrate_asserted;   /* latch: the air-unit bitrate was pushed for this link-up */
     long           osd_frames;
     long           rendered;
     uint16_t       last_voltage_mV;  /* air-unit pack mV, from the 0x09/0x11 status frames */
@@ -489,6 +490,16 @@ int main(int argc, char **argv)
             h.power_asserted = 0;
         }
 
+        /* Same once-per-link-up assertion for the bitrate: ml-linkd applies it via SetLdCfg at
+         * association, so the push must land before (or between) sessions; re-asserting on every
+         * link-up edge covers both. */
+        if (connected && !h.bitrate_asserted) {
+            linkcmd_set_bitrate(settings_get_string_in(h.settings, "air_unit", "bitrate", "24 Mbps"));
+            h.bitrate_asserted = 1;
+        } else if (!connected) {
+            h.bitrate_asserted = 0;
+        }
+
         /* Turning auto-record off stops the recording it started (never a manual one). Level-checked
          * and cleared after the toggle, so it fires once - and also catches a recording that was
          * still starting when the toggle flipped (it stops once the pipeline reports RECORDING).
@@ -554,7 +565,6 @@ int main(int argc, char **argv)
             };
 
             sysosd_update(&telemetry, &air, h.settings);
-            menu_refresh_link();   /* keep the Air Unit entry's dim in step with the live link */
         }
 
         /* Long BACK: fire once while held past the threshold. */

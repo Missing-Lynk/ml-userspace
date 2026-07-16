@@ -31,6 +31,7 @@ dvr.format_prompt = Format the SD card?
 air_unit.no_link = No air unit connected
 air_unit.connected = Air unit connected
 air_unit.power = Power
+air_unit.bitrate = Bitrate
 air_unit.standby = Standby
 
 # Playback

@@ -35,3 +35,26 @@ void linkcmd_set_power(const char *level)
 
     mlm_rfcmd_send(MLM_RF_SET_POWER, (uint32_t) mw);
 }
+
+/* The air's three video bitrate levels, mapping each menu label to its Mbps value. Same contract
+ * as POWER_LEVELS: the menu's stepper options must match these labels; ml-linkd rejects anything
+ * it does not recognise. */
+static const struct { const char *label; int mbps; } BITRATE_LEVELS[] = {
+    { "8 Mbps",  8 },
+    { "16 Mbps", 16 },
+    { "24 Mbps", 24 },
+};
+#define BITRATE_DEFAULT_MBPS 24   /* used when a label does not match (e.g. a stale settings value) */
+
+void linkcmd_set_bitrate(const char *level)
+{
+    int mbps = BITRATE_DEFAULT_MBPS;
+    for (unsigned i = 0; level != NULL && i < sizeof BITRATE_LEVELS / sizeof BITRATE_LEVELS[0]; i++) {
+        if (strcmp(level, BITRATE_LEVELS[i].label) == 0) {
+            mbps = BITRATE_LEVELS[i].mbps;
+            break;
+        }
+    }
+
+    mlm_rfcmd_send(MLM_RF_SET_BITRATE, (uint32_t) mbps);
+}
