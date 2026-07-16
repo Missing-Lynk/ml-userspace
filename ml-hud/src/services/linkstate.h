@@ -30,7 +30,8 @@ int linkstate_airunit_connected(void);
 
 /** @brief Local baseband link metrics from ml-linkd's MLM_T_LINKINFO. Each returns MLM_LINKINFO_NONE
  *  (-1) until a value has been received / while the link is down, so the System OSD shows a dim
- *  placeholder. Channel is the display number (1..16); SNR is in dB; distance is in metres. */
+ *  placeholder. Channel is the table index the RX is tuned to (the select value); SNR is in dB;
+ *  distance is in metres. */
 int linkstate_channel(void);
 int linkstate_snr_db(void);
 int linkstate_distance_m(void);
@@ -38,6 +39,13 @@ int linkstate_distance_m(void);
 /** @brief Whether the air unit is currently in standby (quad disarmed + standby armed), from
  *  ml-linkd's SetStandyMode readback. 0 when active or no link. */
 int linkstate_standby(void);
+
+struct mlm_scan;   /* ml-shared/mlm.h */
+
+/** @brief Copy the latest RF channel scan (ml-linkd's MLM_T_SCAN) into @p out. @return the scan
+ *  generation, which increments on each scan received; 0 = none yet (and @p out is left untouched),
+ *  so callers can re-render only when the generation changes. */
+unsigned linkstate_scan(struct mlm_scan *out);
 
 /** @brief ml-pipeline's last-reported mode (MLM_STATE_* from ml-shared/mlm.h). Defaults to
  *  MLM_STATE_IDLE until the pipeline broadcasts. The pipeline re-asserts every second, so this

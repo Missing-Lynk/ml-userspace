@@ -1,6 +1,7 @@
 /** @file sysosd.c @brief See sysosd.h. */
 #include "sysosd.h"
 
+#include "channel_label.h"
 #include "linkstate.h"
 
 #include "../../../ml-shared/mlm.h"
@@ -249,13 +250,18 @@ static void update_goggle_battery(const telemetry_t *telemetry, settings_t *sett
 }
 
 /* Update the RF fields from ml-linkd (channel, SNR, distance). Dim placeholders when the link is down
- * or a value has not arrived. */
+ * or a value has not arrived. The channel is the table index our RX is tuned to - a local fact that
+ * holds whether or not the air is connected - so it is shown whenever known (green while linked, plain
+ * otherwise) so a pilot can always read off their channel. */
 static void update_link_fields(int connected)
 {
     int channel = linkstate_channel();
-    if (connected && channel != MLM_LINKINFO_NONE) {
-        lv_label_set_text_fmt(g_lbl_channel, "CH %d", channel);
-        lv_obj_set_style_text_color(g_lbl_channel, COLOR_GREEN, 0);
+    if (channel != MLM_LINKINFO_NONE) {
+        char label[24];
+
+        channel_label(label, sizeof label, channel);
+        lv_label_set_text(g_lbl_channel, label);
+        lv_obj_set_style_text_color(g_lbl_channel, connected ? COLOR_GREEN : COLOR_TEXT, 0);
     } else {
         lv_label_set_text(g_lbl_channel, "CH --");
         lv_obj_set_style_text_color(g_lbl_channel, COLOR_TEXT_DIM, 0);

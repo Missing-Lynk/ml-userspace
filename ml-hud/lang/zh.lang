@@ -2,10 +2,16 @@
 # 格式： key = value  （以 # 开头的行为注释）
 
 # 侧边栏
+nav.channel = 频道
 nav.goggles = 眼镜
 nav.dvr = 录制
 nav.air_unit = 天空端
 nav.playback = 回放
+
+# 频道网格
+channel.scanning = 扫描中...
+channel.scan_hint = 按中键扫描
+channel.no_link = 无频道
 
 # 眼镜设置
 goggles.brightness         = 亮度

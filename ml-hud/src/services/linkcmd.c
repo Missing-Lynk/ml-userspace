@@ -58,3 +58,13 @@ void linkcmd_set_bitrate(const char *level)
 
     mlm_rfcmd_send(MLM_RF_SET_BITRATE, (uint32_t) mbps);
 }
+
+void linkcmd_request_scan(void)
+{
+    mlm_rfcmd_send(MLM_RF_SCAN, 0);
+}
+
+void linkcmd_select_channel(unsigned idx)
+{
+    mlm_rfcmd_send(MLM_RF_SELECT_CHANNEL, idx);
+}

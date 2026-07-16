@@ -39,4 +39,8 @@ void menu_close_all(void); /**< @brief Close the menu entirely, whatever the dep
  *  the scrubber tracks position promptly; a no-op unless a clip is playing. */
 void menu_playback_tick(void);
 
+/** @brief Refresh the channel grid from a newly-arrived scan (signal + active highlight). Call every
+ *  loop tick; a no-op unless the channel section is shown. */
+void menu_channel_tick(void);
+
 #endif /* HUD_UI_MENU_H */

@@ -145,12 +145,18 @@ static inline int bb_set_chnmode(uint8_t *frame, uint8_t mode, uint32_t seq)
     return bb_build_frame(frame, BB_SET, 0, 0, SET_CHNMODE, seq, payload, 1);
 }
 
-/* DECODED: manual MCS is two frames - set the mode, then the value. Call bb_set_mcs_mode(seq)
- * then bb_set_mcs_value(mcs, seq + 1). The value is offset +2 on the wire.
+/* DECODED: manual MCS is two frames - set the mode, then the value. Call
+ * bb_set_mcs_mode(MCS_MODE_MANUAL, seq) then bb_set_mcs_value(mcs, seq + 1). The value is offset +2
+ * on the wire. The mode byte is the HIGH byte of the u16 payload (the vendor writes mode << 8).
  */
-static inline int bb_set_mcs_mode(uint8_t *frame, uint32_t seq)
+enum bb_mcs_mode {
+    MCS_MODE_MANUAL = 0,   /* fixed rate, whatever bb_set_mcs_value last set */
+    MCS_MODE_AUTO   = 1,   /* chip picks the rate (the normal running mode) */
+};
+
+static inline int bb_set_mcs_mode(uint8_t *frame, enum bb_mcs_mode mode, uint32_t seq)
 {
-    const uint8_t payload[2] = { 0, 0 };
+    const uint8_t payload[2] = { 0, (uint8_t)mode };
 
     return bb_build_frame(frame, BB_SET, 0, 0, SET_MCS_MODE, seq, payload, 2);
 }

@@ -539,6 +539,7 @@ int main(int argc, char **argv)
 
             /* track the playback scrubber at loop rate, not the 1 s OSD cadence */
             menu_playback_tick();
+            menu_channel_tick();   /* pick up channel scans while the channel grid is shown */
         }
 
         /* Beeps: end any finished key tone; run the low-voltage alarm on its own cadence. */

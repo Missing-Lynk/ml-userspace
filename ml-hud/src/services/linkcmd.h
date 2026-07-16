@@ -25,4 +25,15 @@ void linkcmd_set_power(const char *level);
  *  ml-linkd drops any value it does not know. */
 void linkcmd_set_bitrate(const char *level);
 
+/** @brief Request a one-shot RF channel scan; ml-linkd fires it and publishes the result as a scan
+ *  telemetry record (read by linkstate_scan). Read-only - the sweep self-restores the active channel. */
+void linkcmd_request_scan(void);
+
+/** @brief Tune the local RX to channel table index @p idx (0..18, the value the scan reports and the
+ *  tiles show - passed verbatim, no +1). Unlike the setters above this is LOCAL: nothing is sent to
+ *  the air unit, which follows the retune over its own management link. ml-linkd queues it onto the
+ *  bb-socket thread and rejects an index outside the table. The tune is async: read the applied
+ *  channel back from linkstate_channel(), do not assume it took. */
+void linkcmd_select_channel(unsigned idx);
+
 #endif /* HUD_LINKCMD_H */
