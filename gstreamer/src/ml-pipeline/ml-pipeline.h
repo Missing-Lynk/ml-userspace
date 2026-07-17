@@ -153,6 +153,22 @@ struct ctx {
                                          * buffer pins a composite pool slot */
     gboolean rec_import;                /* encoder in dmabuf-import mode (no videoscale) */
 
+    /* SRT telemetry sidecar (vendor DVR parity): the HUD sends one pre-formatted subtitle line
+     * per second over ctrl.sock (MLM_CMD_SRT_TEXT) while recording; each line becomes one SRT
+     * cue stamped with the recording-relative video time. The file is created lazily on the
+     * first line (setting off = no datagrams = no file) and cues are written continuous: a cue
+     * is flushed when the next line arrives (its start = the cue's end), the last one at stop.
+     */
+    FILE *srt_fp;                       /* open sidecar, or NULL (not recording / no line yet) */
+    char srt_path[300];                 /* rec_path with the extension swapped to .srt */
+    unsigned srt_n;                     /* cues written (SRT indices are 1-based) */
+    char srt_pend[256];                 /* pending cue text, flushed on the next line / at stop */
+    guint64 srt_pend_ms;                /* pending cue start (recording-relative ms) */
+    gboolean srt_pend_set;
+    guint64 rec_last_ms;                /* rebased PTS of the last frame pushed to the encoder,
+                                         * in ms: the cue timestamps' source, so the sidecar
+                                         * tracks the MP4 timeline, not the wall clock */
+
     /* Composite dma-heap pool: a fixed set of contiguous CMA buffers, each scanned out
      * zero-copy by kmssink (COMP_* layout). Claimed per composite, returned to comp_free
      * when the pushed GstBuffer is finalized (kmssink done). See gst-dma-compositor.md.
@@ -356,6 +372,7 @@ int drm_make_idle_fb(struct ctx *c);
 int rec_start(struct ctx *c, const char *path);
 void rec_stop(struct ctx *c);
 void rec_push(struct ctx *c, GstBuffer *buf, GstClockTime pts);
+void rec_srt_text(struct ctx *c, const char *line);
 void send_state(struct ctx *c);
 gboolean state_tick(gpointer u);
 gboolean on_ctrl(gint fd, GIOCondition cond, gpointer u);

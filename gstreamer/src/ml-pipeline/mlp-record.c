@@ -38,6 +38,81 @@ static gboolean rec_bus_cb(GstBus *bus, GstMessage *msg, gpointer u)
     return TRUE;
 }
 
+/* Write one complete SRT cue: index, "HH:MM:SS,mmm --> HH:MM:SS,mmm", text, blank line. */
+static void srt_write_cue(struct ctx *c, guint64 start_ms, guint64 end_ms, const char *text)
+{
+    unsigned s_h = (unsigned)(start_ms / 3600000);
+    unsigned s_m = (unsigned)(start_ms / 60000 % 60);
+    unsigned s_s = (unsigned)(start_ms / 1000 % 60);
+    unsigned e_h = (unsigned)(end_ms / 3600000);
+    unsigned e_m = (unsigned)(end_ms / 60000 % 60);
+    unsigned e_s = (unsigned)(end_ms / 1000 % 60);
+
+    fprintf(c->srt_fp, "%u\n%02u:%02u:%02u,%03u --> %02u:%02u:%02u,%03u\n%s\n\n",
+            ++c->srt_n,
+            s_h, s_m, s_s, (unsigned)(start_ms % 1000),
+            e_h, e_m, e_s, (unsigned)(end_ms % 1000), text);
+}
+
+/* Flush the pending cue with @p end_ms as its end. Cues are continuous: each line's arrival
+ * time is the previous cue's end and the new cue's start, so the sidecar has no gaps.
+ */
+static void srt_flush_pending(struct ctx *c, guint64 end_ms)
+{
+    if (!c->srt_pend_set || !c->srt_fp) {
+        c->srt_pend_set = FALSE;
+        return;
+    }
+
+    if (end_ms <= c->srt_pend_ms) {
+        end_ms = c->srt_pend_ms + 1000;   /* degenerate cue (no video advanced): give it 1 s */
+    }
+
+    srt_write_cue(c, c->srt_pend_ms, end_ms, c->srt_pend);
+    c->srt_pend_set = FALSE;
+}
+
+/* MLM_CMD_SRT_TEXT while recording: buffer @p line as the pending cue, flushing the previous
+ * one with this line's timestamp as its end. Timestamps come from the encoder-side rebased
+ * PTS (rec_last_ms), so the cues track the MP4 timeline. The file is created lazily here:
+ * with the save_srt setting off the HUD sends nothing and no sidecar ever exists.
+ */
+void rec_srt_text(struct ctx *c, const char *line)
+{
+    if (!c->rec_on || !line || !*line) {
+        return;
+    }
+
+    if (!c->srt_fp) {
+        c->srt_fp = fopen(c->srt_path, "w");
+        if (!c->srt_fp) {
+            fprintf(stderr, "ml-pipeline: DVR subtitle open %s: %s\n",
+                    c->srt_path, strerror(errno));
+            return;
+        }
+        printf("ml-pipeline: DVR subtitles -> %s\n", c->srt_path);
+    }
+
+    guint64 now_ms = c->rec_epoch_set ? c->rec_last_ms : 0;
+    srt_flush_pending(c, now_ms);
+    snprintf(c->srt_pend, sizeof c->srt_pend, "%s", line);
+    c->srt_pend_ms = now_ms;
+    c->srt_pend_set = TRUE;
+}
+
+/* Finalize the sidecar at recording stop: flush the last cue and close the file. */
+static void srt_stop(struct ctx *c)
+{
+    if (c->srt_fp) {
+        srt_flush_pending(c, c->rec_epoch_set ? c->rec_last_ms : 0);
+        fclose(c->srt_fp);
+        c->srt_fp = NULL;
+        printf("ml-pipeline: DVR subtitles stopped -> %s (%u cues)\n", c->srt_path, c->srt_n);
+    }
+
+    c->srt_pend_set = FALSE;
+}
+
 /* Build and start the record bin. The encoder imports the composite dma-buf (output-io-mode=
  * dmabuf-import), so its input pool allocates NO CMA and there is no per-frame copy. H.264 to
  * match the vendor DVR and the scripts/dvr-frame.sh tooling.
@@ -136,6 +211,22 @@ int rec_start(struct ctx *c, const char *path)
     gst_caps_unref(caps);
     snprintf(c->rec_path, sizeof c->rec_path, "%s", path);
 
+    /* SRT sidecar path: the recording path with its extension swapped to .srt (the vendor's
+     * VideoNNN.mp4 -> VideoNNN.srt convention). Any stale sidecar at that path is removed so a
+     * re-recorded pinned path (ML_DVR) never keeps an old file's cues; the new file itself is
+     * only created if subtitle lines actually arrive (rec_srt_text).
+     */
+    {
+        const char *dot = strrchr(path, '.');
+        int stem = dot ? (int)(dot - path) : (int)strlen(path);
+        snprintf(c->srt_path, sizeof c->srt_path, "%.*s.srt", stem, path);
+        unlink(c->srt_path);
+    }
+    c->srt_fp = NULL;
+    c->srt_n = 0;
+    c->srt_pend_set = FALSE;
+    c->rec_last_ms = 0;
+
     c->rec_epoch_set = FALSE;
     c->rec_pushed = c->rec_dropped = 0;
 
@@ -160,6 +251,7 @@ void rec_stop(struct ctx *c)
     }
 
     c->rec_on = 0;
+    srt_stop(c);
     {
         /* The watch comes off first: a bus refuses timed_pop while a watch is installed,
          * and the error-start path (rec_src NULL) must not leak it either.
@@ -250,6 +342,7 @@ void rec_push(struct ctx *c, GstBuffer *buf, GstClockTime pts)
     }
 
     GST_BUFFER_PTS(rb) = (pts != GST_CLOCK_TIME_NONE && pts >= c->rec_pts0) ? pts - c->rec_pts0 : 0;
+    c->rec_last_ms = GST_BUFFER_PTS(rb) / GST_MSECOND;
     GST_BUFFER_DTS(rb) = GST_CLOCK_TIME_NONE;
     if (gst_app_src_push_buffer(c->rec_src, rb) != GST_FLOW_OK) {   /* consumes the ref */
         c->rec_dropped++;
@@ -393,6 +486,13 @@ gboolean on_ctrl(gint fd, GIOCondition cond, gpointer u)
 
         case MLM_CMD_SPEED: {
             playback_set_speed(c, (gint32)cmd.arg);   /* arg is the signed multiplier bit-cast */
+        } break;
+
+        case MLM_CMD_SRT_TEXT: {
+            /* one telemetry subtitle line from the HUD; text rides after the cmd like PLAY's path */
+            if (path && *path) {
+                rec_srt_text(c, path);
+            }
         } break;
 
         case MLM_CMD_SHOW_IDLE: {

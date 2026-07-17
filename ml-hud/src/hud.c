@@ -40,6 +40,7 @@
 #define LONGPRESS_MS    600    /* hold BACK this long to close the menu outright */
 #define ALARM_PERIOD_MS 2000   /* low-voltage alarm chirp interval while active */
 #define SYSOSD_PERIOD_MS 1000  /* System OSD telemetry refresh interval */
+#define SRT_PERIOD_MS   1000   /* DVR subtitle-sidecar line interval while recording */
 
 static volatile sig_atomic_t g_stop;
 
@@ -69,6 +70,8 @@ typedef struct {
     uint32_t       back_down_ms;     /* when BACK went down */
     uint32_t       alarm_next_ms;    /* next low-voltage alarm check */
     uint32_t       sysosd_next_ms;   /* next System OSD telemetry refresh */
+    uint32_t       srt_next_ms;      /* next DVR subtitle line (while recording, save_srt on) */
+    uint32_t       rec_seen_ms;      /* when RECORDING was first observed (FlightTime base); 0 = not recording */
     int            rec_autostop_sent;  /* latch: the "stream lost" record-stop toggle was already sent */
     int            rec_autostart_sent; /* latch: the "stream up" auto-record start toggle was already sent */
     int            rec_is_auto;        /* the current recording was started by auto-record (not the button) */
@@ -248,6 +251,55 @@ static void alarm_check(hud_ctx_t *h)
     if (per_cell < threshold) {
         tone_beep(now_ms());
     }
+}
+
+/* DVR subtitle sidecar: while recording and the dvr.save_srt setting is on, send ml-pipeline one
+ * telemetry line per second (pipecmd_srt_text); the pipeline stamps it against the recording's
+ * video timeline and writes the .srt next to the .mp4. The line mirrors the vendor's subtitle
+ * fields (Signal/CH/FlightTime/SBat/GBat/Bitrate/Distance, plus temperatures when Show
+ * Temperature is on), sourced from the same caches the System OSD reads: linkstate for the RF
+ * metrics, the :10000 status frames for the air-unit pack, hal/telemetry for the goggle-local
+ * values. Unknown values render as 0, matching the vendor's zero-filled fields.
+ */
+static void srt_tick(hud_ctx_t *h, int connected, uint32_t now)
+{
+    telemetry_t telemetry;
+    telemetry_read(&telemetry);
+
+    /* SNR -> 0..4 signal bars, the sysosd mapping: ~0 dB = 0, >= 20 dB = 4 */
+    int snr = linkstate_snr_db();
+    unsigned signal = 0;
+    if (connected && snr != MLM_LINKINFO_NONE && snr > 0) {
+        signal = snr >= 20 ? 4 : (unsigned) (snr / 5);
+    }
+
+    int channel = linkstate_channel();
+    int distance = linkstate_distance_m();
+    float sbat = (connected && h->have_voltage) ? (float) h->last_voltage_mV / 1000.0f : 0.0f;
+    float gbat = telemetry.have_battery ? telemetry.pack_volts : 0.0f;
+    unsigned bitrate = telemetry.have_bitrate ? (unsigned) (telemetry.bitrate_mbps + 0.5f) : 0;
+    unsigned flight_s = h->rec_seen_ms ? (now - h->rec_seen_ms) / 1000 : 0;
+
+    /* STYMode is the vendor's fast-mode flag; our equivalent is the band setting (Race = 1). */
+    unsigned stymode =
+        strcmp(settings_get_string_in(h->settings, "goggle", "band", "Normal"), "Race") == 0 ? 1 : 0;
+
+    char line[192];
+    int n = snprintf(line, sizeof line,
+                     "Signal:%1u CH:%2u FlightTime:%4u SBat:%5.2f GBat:%5.2f Bitrate:%2uMbps Distance:%6um STYMode:%1u",
+                     signal,
+                     channel != MLM_LINKINFO_NONE ? (unsigned) channel : 0,
+                     flight_s, sbat, gbat, bitrate,
+                     distance != MLM_LINKINFO_NONE ? (unsigned) distance : 0, stymode);
+
+    if (settings_get_bool_in(h->settings, "goggle", "show_temperature", 1) && n > 0
+        && (size_t) n < sizeof line) {
+        snprintf(line + n, sizeof line - (size_t) n, " AirTemp:%3u GndTemp:%3u",
+                 (connected && h->have_air_temp) ? (unsigned) h->air_temp_c : 0,
+                 telemetry.have_temp ? (unsigned) telemetry.temp_c : 0);
+    }
+
+    pipecmd_srt_text(line);
 }
 
 static void usage(const char *p)
@@ -564,6 +616,25 @@ int main(int argc, char **argv)
         if (have_drm && (int32_t) (now - h.alarm_next_ms) >= 0) {
             h.alarm_next_ms = now + ALARM_PERIOD_MS;
             alarm_check(&h);
+        }
+
+        /* DVR subtitle line cadence. The FlightTime base latches on the first loop that observes
+         * RECORDING and clears when it ends, so it also survives a HUD restart mid-recording
+         * (restarting the count from the reattach point). Not gated on have_drm: telemetry and
+         * linkstate work headless, and the recording may have been auto-started.
+         */
+        if (recording && h.rec_seen_ms == 0) {
+            h.rec_seen_ms = now ? now : 1;
+            h.srt_next_ms = now;   /* first line right away, then every SRT_PERIOD_MS */
+        } else if (!recording) {
+            h.rec_seen_ms = 0;
+        }
+
+        if (recording && (int32_t) (now - h.srt_next_ms) >= 0) {
+            h.srt_next_ms = now + SRT_PERIOD_MS;
+            if (settings_get_bool_in(h.settings, "dvr", "save_srt", 0)) {
+                srt_tick(&h, connected, now);
+            }
         }
 
         if (have_drm && (int32_t) (now - h.sysosd_next_ms) >= 0) {

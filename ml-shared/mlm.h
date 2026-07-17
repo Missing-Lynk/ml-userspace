@@ -164,6 +164,12 @@ enum mlm_cmd_type {
                             *  frame (the live RF link dropped). The HUD sends this off ml-linkd's
                             *  connection state; a returning video frame clears it. Ignored during
                             *  playback (a file owns the display). */
+    MLM_CMD_SRT_TEXT   = 9, /* one telemetry subtitle line: the NUL-terminated text follows the
+                            *  mlm_cmd (like PLAY's path). While recording, ml-pipeline appends it
+                            *  to the recording's .srt sidecar (same basename as the .mp4) stamped
+                            *  with the recording-relative time; ignored otherwise. The sender (the
+                            *  HUD, off its telemetry cache) gates on the dvr.save_srt setting, so
+                            *  no datagrams means no sidecar file. */
 };
 
 struct mlm_cmd {

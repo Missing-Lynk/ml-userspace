@@ -23,6 +23,8 @@ Composite mode (vs direct tile scanout) is deliberate, not a fallback: it is the
 
 **DVR records native 1080p60**: 60 fps composite display + a playable 1920x1080@60 H.264 MP4 simultaneously, `drop=0 evict=0`. `ML_DVR_RES=720 ML_DVR_FPS=30` selects a smaller recording if ever needed. Recording robustness: `push_au` bounds each input appsrc at 4 MiB with drop-until-IRAP resync (appsrc `block=false` never fails a push; an unbounded input queue OOMs).
 
+**SRT telemetry sidecar** (vendor DVR parity): while recording, the HUD sends one pre-formatted telemetry line per second over `ctrl.sock` (`MLM_CMD_SRT_TEXT`), gated on its `dvr.save_srt` setting; the pipeline stamps each line with the recording-relative video PTS and writes continuous SRT cues to `VideoNNN.srt` next to the `.mp4` (the vendor's basename convention). The file is created lazily on the first line, so setting off means no sidecar. The line mirrors the vendor's fields (`Signal/CH/FlightTime/SBat/GBat/Bitrate/Distance`, temperatures when Show Temperature is on) from the HUD's own telemetry caches; unlike the vendor stack it is not derived from stream SEI (the vendor never did either - its SRT was built goggle-side from telemetry, and the RF downlink's per-frame SEI carries only encoder stats).
+
 ## Use
 
 ```

@@ -33,4 +33,11 @@ void pipecmd_playback_speed(int speed);
  */
 void pipecmd_show_nosignal(void);
 
+/**
+ * @brief Send one telemetry subtitle line for the recording's .srt sidecar. Only meaningful while
+ *  the pipeline is recording (it stamps the line with the recording-relative video time and
+ *  appends it as an SRT cue); ignored otherwise. The caller gates on the dvr.save_srt setting.
+ */
+void pipecmd_srt_text(const char *line);
+
 #endif /* HUD_PIPECMD_H */

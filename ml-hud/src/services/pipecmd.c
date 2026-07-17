@@ -44,3 +44,9 @@ void pipecmd_show_nosignal(void)
 {
     mlm_ctrl_send(MLM_CMD_SHOW_IDLE, 0, NULL);
 }
+
+/* One telemetry subtitle line for the .srt sidecar (the text travels like PLAY's path). */
+void pipecmd_srt_text(const char *line)
+{
+    mlm_ctrl_send(MLM_CMD_SRT_TEXT, 0, line);
+}
