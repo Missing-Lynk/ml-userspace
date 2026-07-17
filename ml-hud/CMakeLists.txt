@@ -72,6 +72,7 @@ add_executable(hud
     src/ui/display.c
     src/ui/tone.c
     src/ui/menu.c
+    src/ui/menu_channel.c
     src/ui/player.c
     src/ui/sysosd.c)
 target_include_directories(hud PRIVATE
