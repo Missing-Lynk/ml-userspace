@@ -232,10 +232,15 @@ static void on_button(void *ctx, hud_button_t button, hud_button_edge_t edge)
 }
 
 /* Low-voltage alarm: while enabled and the per-cell voltage is below the threshold, chirp on each
- * check.
+ * check (its own ALARM_PERIOD_MS cadence).
  */
-static void alarm_check(hud_ctx_t *h)
+static void alarm_tick(hud_ctx_t *h, uint32_t now)
 {
+    if (h->drm == NULL || (int32_t) (now - h->alarm_next_ms) < 0) {
+        return;
+    }
+
+    h->alarm_next_ms = now + ALARM_PERIOD_MS;
     if (!settings_get_bool_in(h->settings, "goggle", "low_voltage_alarm", 1)) {
         return;
     }
@@ -261,7 +266,7 @@ static void alarm_check(hud_ctx_t *h)
  * metrics, the :10000 status frames for the air-unit pack, hal/telemetry for the goggle-local
  * values. Unknown values render as 0, matching the vendor's zero-filled fields.
  */
-static void srt_tick(hud_ctx_t *h, int connected, uint32_t now)
+static void srt_send_line(hud_ctx_t *h, int connected, uint32_t now)
 {
     telemetry_t telemetry;
     telemetry_read(&telemetry);
@@ -300,6 +305,208 @@ static void srt_tick(hud_ctx_t *h, int connected, uint32_t now)
     }
 
     pipecmd_srt_text(line);
+}
+
+/* DVR subtitle cadence: latch the FlightTime base on the first loop that observes RECORDING and
+ * clear it when the recording ends, so the count also survives a HUD restart mid-recording
+ * (restarting from the reattach point). Not gated on the overlay: telemetry and linkstate work
+ * headless, and the recording may have been auto-started.
+ */
+static void srt_tick(hud_ctx_t *h, int recording, int connected, uint32_t now)
+{
+    if (recording && h->rec_seen_ms == 0) {
+        h->rec_seen_ms = now ? now : 1;
+        h->srt_next_ms = now;   /* first line right away, then every SRT_PERIOD_MS */
+    } else if (!recording) {
+        h->rec_seen_ms = 0;
+    }
+
+    if (recording && (int32_t) (now - h->srt_next_ms) >= 0) {
+        h->srt_next_ms = now + SRT_PERIOD_MS;
+        if (settings_get_bool_in(h->settings, "dvr", "save_srt", 0)) {
+            srt_send_line(h, connected, now);
+        }
+    }
+}
+
+/* Auto record and auto stop, all keyed off ml-linkd's connection state - the single source of truth
+ * for whether a stream is present:
+ *   - stop a running recording the moment the stream drops (the pipeline would otherwise keep
+ *     muxing a dead feed);
+ *   - start one when the stream comes up if the DVR auto-record setting is on (and at once if it is
+ *     switched on while a stream is already live);
+ *   - turning auto-record off stops the recording it started (never a manual one).
+ * Each command is a toggle, so all are latched + state-guarded to fire once. The auto-start latch
+ * clears on disconnect, so a manual stop while still connected is respected - not overridden until
+ * the link drops and comes back.
+ */
+static void record_policy_tick(hud_ctx_t *h, int connected, int recording, int state)
+{
+    int autorecord = settings_get_bool_in(h->settings, "dvr", "autostart", 0);
+
+    if (recording && !connected && !h->rec_autostop_sent) {
+        pipecmd_record_toggle();
+        h->rec_autostop_sent = 1;
+        h->rec_is_auto = 0;
+    } else if (!recording) {
+        h->rec_autostop_sent = 0;
+    }
+
+    if (autorecord && connected && linkstate_pipeline_seen() && state == MLM_STATE_IDLE
+        && !h->rec_autostart_sent) {
+        pipecmd_record_toggle();   /* idle-guarded: a toggle from idle starts recording */
+        h->rec_autostart_sent = 1;
+        h->rec_is_auto = 1;        /* auto-record owns this recording */
+    }
+
+    if (!connected) {
+        h->rec_autostart_sent = 0;
+    }
+
+    /* The auto-off stop is level-checked and clears rec_is_auto after the toggle, so it fires once -
+     * and also catches a recording that was still starting when the toggle flipped (it stops once
+     * the pipeline reports RECORDING).
+     */
+    if (!autorecord && recording && h->rec_is_auto) {
+        pipecmd_record_toggle();
+        h->rec_is_auto = 0;
+    }
+}
+
+/* Push the air-unit settings once per link-up; every latch clears on disconnect. The menu defaults
+ * matter here: a user who never touches a row still needs standby armed and power/bitrate pushed.
+ * ml-linkd re-applies standby and power on its own session restarts, and applies the bitrate via
+ * SetLdCfg at association, so re-asserting on every link-up edge covers both. The channel, which
+ * ml-linkd does not persist (without this every boot lands on its bring-up default), is asserted
+ * only if the user has ever picked one; ml-linkd ignores a channel outside the current band's valid
+ * set, leaving its own first-valid choice in place.
+ */
+static void assert_air_settings(hud_ctx_t *h, int connected)
+{
+    if (!connected) {
+        h->standby_asserted = 0;
+        h->power_asserted = 0;
+        h->channel_asserted = 0;
+        h->bitrate_asserted = 0;
+        return;
+    }
+
+    if (!h->standby_asserted) {
+        linkcmd_set_standby(settings_get_bool_in(h->settings, "air_unit", "standby", 1));
+        h->standby_asserted = 1;
+    }
+
+    if (!h->power_asserted) {
+        /* the stored value is the level label ("100 mW"); linkcmd maps it to mW */
+        linkcmd_set_power(settings_get_string_in(h->settings, "air_unit", "power", "100 mW"));
+        h->power_asserted = 1;
+    }
+
+    if (!h->channel_asserted) {
+        int channel = settings_get_int_in(h->settings, "goggle", "channel", -1);
+        if (channel >= 0) {
+            linkcmd_select_channel((unsigned) channel);
+        }
+
+        h->channel_asserted = 1;
+    }
+
+    if (!h->bitrate_asserted) {
+        linkcmd_set_bitrate(settings_get_string_in(h->settings, "air_unit", "bitrate", "24 Mbps"));
+        h->bitrate_asserted = 1;
+    }
+}
+
+/* No-signal splash: when the link drops during live view, ask the pipeline to park on the default
+ * no-signal frame instead of holding the last decoded frame. Latched to fire once per drop; the
+ * latch clears on reconnect and the pipeline resumes video on its own when frames return. Only in
+ * live (IDLE) mode - playback owns the display itself.
+ */
+static void nosignal_tick(hud_ctx_t *h, int connected, int state)
+{
+    if (connected) {
+        h->nosignal_sent = 0;
+        return;
+    }
+
+    if (state != MLM_STATE_IDLE || !linkstate_pipeline_seen() || h->nosignal_sent) {
+        return;
+    }
+
+    pipecmd_show_nosignal();
+    h->nosignal_sent = 1;
+
+    /* Clear the last MSP OSD frame off the overlay once, so stale FC glyphs do not linger over the
+     * no-signal splash. Only in the flying view (menu closed) - with the menu up the OSD is hidden
+     * and the surface is the menu's to draw. btfl_osd_clear leaves the System OSD bar intact.
+     */
+    if (h->drm != NULL && hud_btfl_visible(h->state)) {
+        rect_t rects[128];
+        int n = btfl_osd_clear(h->fb, rects, (int) (sizeof(rects) / sizeof(rects[0])));
+        if (n != 0) {
+            drm_overlay_present(h->drm, h->fb, rects, n);
+        }
+    }
+}
+
+/* System OSD refresh, on its own SYSOSD_PERIOD_MS cadence. */
+static void sysosd_tick(hud_ctx_t *h, uint32_t now)
+{
+    if (h->drm == NULL || (int32_t) (now - h->sysosd_next_ms) < 0) {
+        return;
+    }
+
+    h->sysosd_next_ms = now + SYSOSD_PERIOD_MS;
+    telemetry_t telemetry;
+    telemetry_read(&telemetry);
+
+    /* Air-unit values decoded from the :10000 status frames; blanked when the link is down so the
+     * bar shows placeholders rather than stale readings. */
+    int air_up = linkstate_airunit_connected();
+    air_telem_t air = {
+        .have_voltage = air_up && h->have_voltage,
+        .voltage_mV = h->last_voltage_mV,
+        .have_temp = air_up && h->have_air_temp,
+        .temp_c = h->air_temp_c,
+    };
+
+    sysosd_update(&telemetry, &air, h->settings);
+}
+
+/* Long BACK: fire the outright menu close once while the hold passes the threshold. */
+static void back_longpress_tick(hud_ctx_t *h)
+{
+    if (h->menu_available && h->back_held && !h->back_fired && menu_is_open()
+        && now_ms() - h->back_down_ms >= LONGPRESS_MS) {
+        menu_close_all();
+        h->back_fired = 1;
+        fprintf(stderr, "hud: menu close (long back)\n");
+    }
+}
+
+/* Sync the BTFL gate to the menu on any open/close edge, however it was triggered. */
+static void menu_state_sync(hud_ctx_t *h)
+{
+    if (!h->menu_available) {
+        return;
+    }
+
+    int open_now = menu_is_open();
+    if (open_now == h->prev_menu_open) {
+        return;
+    }
+
+    sysosd_set_menu_open(open_now);   /* solid bar background for context while the menu is up */
+    if (open_now) {
+        h->state = HUD_MENU_OPEN;
+    } else {
+        h->state = HUD_MENU_CLOSED;
+        btfl_osd_invalidate();   /* the menu overwrote the surface: full OSD redraw next */
+        sysosd_invalidate();     /* and repaint the bar over the coming full BTFL present */
+        fprintf(stderr, "hud: menu closed\n");
+    }
+
+    h->prev_menu_open = open_now;
 }
 
 static void usage(const char *p)
@@ -489,118 +696,15 @@ int main(int argc, char **argv)
         /* drain link/telemetry datagrams; updates air-unit + pipeline state */
         linkstate_poll(link_fd);
 
-        /* Auto record and auto stop, both keyed off ml-linkd's connection state - the single source
-         * of truth for whether a stream is present:
-         *   - stop a running recording the moment the stream drops (the pipeline would otherwise keep
-         *     muxing a dead feed);
-         *   - start one when the stream comes up if the DVR auto-record setting is on (and at once if
-         *     it is switched on while a stream is already live).
-         * Each command is a toggle, so both are latched + state-guarded to fire once. The auto-start
-         * latch clears on disconnect, so a manual stop while still connected is respected - not
-         * overridden until the link drops and comes back.
-         */
+        /* ml-linkd's connection state is the single source of truth for whether a stream is
+         * present; every policy below keys off this one read. */
         int state = linkstate_pipeline_state();
         int recording = (state == MLM_STATE_RECORDING);
         int connected = linkstate_airunit_connected();
-        int autorecord = settings_get_bool_in(h.settings, "dvr", "autostart", 0);
 
-        if (recording && !connected && !h.rec_autostop_sent) {
-            pipecmd_record_toggle();
-            h.rec_autostop_sent = 1;
-            h.rec_is_auto = 0;
-        } else if (!recording) {
-            h.rec_autostop_sent = 0;
-        }
-
-        if (autorecord && connected && linkstate_pipeline_seen() && state == MLM_STATE_IDLE
-            && !h.rec_autostart_sent) {
-            pipecmd_record_toggle();   /* idle-guarded: a toggle from idle starts recording */
-            h.rec_autostart_sent = 1;
-            h.rec_is_auto = 1;         /* auto-record owns this recording */
-        }
-
-        if (!connected) {
-            h.rec_autostart_sent = 0;
-        }
-
-        /* Push the air-unit standby state once per link-up. The menu default is armed, so a user who
-         * never touches the toggle still needs it asserted; ml-linkd applies it and re-applies on its
-         * own session restarts. Latched to fire once; the latch clears on disconnect. */
-        if (connected && !h.standby_asserted) {
-            linkcmd_set_standby(settings_get_bool_in(h.settings, "air_unit", "standby", 1));
-            h.standby_asserted = 1;
-        } else if (!connected) {
-            h.standby_asserted = 0;
-        }
-
-        /* Same once-per-link-up assertion for TX power: the menu default is 100 mW, so a user who
-         * never touches the row still needs it pushed. The stored value is the level label; linkcmd
-         * maps it to mW and ml-linkd re-applies it on its own session restarts. */
-        if (connected && !h.power_asserted) {
-            linkcmd_set_power(settings_get_string_in(h.settings, "air_unit", "power", "100 mW"));
-            h.power_asserted = 1;
-        } else if (!connected) {
-            h.power_asserted = 0;
-        }
-
-        /* Same once-per-link-up assertion for the channel, which ml-linkd does not persist: without
-         * it every boot lands on ml-linkd's bring-up default. Only asserted if the user has ever
-         * picked one; ml-linkd ignores a channel outside the current band's valid set, leaving its
-         * own first-valid choice in place. */
-        if (connected && !h.channel_asserted) {
-            int channel = settings_get_int_in(h.settings, "goggle", "channel", -1);
-            if (channel >= 0) {
-                linkcmd_select_channel((unsigned) channel);
-            }
-
-            h.channel_asserted = 1;
-        } else if (!connected) {
-            h.channel_asserted = 0;
-        }
-
-        /* Same once-per-link-up assertion for the bitrate: ml-linkd applies it via SetLdCfg at
-         * association, so the push must land before (or between) sessions; re-asserting on every
-         * link-up edge covers both. */
-        if (connected && !h.bitrate_asserted) {
-            linkcmd_set_bitrate(settings_get_string_in(h.settings, "air_unit", "bitrate", "24 Mbps"));
-            h.bitrate_asserted = 1;
-        } else if (!connected) {
-            h.bitrate_asserted = 0;
-        }
-
-        /* Turning auto-record off stops the recording it started (never a manual one). Level-checked
-         * and cleared after the toggle, so it fires once - and also catches a recording that was
-         * still starting when the toggle flipped (it stops once the pipeline reports RECORDING).
-         */
-        if (!autorecord && recording && h.rec_is_auto) {
-            pipecmd_record_toggle();
-            h.rec_is_auto = 0;
-        }
-
-        /* No-signal splash: when the link drops during live view, ask the pipeline to park on the
-         * default no-signal frame instead of holding the last decoded frame. Latched to fire once
-         * per drop; the latch clears on reconnect and the pipeline resumes video on its own when
-         * frames return. Only in live (IDLE) mode - playback owns the display itself.
-         */
-        if (!connected && state == MLM_STATE_IDLE && linkstate_pipeline_seen() && !h.nosignal_sent) {
-            pipecmd_show_nosignal();
-            h.nosignal_sent = 1;
-
-            /* Clear the last MSP OSD frame off the overlay once, so stale FC glyphs do not linger over
-             * the no-signal splash. Only in the flying view (menu closed) - with the menu up the OSD
-             * is hidden and the surface is the menu's to draw. btfl_osd_clear leaves the System OSD
-             * bar intact.
-             */
-            if (have_drm && hud_btfl_visible(h.state)) {
-                rect_t rects[128];
-                int n = btfl_osd_clear(h.fb, rects, (int) (sizeof(rects) / sizeof(rects[0])));
-                if (n != 0) {
-                    drm_overlay_present(h.drm, h.fb, rects, n);
-                }
-            }
-        } else if (connected) {
-            h.nosignal_sent = 0;
-        }
+        record_policy_tick(&h, connected, recording, state);
+        assert_air_settings(&h, connected);
+        nosignal_tick(&h, connected, state);
 
         if (have_drm) {
             sysosd_set_recording(recording);
@@ -610,75 +714,13 @@ int main(int argc, char **argv)
             menu_channel_tick();   /* pick up channel scans while the channel grid is shown */
         }
 
-        /* Beeps: end any finished key tone; run the low-voltage alarm on its own cadence. */
         uint32_t now = now_ms();
-        tone_tick(now);
-        if (have_drm && (int32_t) (now - h.alarm_next_ms) >= 0) {
-            h.alarm_next_ms = now + ALARM_PERIOD_MS;
-            alarm_check(&h);
-        }
-
-        /* DVR subtitle line cadence. The FlightTime base latches on the first loop that observes
-         * RECORDING and clears when it ends, so it also survives a HUD restart mid-recording
-         * (restarting the count from the reattach point). Not gated on have_drm: telemetry and
-         * linkstate work headless, and the recording may have been auto-started.
-         */
-        if (recording && h.rec_seen_ms == 0) {
-            h.rec_seen_ms = now ? now : 1;
-            h.srt_next_ms = now;   /* first line right away, then every SRT_PERIOD_MS */
-        } else if (!recording) {
-            h.rec_seen_ms = 0;
-        }
-
-        if (recording && (int32_t) (now - h.srt_next_ms) >= 0) {
-            h.srt_next_ms = now + SRT_PERIOD_MS;
-            if (settings_get_bool_in(h.settings, "dvr", "save_srt", 0)) {
-                srt_tick(&h, connected, now);
-            }
-        }
-
-        if (have_drm && (int32_t) (now - h.sysosd_next_ms) >= 0) {
-            h.sysosd_next_ms = now + SYSOSD_PERIOD_MS;
-            telemetry_t telemetry;
-            telemetry_read(&telemetry);
-
-            /* Air-unit values decoded from the :10000 status frames; blanked when the link is down so
-             * the bar shows placeholders rather than stale readings. */
-            int air_up = linkstate_airunit_connected();
-            air_telem_t air = {
-                .have_voltage = air_up && h.have_voltage,
-                .voltage_mV = h.last_voltage_mV,
-                .have_temp = air_up && h.have_air_temp,
-                .temp_c = h.air_temp_c,
-            };
-
-            sysosd_update(&telemetry, &air, h.settings);
-        }
-
-        /* Long BACK: fire once while held past the threshold. */
-        if (have_drm && h.back_held && !h.back_fired && menu_is_open()
-            && now_ms() - h.back_down_ms >= LONGPRESS_MS) {
-            menu_close_all();
-            h.back_fired = 1;
-            fprintf(stderr, "hud: menu close (long back)\n");
-        }
-
-        /* Sync the BTFL gate to the menu on any open/close edge, however it was triggered. */
-        if (have_drm) {
-            int open_now = menu_is_open();
-            if (open_now != h.prev_menu_open) {
-                sysosd_set_menu_open(open_now);   /* solid bar background for context while the menu is up */
-                if (open_now) {
-                    h.state = HUD_MENU_OPEN;
-                } else {
-                    h.state = HUD_MENU_CLOSED;
-                    btfl_osd_invalidate();   /* the menu overwrote the surface: full OSD redraw next */
-                    sysosd_invalidate();     /* and repaint the bar over the coming full BTFL present */
-                    fprintf(stderr, "hud: menu closed\n");
-                }
-                h.prev_menu_open = open_now;
-            }
-        }
+        tone_tick(now);   /* end any finished key-tone beep */
+        alarm_tick(&h, now);
+        srt_tick(&h, recording, connected, now);
+        sysosd_tick(&h, now);
+        back_longpress_tick(&h);
+        menu_state_sync(&h);
 
         if (r == 0) {
             idle_accum += poll_ms;
