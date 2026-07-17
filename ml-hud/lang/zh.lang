@@ -4,8 +4,9 @@
 # 侧边栏
 nav.channel = 频道
 nav.goggles = 眼镜
-nav.dvr = 录制
+nav.system = 系统
 nav.air_unit = 天空端
+nav.dvr = 录制
 nav.playback = 回放
 
 # 频道网格
@@ -18,13 +19,15 @@ goggles.brightness         = 亮度
 goggles.msp_osd            = MSP OSD 叠加
 goggles.show_system_osd    = 显示系统 OSD
 goggles.show_temperature   = 显示温度
-goggles.buzzer_volume      = 蜂鸣器音量
-goggles.key_tones_off      = 关闭按键音
-goggles.low_voltage_alarm  = 低电压报警
-goggles.min_cell_voltage   = 最低单节电压
-goggles.language           = 语言
-goggles.band               = 射频频段
-goggles.slot_switch        = 切换到插槽 A
+
+# 系统设置
+system.buzzer_volume       = 蜂鸣器音量
+system.key_tones_off       = 关闭按键音
+system.low_voltage_alarm   = 低电压报警
+system.min_cell_voltage    = 最低单节电压
+system.language            = 语言
+system.band                = 射频频段
+system.slot_switch         = 切换到插槽 A
 
 # 录制
 dvr.autostart = 自动开始录制

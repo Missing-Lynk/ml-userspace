@@ -36,7 +36,7 @@
 #define ITEM_PAD_HOR         24
 /* OSD_BAR_HEIGHT (the bottom strip reserved for the System OSD) comes from sysosd.h. */
 
-#define GOG_SECTION          "goggle"   /* every Goggles-menu setting lives in this JSON section */
+#define GOG_SECTION          "goggle"   /* backs both the Goggles and System menus (see section_key) */
 #define DVR_SECTION          "dvr"      /* every DVR-menu setting lives in this JSON section */
 #define AIRUNIT_SECTION      "air_unit" /* every Air-Unit-menu setting lives in this JSON section */
 
@@ -75,20 +75,29 @@ static const char *const band_options[]      = { "Race", "Normal", NULL };
 #define BAND_MARKER_DIR  "/usrdata/missinglynk"
 #define BAND_MARKER_PATH BAND_MARKER_DIR "/rf-band"
 
-static const gog_item_t g_items[] = {
-    { ITEM_STEPPER, "goggles.brightness",        "brightness",        brightness_options, 5, 0, "brightness" },
-    { ITEM_STEPPER, "goggles.msp_osd",           "msp_osd",           msp_osd_options,    1, 0, "" },
-    { ITEM_TOGGLE,  "goggles.show_system_osd",   "show_system_osd",   NULL,               0, 1, "" },
-    { ITEM_TOGGLE,  "goggles.show_temperature",  "show_temperature",  NULL,               0, 1, "" },
-    { ITEM_STEPPER, "goggles.buzzer_volume",     "buzzer_volume",     buzzer_options,     5, 0, "buzzer" },
-    { ITEM_TOGGLE,  "goggles.key_tones_off",     "key_tones_off",     NULL,               0, 0, "key_tones" },
-    { ITEM_TOGGLE,  "goggles.low_voltage_alarm", "low_voltage_alarm", NULL,               0, 1, "alarm" },
-    { ITEM_STEPPER,  "goggles.min_cell_voltage", "min_cell_voltage",  cell_volt_options,  9, 0, "alarm_voltage" },
-    { ITEM_DROPDOWN, "goggles.language",         "language",          language_options,   0, 0, "language" },
-    { ITEM_DROPDOWN, "goggles.band",             "band",              band_options,       0, 0, "band" },
-    { ITEM_ACTION,   "goggles.slot_switch",      NULL,                NULL,               0, 0, "slot_switch" },
+/* The Goggles section: display and on-screen-display settings only. */
+static const gog_item_t g_goggles_items[] = {
+    { ITEM_STEPPER, "goggles.brightness",       "brightness",       brightness_options, 5, 0, "brightness" },
+    { ITEM_STEPPER, "goggles.msp_osd",          "msp_osd",          msp_osd_options,    1, 0, "" },
+    { ITEM_TOGGLE,  "goggles.show_system_osd",  "show_system_osd",  NULL,               0, 1, "" },
+    { ITEM_TOGGLE,  "goggles.show_temperature", "show_temperature", NULL,               0, 1, "" },
 };
-#define GOG_ITEM_COUNT ((int) (sizeof(g_items) / sizeof(g_items[0])))
+#define GOGGLES_ITEM_COUNT ((int) (sizeof(g_goggles_items) / sizeof(g_goggles_items[0])))
+
+/* The System section: everything that is not a display setting. Every value still persists in
+ * GOG_SECTION (section_key defaults there for this section), so splitting the sidebar list re-keys
+ * no saved setting and hud.c keeps reading band/language/etc. from the same JSON section.
+ */
+static const gog_item_t g_system_items[] = {
+    { ITEM_STEPPER,  "system.buzzer_volume",     "buzzer_volume",     buzzer_options,    5, 0, "buzzer" },
+    { ITEM_TOGGLE,   "system.key_tones_off",     "key_tones_off",     NULL,              0, 0, "key_tones" },
+    { ITEM_TOGGLE,   "system.low_voltage_alarm", "low_voltage_alarm", NULL,              0, 1, "alarm" },
+    { ITEM_STEPPER,  "system.min_cell_voltage",  "min_cell_voltage",  cell_volt_options, 9, 0, "alarm_voltage" },
+    { ITEM_DROPDOWN, "system.language",          "language",          language_options,  0, 0, "language" },
+    { ITEM_DROPDOWN, "system.band",              "band",              band_options,      0, 0, "band" },
+    { ITEM_ACTION,   "system.slot_switch",       NULL,                NULL,              0, 0, "slot_switch" },
+};
+#define SYSTEM_ITEM_COUNT ((int) (sizeof(g_system_items) / sizeof(g_system_items[0])))
 
 static const char *const resolution_options[] = { "1080p 60fps", "1080p 30fps",
                                                   "720p 60fps", "720p 30fps", NULL };
@@ -126,9 +135,10 @@ static const char *const LANG_DIRS[] = {
 /* sidebar sections */
 typedef enum {
     SECTION_CHANNEL = 0,   /* the RF channel grid (scan overview) */
-    SECTION_GOGGLES,       /* the goggle settings list */
-    SECTION_DVR,           /* the DVR settings list */
+    SECTION_GOGGLES,       /* display + OSD settings */
+    SECTION_SYSTEM,        /* everything else: audio, alarm, language, RF band, slot */
     SECTION_AIRUNIT,       /* air-unit settings; always editable, pushed to the air at association */
+    SECTION_DVR,           /* the DVR settings list */
     SECTION_PLAYBACK,      /* the SD-card recordings list */
     NUM_SECTIONS,
 } section_t;
@@ -136,9 +146,10 @@ typedef enum {
 #define MAX_RECORDINGS 64
 
 static const char *const g_nav_icons[NUM_SECTIONS] = {
-    LV_SYMBOL_LIST, LV_SYMBOL_SETTINGS, LV_SYMBOL_SD_CARD, LV_SYMBOL_WIFI, LV_SYMBOL_VIDEO };
+    LV_SYMBOL_LIST, LV_SYMBOL_IMAGE, LV_SYMBOL_SETTINGS, LV_SYMBOL_WIFI, LV_SYMBOL_SD_CARD,
+    LV_SYMBOL_VIDEO };
 static const char *const g_nav_keys[NUM_SECTIONS]  = {
-    "nav.channel", "nav.goggles", "nav.dvr", "nav.air_unit", "nav.playback" };
+    "nav.channel", "nav.goggles", "nav.system", "nav.air_unit", "nav.dvr", "nav.playback" };
 
 /* state */
 static settings_t  *g_settings;
@@ -148,7 +159,7 @@ static lv_obj_t    *g_menu;                       /* top area (sidebar + content
 static lv_obj_t    *g_sidebar;
 static lv_obj_t    *g_content;                     /* content pane, rebuilt per section */
 static lv_obj_t    *g_sidebar_buttons[NUM_SECTIONS];
-static lv_obj_t    *g_rows[GOG_ITEM_COUNT];        /* the Goggles rows, NULL while another section shows */
+static lv_obj_t    *g_rows[SYSTEM_ITEM_COUNT];     /* the System rows (the list with the language item), NULL while another section shows */
 static int          g_section;                     /* SECTION_* */
 static int          g_content_focusable;           /* 0 = hint screen: keep focus in the sidebar */
 static int          g_zone;                        /* 0 = sidebar, 1 = content */
@@ -258,7 +269,8 @@ static void feed_key(uint32_t key)
 }
 
 /* The JSON section for the settings list currently shown. Item reads/writes go here; correct because
- * a row can only be touched while its own section is displayed.
+ * a row can only be touched while its own section is displayed. Goggles and System both fall through
+ * to GOG_SECTION: the split is presentational, so a setting keeps persisting where it always did.
  */
 static const char *section_key(void)
 {
@@ -502,7 +514,7 @@ static void load_catalog(const char *code)
     }
 }
 
-/* Re-apply the labels from the current catalog in place (no rebuild, so focus is kept). The Goggles
+/* Re-apply the labels from the current catalog in place (no rebuild, so focus is kept). The System
  * rows exist only while that section is shown (language can only change from there).
  */
 static void relabel(void)
@@ -514,9 +526,9 @@ static void relabel(void)
         }
     }
 
-    for (int i = 0; i < GOG_ITEM_COUNT; i++) {
+    for (int i = 0; i < SYSTEM_ITEM_COUNT; i++) {
         if (g_rows[i] != NULL) {
-            lv_label_set_text(lv_obj_get_child(g_rows[i], 0), T(g_items[i].title_key));
+            lv_label_set_text(lv_obj_get_child(g_rows[i], 0), T(g_system_items[i].title_key));
         }
     }
 }
@@ -539,7 +551,7 @@ static void item_clicked_cb(lv_event_t *event)
     } else if (item->type == ITEM_DROPDOWN) {
         open_select(item, row);   /* CENTER opens the select-list overlay */
     } else if (item->type == ITEM_ACTION && strcmp(item->action, "slot_switch") == 0) {
-        open_confirm(T("slot_switch.prompt"), T("goggles.slot_switch"), slot_switch_to_a, row);
+        open_confirm(T("slot_switch.prompt"), T("system.slot_switch"), slot_switch_to_a, row);
     } else if (item->type == ITEM_ACTION && strcmp(item->action, "format") == 0) {
         open_confirm(T("dvr.format_prompt"), T("dvr.format"), format_sdcard, row);
     }
@@ -625,7 +637,7 @@ static void build_sidebar(void)
 
 /* content renderers (each fills the cleared g_content with rows) */
 /* A settings list: one widget row per item (stepper/toggle/dropdown/action). rows, if non-NULL,
- * receives the row objects for in-place relabel (used only by Goggles, the only list with a language
+ * receives the row objects for in-place relabel (used only by System, the only list with a language
  * item). Reads/writes route through section_key(), so the same code serves any section's list.
  */
 static void render_settings_list(const gog_item_t *items, int count, lv_obj_t **rows)
@@ -653,7 +665,12 @@ static void render_settings_list(const gog_item_t *items, int count, lv_obj_t **
 
 static void render_goggles(void)
 {
-    render_settings_list(g_items, GOG_ITEM_COUNT, g_rows);
+    render_settings_list(g_goggles_items, GOGGLES_ITEM_COUNT, NULL);
+}
+
+static void render_system(void)
+{
+    render_settings_list(g_system_items, SYSTEM_ITEM_COUNT, g_rows);
 }
 
 static void render_dvr(void)
@@ -934,7 +951,7 @@ static void render_channel(void)
 static void render_content(void)
 {
     lv_obj_clean(g_content);
-    for (int i = 0; i < GOG_ITEM_COUNT; i++) {
+    for (int i = 0; i < SYSTEM_ITEM_COUNT; i++) {
         g_rows[i] = NULL;
     }
 
@@ -946,6 +963,8 @@ static void render_content(void)
         render_channel();
     } else if (g_section == SECTION_GOGGLES) {
         render_goggles();
+    } else if (g_section == SECTION_SYSTEM) {
+        render_system();
     } else if (g_section == SECTION_DVR) {
         render_dvr();
     } else if (g_section == SECTION_AIRUNIT) {
@@ -1432,7 +1451,7 @@ void menu_close(void)
             g_sidebar_buttons[i] = NULL;
         }
 
-        for (int i = 0; i < GOG_ITEM_COUNT; i++) {
+        for (int i = 0; i < SYSTEM_ITEM_COUNT; i++) {
             g_rows[i] = NULL;
         }
     }
