@@ -205,7 +205,7 @@ static int wait_ar8030(void)
 }
 
 /* Load artosyn_sdio with the firmware/config params, which downloads the baseband into the chip.
- * Deps (ar_dtbo_sdio, artosyn_gpio, dw_mci-artosyn) are already up from the coldplug, so a direct
+ * Deps (artosyn_gpio, dw_mci-artosyn) are already up from the coldplug, so a direct
  * finit_module of the one .ko is enough. Returns 0 on success.
  */
 static int load_rf_driver(const char *fw, const char *cfg)

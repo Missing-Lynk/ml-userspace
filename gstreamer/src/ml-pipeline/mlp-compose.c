@@ -1,12 +1,14 @@
 #include "ml-pipeline.h"
 
-/* Allocate one contiguous CMA buffer; returns its fd.
+/* Allocate one contiguous dma-buf; returns its fd.
  *
- * Heap choice matters for correctness, not just placement: `default_cma_region` hands out
- * CACHED CPU mappings and its dma_buf_sync no-ops, so a CPU-blitted composite can sit in L2
- * forever while the (non-snooping) DC scans stale DDR - clean in every CPU dump, garbage on
- * the panel. The `reserved` heap is the no-map uncached-coherent carveout: CPU writes land
- * in DDR directly, so what we compose is what the DC fetches. Prefer it; ML_HEAP overrides.
+ * Heap choice matters for correctness and placement. `mmz` (ml_mmzheap.ko) is the no-map
+ * WC carveout shared with the wave5 codec pool: CPU writes land in DDR directly, so what we
+ * compose is what the (non-snooping) DC fetches, and composite stops competing with the HUD
+ * overlay, DRM and driver DMA for the small CMA. `default_cma_region` hands out CACHED CPU
+ * mappings (its legacy alias `reserved` is the SAME CMA, not a carveout), so a CPU-blitted
+ * composite can sit in L2 while the DC scans stale DDR - clean in every CPU dump, garbage on
+ * the panel. Prefer mmz; the scan falls back to a CMA heap when it is absent; ML_HEAP overrides.
  */
 int ml_heap_alloc(gsize len)
 {
@@ -14,7 +16,7 @@ int ml_heap_alloc(gsize len)
     struct dirent *de;
     DIR *d;
     int hfd = -1;
-    const char *pref = getenv("ML_HEAP") ? getenv("ML_HEAP") : "default_cma_region";
+    const char *pref = getenv("ML_HEAP") ? getenv("ML_HEAP") : "mmz";
     char path[280];
 
     snprintf(path, sizeof path, "/dev/dma_heap/%s", pref);
@@ -74,9 +76,9 @@ void ml_dmabuf_sync(int fd, int start)
     ioctl(fd, DMA_BUF_IOCTL_SYNC, &s);
 }
 
-/* Allocate the composite pool adaptively: CMA is limited (~64 MB, shared and fragmentation-prone)
- * and each buffer is ~3.1 MB, so grab as many as CMA yields up to COMP_POOL, stopping at the first
- * failure. Need COMP_MIN to run without constant starvation; fewer than COMP_POOL just means the
+/* Allocate the composite pool adaptively: the heap is shared (mmz with the codec, or CMA with
+ * everything) and each buffer is ~3.1 MB, so grab as many as it yields up to COMP_POOL, stopping
+ * at the first failure. Need COMP_MIN to run without constant starvation; fewer than COMP_POOL just means the
  * starve-drop path fires under heavy inter-decoder skew (counted in comp_starve). The display
  * side alone can hold 4 (prev + front + pending + next, late retirement in drm_flip_handler),
  * so the floor leaves at least one slot free for the compositor.
@@ -101,10 +103,10 @@ gboolean comp_pool_init(struct ctx *c)
             c->stage_map = NULL;
         }
     }
-    /* Cap the pool when the heap is the SHARED mmz pool (ML_HEAP=mmz): the composite allocates
+    /* Cap the pool: the default heap is the SHARED mmz pool, and the composite allocates
      * before the two decoders claim their ~52 MiB of the same 108 MiB pool, so an uncapped
-     * greedy grab would starve wave5. ML_COMP_MAX bounds it (DVR launch sets ~14 -> ~42 MiB,
-     * leaving room for wave5). Default COMP_POOL for the standalone/CMA case.
+     * greedy grab would starve wave5. ML_COMP_MAX bounds it (ml-video-up sets 10 -> ~31 MiB,
+     * leaving room for wave5 + DVR encoder). Default COMP_POOL for the standalone/CMA case.
      */
     int cap = getenv("ML_COMP_MAX") ? atoi(getenv("ML_COMP_MAX")) : COMP_POOL;
     if (cap < COMP_MIN) {
@@ -116,7 +118,10 @@ gboolean comp_pool_init(struct ctx *c)
     }
 
     for (int i = 0; i < cap; i++) {
-        int fd = ml_heap_alloc(COMP_SIZE);
+        /* COMP_ALLOC, not COMP_SIZE: the encoder's dmabuf import demands its 16-row-aligned
+         * sizeimage; the content layout stays COMP_SIZE (the tail is padding).
+         */
+        int fd = ml_heap_alloc(COMP_ALLOC);
         guint8 *m;
 
         if (fd < 0) {
@@ -134,7 +139,7 @@ gboolean comp_pool_init(struct ctx *c)
         g_async_queue_push(c->comp_free, GINT_TO_POINTER(i + 1));   /* +1: 0 == queue-empty */
         c->comp_n++;
     }
-    fprintf(stderr, "ml-pipeline: composite pool = %d x %d KiB (%d MiB CMA)\n",
+    fprintf(stderr, "ml-pipeline: composite pool = %d x %d KiB (%d MiB)\n",
             c->comp_n, COMP_SIZE / 1024, c->comp_n * COMP_SIZE / (1024 * 1024));
 
     /* Derive the input-gate bounds from the actual yield: the display side holds up to 4
@@ -201,7 +206,7 @@ GstBuffer *comp_get(struct ctx *c, int *idx_out)
     ml_dmabuf_sync(cb->fd, 1);              /* begin CPU write access */
 
     b = gst_buffer_new();
-    mem = gst_dmabuf_allocator_alloc(c->comp_alloc, dup(cb->fd), COMP_SIZE);
+    mem = gst_dmabuf_allocator_alloc(c->comp_alloc, dup(cb->fd), COMP_ALLOC);
     gst_buffer_append_memory(b, mem);
     gst_buffer_add_video_meta_full(b, GST_VIDEO_FRAME_FLAG_NONE,
                                    GST_VIDEO_FORMAT_I420, COMP_W, COMP_H, 3, offs, strd);

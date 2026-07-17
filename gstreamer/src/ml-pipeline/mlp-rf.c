@@ -550,10 +550,25 @@ void *rf_rx(void *arg)
              * after the skew gate closes, and that overrun blew through the slot table and
              * dropped frames in blocks. Keeping dec0's in-flight depth shallow caps the
              * overrun at inflight_max + skew_max < the backable window.
+             *
+             * The skew is measured on the decoders' OUTPUT PTS (frame position), not on
+             * cumulative sample counts: counts drift from position when the tiles catch
+             * their first IDR at different FrameIds or a decoder consumes an AU without
+             * emitting output, and a count-based gate then holds tile 0 against a delta
+             * that cannot close - the positions diverge past the slot window and every
+             * pair evicts.
+             */
+            GstClockTime skew_ns = gst_util_uint64_scale(c->skew_max, GST_SECOND, RF_FPS);
+
+            /* The queue-depth bound reads the appsrc level directly: a sent[]-samples[]
+             * count delta ratchets whenever the decoder consumes an AU without emitting
+             * output (session restart, corrupt AU) and then holds tile 0 against a debt
+             * that can never clear - the same count-vs-position disease as the old skew
+             * gate. The appsrc level is the actual backlog and cannot drift.
              */
             if (c->t0_nhold > 0
-                || c->samples[0] > c->samples[1] + c->skew_max
-                || c->sent[0] > c->samples[0] + c->inflight_max) {
+                || c->out_pts[0] > c->out_pts[1] + skew_ns
+                || gst_app_src_get_current_level_buffers(c->src[0]) > (guint64)c->inflight_max) {
                 if (c->t0_nhold < (int)(sizeof c->t0_hold / sizeof c->t0_hold[0])) {
                     c->t0_hold[c->t0_nhold++] = buf;
                     continue;
@@ -568,13 +583,15 @@ void *rf_rx(void *arg)
         }
         push_au(c, chn, buf);
 
-        /* drain held tile-0 AUs as decoder 1 catches up - at most 2 per incoming datagram,
-         * since samples[] only advances asynchronously and an unbounded drain would just
+        /* drain held tile-0 AUs as decoder 1 catches up - bounded per incoming datagram,
+         * since out_pts[] only advances asynchronously and an unbounded drain would just
          * re-create the skew in one burst
          */
+        GstClockTime drain_skew_ns = gst_util_uint64_scale(c->skew_max, GST_SECOND, RF_FPS);
+
         for (int k = 0; k < 8 && c->t0_nhold > 0
-                        && c->samples[0] <= c->samples[1] + c->skew_max
-                        && c->sent[0] <= c->samples[0] + c->inflight_max; k++) {
+                        && c->out_pts[0] <= c->out_pts[1] + drain_skew_ns
+                        && gst_app_src_get_current_level_buffers(c->src[0]) <= (guint64)c->inflight_max; k++) {
             push_au(c, 0, c->t0_hold[0]);
             c->t0_nhold--;
             memmove(&c->t0_hold[0], &c->t0_hold[1], c->t0_nhold * sizeof c->t0_hold[0]);

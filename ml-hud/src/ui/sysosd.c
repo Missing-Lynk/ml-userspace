@@ -1,6 +1,7 @@
 /** @file sysosd.c @brief See sysosd.h. */
 #include "sysosd.h"
 
+#include "channel_label.h"
 #include "linkstate.h"
 
 #include "../../../ml-shared/mlm.h"
@@ -161,16 +162,17 @@ void sysosd_create(lv_obj_t *parent)
     lv_obj_add_flag(g_lbl_rec, LV_OBJ_FLAG_HIDDEN);    /* shown only while recording */
 
     /* RIGHT: air unit. Battery + temperature ride the :10000 status frames; distance is a local
-     * baseband reading via ml-linkd. Standby has no data source yet (needs an armed capture), so it
-     * stays hidden - a placeholder for when the arm/standby field is decoded.
-     * Temperature is the LEFTMOST field: the group is pinned to the bar's right edge, so hiding the
-     * left field (Show Temperature off) leaves the battery/distance fields to its right in place
-     * instead of shifting them. Standby is hidden, so it takes no layout space until it has data. */
+     * baseband reading via ml-linkd; standby is the air's work-mode readback (SetStandyMode 0x12),
+     * shown only when the air reports standby.
+     * Standby is the OUTERMOST (leftmost) field, then temperature: the group is pinned to the bar's
+     * right edge, so hiding a left field leaves the fields to its right in place instead of shifting
+     * them. Standby toggles with the air's arm state, so putting it leftmost keeps the rest of the
+     * air group steady as it appears/disappears; temperature (Show Temperature) sits just inside it. */
     g_group_right = make_group();
-    g_lbl_quad_temp = add_field(g_group_right, NULL, "--°C", COLOR_TEXT_DIM);
-    lv_obj_add_flag(g_lbl_quad_temp, LV_OBJ_FLAG_HIDDEN);
     g_lbl_standby = add_field(g_group_right, LV_SYMBOL_POWER, "", COLOR_PARTIAL);
     lv_obj_add_flag(g_lbl_standby, LV_OBJ_FLAG_HIDDEN);
+    g_lbl_quad_temp = add_field(g_group_right, NULL, "--°C", COLOR_TEXT_DIM);
+    lv_obj_add_flag(g_lbl_quad_temp, LV_OBJ_FLAG_HIDDEN);
     g_lbl_quad_battery = add_field(g_group_right, LV_SYMBOL_BATTERY_2, "--.-V", COLOR_TEXT_DIM);
     g_lbl_distance = add_field(g_group_right, LV_SYMBOL_GPS, "-- m", COLOR_TEXT_DIM);
 
@@ -248,13 +250,18 @@ static void update_goggle_battery(const telemetry_t *telemetry, settings_t *sett
 }
 
 /* Update the RF fields from ml-linkd (channel, SNR, distance). Dim placeholders when the link is down
- * or a value has not arrived. */
+ * or a value has not arrived. The channel is the table index our RX is tuned to - a local fact that
+ * holds whether or not the air is connected - so it is shown whenever known (green while linked, plain
+ * otherwise) so a pilot can always read off their channel. */
 static void update_link_fields(int connected)
 {
     int channel = linkstate_channel();
-    if (connected && channel != MLM_LINKINFO_NONE) {
-        lv_label_set_text_fmt(g_lbl_channel, "CH %d", channel);
-        lv_obj_set_style_text_color(g_lbl_channel, COLOR_GREEN, 0);
+    if (channel != MLM_LINKINFO_NONE) {
+        char label[24];
+
+        channel_label(label, sizeof label, channel);
+        lv_label_set_text(g_lbl_channel, label);
+        lv_obj_set_style_text_color(g_lbl_channel, connected ? COLOR_GREEN : COLOR_TEXT, 0);
     } else {
         lv_label_set_text(g_lbl_channel, "CH --");
         lv_obj_set_style_text_color(g_lbl_channel, COLOR_TEXT_DIM, 0);
@@ -278,6 +285,14 @@ static void update_link_fields(int connected)
     } else {
         lv_label_set_text_fmt(g_lbl_distance, "%s -- m", LV_SYMBOL_GPS);
         lv_obj_set_style_text_color(g_lbl_distance, COLOR_TEXT_DIM, 0);
+    }
+
+    /* Standby cue: the power glyph, shown only when the air reports standby (quad disarmed +
+     * standby armed). Hidden otherwise, so the bar is unchanged when the air is active. */
+    if (connected && linkstate_standby()) {
+        lv_obj_remove_flag(g_lbl_standby, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(g_lbl_standby, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
@@ -342,8 +357,10 @@ void sysosd_update(const telemetry_t *telemetry, const air_telem_t *air, setting
         lv_label_set_text(g_lbl_sdcard, LV_SYMBOL_SD_CARD " --");
     }
 
-    /* Incoming-video bitrate: shown live only while the downlink is up (its byte rate is otherwise 0). */
-    if (connected && telemetry->have_bitrate) {
+    /* Incoming-video bitrate: driven by the actual sdio0 byte flow (telemetry.c smooths it and holds
+     * the last value across brief gaps), NOT the link-liveness flag - the air throttles its status
+     * cadence in standby, which would otherwise blank a steadily-arriving video rate. */
+    if (telemetry->have_bitrate) {
         int tenths = (int) (telemetry->bitrate_mbps * 10.0f + 0.5f);
         lv_label_set_text_fmt(g_lbl_bitrate, "%s %d.%d Mbps", LV_SYMBOL_DOWNLOAD, tenths / 10, tenths % 10);
         lv_obj_set_style_text_color(g_lbl_bitrate, COLOR_TEXT, 0);

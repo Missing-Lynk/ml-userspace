@@ -35,11 +35,12 @@ void menu_center(void);    /**< @brief Enter the section (sidebar) or toggle/adv
 void menu_back(void);      /**< @brief Step one zone back; close at the sidebar. */
 void menu_close_all(void); /**< @brief Close the menu entirely, whatever the depth (long BACK). */
 
-/** @brief Re-dim the link-gated Air Unit entry from the live link state. Call on a timer while open. */
-void menu_refresh_link(void);
-
 /** @brief Advance the playback transport bar from the pipeline's telemetry. Call every loop tick so
  *  the scrubber tracks position promptly; a no-op unless a clip is playing. */
 void menu_playback_tick(void);
+
+/** @brief Refresh the channel grid from a newly-arrived scan (signal + active highlight). Call every
+ *  loop tick; a no-op unless the channel section is shown. */
+void menu_channel_tick(void);
 
 #endif /* HUD_UI_MENU_H */

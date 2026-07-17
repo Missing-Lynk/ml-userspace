@@ -77,6 +77,14 @@ struct ml_dmablit_req { gint32 dst_fd; guint32 n; struct ml_dmablit_copy copy[ML
 #define COMP_USIZE      (COMP_CSTRIDE * (COMP_H / 2))
 #define COMP_VOFF       (COMP_UOFF + COMP_USIZE)
 #define COMP_SIZE       (COMP_VOFF + COMP_USIZE)
+
+/* Allocation size: the wave5 encoder's sizeimage rounds the height to a multiple of 16
+ * (1080 -> 1088) and its dmabuf import rejects any buffer smaller than that, while its
+ * plane ADDRESSING uses stride * height = the plain COMP_* layout. Allocate the padded
+ * size, keep the 1080 content layout; the tail is dead padding.
+ */
+#define COMP_HALIGN     (((COMP_H + 15) / 16) * 16)
+#define COMP_ALLOC      (COMP_LSTRIDE * COMP_HALIGN * 3 / 2)
 #define COMP_TILE_SIZE  (COMP_W * COMP_H * 3 / 2)   /* max packed I420 tile for the staging buffer */
 #define COMP_POOL       24              /* cap; comp_pool_init allocates as many as the heap yields.
                                          * Sizing: the display side retires one flip late (prev +
@@ -141,6 +149,9 @@ struct ctx {
     GstClockTime rec_pts0;              /* first recorded PTS, rebased to 0 for a clean MP4 */
     gboolean rec_epoch_set;
     guint64 rec_pushed, rec_dropped;
+    int rec_qmax;                       /* appsrc queue bound; low in import mode - every queued
+                                         * buffer pins a composite pool slot */
+    gboolean rec_import;                /* encoder in dmabuf-import mode (no videoscale) */
 
     /* Composite dma-heap pool: a fixed set of contiguous CMA buffers, each scanned out
      * zero-copy by kmssink (COMP_* layout). Claimed per composite, returned to comp_free
@@ -192,6 +203,7 @@ struct ctx {
     } next_it,                          /* mailbox: newest frame awaiting flip */
       front_it, pending_it,             /* display-thread-only: on-screen / flip-in-flight */
       prev_it;                          /* retired one flip late, see drm_flip_handler */
+    gint64 pending_since;               /* monotonic us when pending_it's flip was submitted */
     GstClockTime next_pts;
     int wake_r, wake_w;                 /* self-pipe to kick the display thread */
 

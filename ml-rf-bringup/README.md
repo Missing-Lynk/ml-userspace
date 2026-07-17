@@ -21,7 +21,7 @@ Both arguments are required. `ml-video` invokes it at boot as `ml-rf-bringup bb_
 | firmware | `finit_module` `artosyn_sdio.ko` with `fw_name=`/`cfg_name=` |
 | netdev | wait (up to 10 s) for `sdio0`, bring it up, set `10.0.0.1/24` |
 
-A failed phase logs the reason and exits non-zero. Dependency modules (`ar_dtbo_sdio`, `artosyn_gpio`, `dw_mci-artosyn`) are loaded by the coldplug, not here.
+A failed phase logs the reason and exits non-zero. Dependency modules (`artosyn_gpio`, `dw_mci-artosyn`) are loaded by the coldplug, not here.
 
 ## Environment overrides
 

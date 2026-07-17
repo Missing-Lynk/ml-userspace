@@ -2,10 +2,16 @@
 # Format: key = value   (lines starting with # are comments)
 
 # Sidebar sections
+nav.channel = Channels
 nav.goggles = Goggles
 nav.dvr = DVR
 nav.air_unit = Air Unit
 nav.playback = Playback
+
+# Channel grid
+channel.scanning = Scanning...
+channel.scan_hint = Press CENTER to scan
+channel.no_link = No channels
 
 # Goggles section
 goggles.brightness         = Brightness
@@ -17,6 +23,7 @@ goggles.key_tones_off      = Disable Key Tones
 goggles.low_voltage_alarm  = Low Voltage Alarm
 goggles.min_cell_voltage   = Minimum Cell Voltage
 goggles.language           = Language
+goggles.band               = RF Band
 goggles.slot_switch        = Switch to Slot A
 
 # DVR section
@@ -30,6 +37,9 @@ dvr.format_prompt = Format the SD card?
 # Air Unit section
 air_unit.no_link = No air unit connected
 air_unit.connected = Air unit connected
+air_unit.power = Power
+air_unit.bitrate = Bitrate
+air_unit.standby = Standby
 
 # Playback
 playback.empty = No recordings
@@ -37,4 +47,8 @@ playback.empty = No recordings
 # Generic
 common.off = Off
 common.cancel = Cancel
+common.ok = OK
+common.reboot = Reboot
 slot_switch.prompt = Reboot into stock slot A?
+band.reboot_prompt = Switching band reboots the goggle. Continue?
+band.save_failed = Could not save the band setting

@@ -2,10 +2,16 @@
 # 格式： key = value  （以 # 开头的行为注释）
 
 # 侧边栏
+nav.channel = 频道
 nav.goggles = 眼镜
 nav.dvr = 录制
 nav.air_unit = 天空端
 nav.playback = 回放
+
+# 频道网格
+channel.scanning = 扫描中...
+channel.scan_hint = 按中键扫描
+channel.no_link = 无频道
 
 # 眼镜设置
 goggles.brightness         = 亮度
@@ -17,6 +23,7 @@ goggles.key_tones_off      = 关闭按键音
 goggles.low_voltage_alarm  = 低电压报警
 goggles.min_cell_voltage   = 最低单节电压
 goggles.language           = 语言
+goggles.band               = 射频频段
 goggles.slot_switch        = 切换到插槽 A
 
 # 录制
@@ -30,6 +37,9 @@ dvr.format_prompt = 格式化 SD 卡？
 # 天空端
 air_unit.no_link = 未连接天空端
 air_unit.connected = 天空端已连接
+air_unit.power = 功率
+air_unit.bitrate = 码率
+air_unit.standby = 待机
 
 # 回放
 playback.empty = 无录像
@@ -37,4 +47,8 @@ playback.empty = 无录像
 # 通用
 common.off = 关
 common.cancel = 取消
+common.ok = 确定
+common.reboot = 重启
 slot_switch.prompt = 重启进入原厂插槽 A？
+band.reboot_prompt = 切换频段需要重启眼镜，是否继续？
+band.save_failed = 无法保存频段设置

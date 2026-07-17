@@ -2,6 +2,11 @@
 
 /* Custom DRM/KMS display sink: drives artosyn_vo directly, retires after page-flip. */
 
+/* Upper bound on waiting for a page-flip completion event (~6 frame times at 60 Hz; the
+ * poll below wakes at most every 100 ms, so this is also the effective check granularity).
+ */
+#define FLIP_TIMEOUT_US (100 * 1000)
+
 /* Discover the connected output: connector + its mode + the CRTC driving it. */
 static int drm_find_output(struct ctx *c)
 {
@@ -264,7 +269,19 @@ static void *drm_disp_run(void *arg)
 
         pfd[0].revents = pfd[1].revents = 0;
         if (!ditem_empty(&c->pending_it)) {
-            continue;               /* a flip is in flight; wait for its completion event */
+            /* A flip is in flight; wait for its completion event. Bounded: the completion
+             * rides the VO vsync IRQ, and a lost edge would otherwise block this thread
+             * forever. After FLIP_TIMEOUT_US force-retire as if the event had arrived. If
+             * the real event still arrives later it rotates the queue one step early - a
+             * one-frame glitch, not a freeze.
+             */
+            if (g_get_monotonic_time() - c->pending_since < FLIP_TIMEOUT_US) {
+                continue;
+            }
+
+            fprintf(stderr, "ml-pipeline: flip completion lost (> %d ms), force-retiring "
+                    "(VO vsync stall?)\n", (int)(FLIP_TIMEOUT_US / 1000));
+            drm_flip_handler(c->drm_fd, 0, 0, 0, c);
         }
 
         if (c->show_idle && !c->idle_shown) {
@@ -304,6 +321,7 @@ static void *drm_disp_run(void *arg)
                 ditem_release(&it);
             } else {
                 c->pending_it = it;
+                c->pending_since = g_get_monotonic_time();
             }
         } else {
             /* composite: scan out the pool buffer's FB; single: the frame's own imported FB. */
@@ -324,6 +342,7 @@ static void *drm_disp_run(void *arg)
                 ditem_release(&it);
             } else {
                 c->pending_it = it;
+                c->pending_since = g_get_monotonic_time();
             }
         }
     }
@@ -580,6 +599,7 @@ int drm_disp_init(struct ctx *c)
     memset(&c->pending_it, 0, sizeof c->pending_it);
     memset(&c->prev_it, 0, sizeof c->prev_it);
     c->next_it.cbi = c->front_it.cbi = c->pending_it.cbi = c->prev_it.cbi = -1;
+    c->pending_since = 0;
     c->retire_dumps = getenv("ML_DUMP_RETIRE") ? atoi(getenv("ML_DUMP_RETIRE")) : 0;
     c->modeset_done = 0;   /* re-modeset the first frame of each (re)init - modes swap at runtime */
 

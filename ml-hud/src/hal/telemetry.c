@@ -59,29 +59,63 @@ static uint32_t mono_ms(void)
     return (uint32_t) (t.tv_sec * 1000 + t.tv_nsec / 1000000);
 }
 
-/* Incoming-video bitrate: the SDIO netdev RX byte counter differentiated over wall time. The counter
- * is monotonic per boot, so a smaller reading than last means it was reset (driver reload) - we skip
- * that tick and re-baseline. The first call only baselines (no interval yet). */
+/* Bitrate display shaping. The raw per-second sdio0 delta is bursty (especially in the air's 15 fps
+ * standby mode), so we smooth it with an EMA. And we drive the field from the byte flow itself, holding
+ * the last value briefly across gaps, rather than off the link-liveness flag - the air throttles its
+ * status-frame cadence in standby, which would otherwise blank a steadily-arriving video rate. */
+#define BITRATE_EMA_ALPHA 0.4f      /* newest-sample weight; ~a few 1 Hz ticks to converge */
+#define BITRATE_HOLD_MS   3000u     /* keep showing the last rate this long after bytes stop moving */
+
+/* Incoming-video bitrate: the SDIO netdev RX byte counter differentiated over wall time, smoothed and
+ * held. The counter is monotonic per boot, so a smaller reading than last means a reset (driver reload)
+ * - treated as no movement. have_bitrate stays set while bytes moved within the hold window, so the
+ * field reflects the real downlink rate even when the telemetry-liveness flag gaps. */
 static void read_bitrate(const board_profile_t *board, telemetry_t *out)
 {
     static long long last_bytes = -1;
     static uint32_t  last_ms;
+    static uint32_t  last_move_ms;   /* last tick the counter actually advanced */
+    static float     ema_mbps;       /* smoothed rate */
+    static int       have_ema;
 
     long long bytes = read_u64_file(board->sdio_rx_bytes_path);
     uint32_t now = mono_ms();
-    if (bytes < 0) {
-        last_bytes = -1;   /* source gone: re-baseline when it returns */
+    if (bytes < 0) {                 /* source vanished: hard reset -> placeholder */
+        last_bytes = -1;
+        have_ema = 0;
+        return;
+    }
+
+    if (last_bytes < 0) {            /* first sample: baseline only, assume live */
+        last_bytes = bytes;
+        last_ms = now;
+        last_move_ms = now;
         return;
     }
 
     uint32_t elapsed = now - last_ms;
-    if (last_bytes >= 0 && bytes >= last_bytes && elapsed >= 250) {
-        out->have_bitrate = 1;
-        out->bitrate_mbps = (float) ((bytes - last_bytes) * 8) / ((double) elapsed * 1000.0);
+    if (elapsed >= 250) {
+
+        long long delta = bytes - last_bytes;
+        if (delta < 0) {             /* counter reset: re-baseline, count as no movement */
+            delta = 0;
+        }
+
+        if (delta > 0) {
+            last_move_ms = now;
+        }
+
+        float inst = (float) (delta * 8) / ((double) elapsed * 1000.0);
+        ema_mbps = have_ema ? ema_mbps + (inst - ema_mbps) * BITRATE_EMA_ALPHA : inst;
+        have_ema = 1;
+        last_bytes = bytes;
+        last_ms = now;
     }
 
-    last_bytes = bytes;
-    last_ms = now;
+    if (have_ema && (uint32_t) (now - last_move_ms) < BITRATE_HOLD_MS) {
+        out->have_bitrate = 1;
+        out->bitrate_mbps = ema_mbps;
+    }
 }
 
 /** @brief Estimate the pack cell count from the pack voltage. */
@@ -128,6 +162,7 @@ void telemetry_read(telemetry_t *out)
             fprintf(stderr, "telemetry: detected %dS pack (%.2fV, ~%.2fV/cell)\n",
                     g_cell_count, pack_volts, pack_volts / g_cell_count);
         }
+
         out->have_battery = 1;
         out->pack_volts = pack_volts;
         out->cell_count = g_cell_count;

@@ -42,6 +42,8 @@ enum mlm_type {
     MLM_T_CMD        = 0x0007, /* HUD -> ml-pipeline (ctrl.sock): a control command */
     MLM_T_STATE      = 0x0008, /* ml-pipeline -> HUD (telemetry.sock): current pipeline mode */
     MLM_T_LINKINFO   = 0x0009, /* ml-linkd -> HUD (telemetry.sock): local baseband link metrics */
+    MLM_T_RFCMD      = 0x000a, /* HUD -> ml-linkd (link.sock): air-unit RF config command */
+    MLM_T_SCAN       = 0x000b, /* ml-linkd -> HUD (telemetry.sock): RF channel scan result */
 };
 
 struct mlm_hdr {
@@ -85,10 +87,45 @@ struct mlm_link {
 #define MLM_LINKINFO_NONE INT32_MIN
 
 struct mlm_linkinfo {
-    int32_t  channel;      /* display channel number (1..16), or MLM_LINKINFO_NONE */
+    int32_t  channel;      /* channel table index the RX is tuned to (the select value), or MLM_LINKINFO_NONE */
     int32_t  snr_db;       /* link SNR in dB (from Get1V1Info), or MLM_LINKINFO_NONE */
     int32_t  distance_m;   /* RF-ranging distance in metres, or MLM_LINKINFO_NONE (not ranging) */
-    uint32_t flags;        /* reserved for future validity/quality bits */
+    uint32_t flags;        /* MLM_LINKINFO_F_* validity/state bits */
+} __attribute__((packed));
+
+/* The air unit is currently in standby (its work-mode sync, :10000 SetStandyMode 0x12, reports
+ * standby - the quad is disarmed and standby is armed). The HUD shows the standby glyph. */
+#define MLM_LINKINFO_F_STANDBY 0x1
+
+/* MLM_T_SCAN payload (ml-linkd -> HUD on telemetry.sock). One RF channel scan. The frequency table
+ * and `valid_bmp` come from the raw GetScanResult bb-socket reply (struct-of-arrays: count + freq[]
+ * + valid bitmap); the chip returns the FULL channel table (up to 19) regardless of the
+ * Standard/Race mode, and `valid_bmp` is the current mode's valid-channel mask (bit i = index i
+ * valid). `snr_db` does NOT come from that reply, which carries no per-channel SNR: ml-linkd
+ * measures it by visiting each valid channel and reading Get1V1Info there, so only valid channels
+ * carry a value and out-of-mode entries carry MLM_SCAN_SIGNAL_NONE. */
+#define MLM_SCAN_MAX_CH     19
+#define MLM_SCAN_SIGNAL_NONE INT16_MIN     /* snr_db has no value (snr_raw <= 0) */
+
+/* snr_raw sentinels. The vendor buckets the RAW value, so it is the wire's source of truth and
+ * snr_db is only a display convenience. */
+#define MLM_SCAN_RAW_NOLOCK  0   /* the chip never reported the swept channel: no usable link there */
+#define MLM_SCAN_RAW_NONE   (-1) /* no Get1V1Info reply came back at all */
+
+struct mlm_scan_chan {
+    uint16_t freq_mhz;  /* channel centre frequency in MHz */
+    int16_t  snr_db;    /* snr_raw expressed in dB for display, or MLM_SCAN_SIGNAL_NONE */
+    int16_t  snr_raw;   /* raw linear Get1V1Info SNR (+0x06), or MLM_SCAN_RAW_NOLOCK / _RAW_NONE */
+    uint8_t  index;     /* channel table index 0..18 = the value passed to a channel select */
+    uint8_t  valid;     /* 1 = in the current mode's valid set (from valid_bmp) */
+} __attribute__((packed));
+
+struct mlm_scan {
+    uint32_t valid_bmp;  /* current mode's valid-channel bitmap (bit i set = index i selectable now) */
+    uint8_t  count;      /* number of entries in chan[] */
+    uint8_t  active_idx; /* table index the local RX is currently tuned to (for the active highlight) */
+    uint8_t  pad[2];
+    struct mlm_scan_chan chan[MLM_SCAN_MAX_CH];
 } __attribute__((packed));
 
 /* MLM_T_LED payload (any producer -> ml-ledd). ml-ledd renders the animation itself
@@ -160,6 +197,66 @@ struct mlm_state {
 #define MLM_STATE_F_RENDERING 0x4 /* first decoded frame is on the display (the clip is visible); before
                                    *  this the HUD keeps the menu up with a loading spinner. */
 
+/* MLM_T_RFCMD payload (HUD -> ml-linkd on link.sock). ml-linkd owns /dev/artosyn_sdio and the
+ * :10000 message channel, so the HUD never touches the air directly: it sends intent, and ml-linkd
+ * translates it into the air's config datagrams and re-applies it after a session restart. The HUD
+ * re-asserts on every link-up edge so the air converges to the menu's state (a default that was
+ * never toggled still needs pushing). New cmds append; ml-linkd ignores unknown values.
+ */
+enum mlm_rfcmd_type {
+    MLM_RF_SET_STANDBY = 1, /* arg = 1 arm standby, 0 disarm. Rides SetTranParm (:10000 msg 0x0D)
+                             * byte[8] = u8StandbyModeEn; the air's automatic arm/disarm handshake
+                             * (0x12/0x1b) does the actual power-save entry/exit. */
+    MLM_RF_SET_POWER   = 2, /* arg = the air's TX power in mW, one of {25,100,200}. Rides the same
+                             * SetTranParm (:10000 msg 0x0D) byte[0]; ml-linkd maps mW -> dBm
+                             * (25->0x0e, 100->0x14, 200->0x17) and rejects any other value. */
+    MLM_RF_SET_BITRATE = 3, /* arg = the air's video bitrate in Mbps, one of {8,16,24}. Rides
+                             * SetLdCfg (:10000 msg 0x0A) bitrate_q (Mbps * 4, 250 kbps units);
+                             * the air latches it at association, so a change takes effect on the
+                             * next session. ml-linkd rejects any other value. */
+    MLM_RF_SELECT_CHANNEL = 4, /* arg = the channel table index (0..18) to tune the local RX to,
+                             * passed verbatim to the bb-socket SelectChn (SET_CHNIDX): the same
+                             * index the scan reports and the tiles show, no +1. Unlike the three
+                             * above this is LOCAL: it sends nothing to the air, which follows the
+                             * retune transparently (no re-association, no video drop). ml-linkd
+                             * rejects an arg outside the table (0..MLM_SCAN_MAX_CH-1); whether the
+                             * index is valid in the current band is left to the chip. */
+    MLM_RF_SCAN         = 5, /* trigger a one-shot RF channel scan (GetScanResult); ml-linkd fires it
+                             * on its bb-socket thread and publishes MLM_T_SCAN. arg ignored. Read-only:
+                             * the sweep self-restores the active channel. */
+};
+
+struct mlm_rfcmd {
+    uint32_t cmd; /* enum mlm_rfcmd_type */
+    uint32_t arg; /* command-specific */
+} __attribute__((packed));
+
+/* Send one MLM_T_RFCMD to ml-linkd's link.sock. Connectionless DGRAM: returns 0 if the datagram
+ * went out, -1 otherwise (a down ml-linkd just means nobody is bound; the HUD re-asserts on the
+ * next link-up edge regardless). */
+static inline int mlm_rfcmd_send(uint32_t cmd, uint32_t arg)
+{
+    struct { struct mlm_hdr h; struct mlm_rfcmd cmd; } __attribute__((packed)) frame;
+    frame.h.magic = MLM_MAGIC;
+    frame.h.type = MLM_T_RFCMD;
+    frame.h.flags = 0;
+    frame.cmd.cmd = cmd;
+    frame.cmd.arg = arg;
+
+    int sock = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        return -1;
+    }
+
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    strncpy(addr.sun_path, MLM_LINK_SOCK, sizeof addr.sun_path - 1);
+    int ok = sendto(sock, &frame, sizeof frame, 0, (struct sockaddr *)&addr, sizeof addr)
+             == (ssize_t) sizeof frame ? 0 : -1;
+    close(sock);
+
+    return ok;
+}
+
 /* SCM_RIGHTS fd passing over drm.sock */
 static inline int mlm_send_fd(int sock, int fd)
 {
@@ -188,7 +285,7 @@ static inline int mlm_recv_fd(int sock)
     struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1,
                           .msg_control = control.buf, .msg_controllen = sizeof control.buf };
 
-                          if (recvmsg(sock, &msg, 0) != 1) {
+    if (recvmsg(sock, &msg, 0) != 1) {
         return -1;
     }
 

@@ -30,7 +30,7 @@ $(BUILD):
 # pin as the gstreamer stack and the slot-B rootfs, so musl and versions match the runtime).
 #   $(1)=name  $(2)=extra apk packages  $(3)=extra gcc flags
 define daemon_rule
-$(BUILD)/$(1): $(1)/$(1).c ml-shared/mlm.h | $(BUILD)
+$(BUILD)/$(1): $(1)/$(1).c $(wildcard $(1)/*.h) ml-shared/mlm.h | $(BUILD)
 	docker run --rm --platform linux/arm64 -v $(REPO):/w -w /w \
 	  alpine:3.24 sh -euc 'apk add -q build-base $(2); \
 	    gcc -O2 -Wall -static $(3) -o build/$(1) $(1)/$(1).c'

@@ -18,6 +18,7 @@
 #include "hal/telemetry.h"
 #include "hud_state.h"
 #include "osd/btfl_osd.h"
+#include "services/linkcmd.h"
 #include "services/linkstate.h"
 #include "services/pipecmd.h"
 #include "settings/settings.h"
@@ -72,6 +73,10 @@ typedef struct {
     int            rec_autostart_sent; /* latch: the "stream up" auto-record start toggle was already sent */
     int            rec_is_auto;        /* the current recording was started by auto-record (not the button) */
     int            nosignal_sent;      /* latch: the "stream lost" no-signal-splash command was already sent */
+    int            standby_asserted;   /* latch: the air-unit standby state was pushed for this link-up */
+    int            power_asserted;     /* latch: the air-unit TX power was pushed for this link-up */
+    int            bitrate_asserted;   /* latch: the air-unit bitrate was pushed for this link-up */
+    int            channel_asserted;   /* latch: the saved RF channel was pushed for this link-up */
     long           osd_frames;
     long           rendered;
     uint16_t       last_voltage_mV;  /* air-unit pack mV, from the 0x09/0x11 status frames */
@@ -466,6 +471,51 @@ int main(int argc, char **argv)
             h.rec_autostart_sent = 0;
         }
 
+        /* Push the air-unit standby state once per link-up. The menu default is armed, so a user who
+         * never touches the toggle still needs it asserted; ml-linkd applies it and re-applies on its
+         * own session restarts. Latched to fire once; the latch clears on disconnect. */
+        if (connected && !h.standby_asserted) {
+            linkcmd_set_standby(settings_get_bool_in(h.settings, "air_unit", "standby", 1));
+            h.standby_asserted = 1;
+        } else if (!connected) {
+            h.standby_asserted = 0;
+        }
+
+        /* Same once-per-link-up assertion for TX power: the menu default is 100 mW, so a user who
+         * never touches the row still needs it pushed. The stored value is the level label; linkcmd
+         * maps it to mW and ml-linkd re-applies it on its own session restarts. */
+        if (connected && !h.power_asserted) {
+            linkcmd_set_power(settings_get_string_in(h.settings, "air_unit", "power", "100 mW"));
+            h.power_asserted = 1;
+        } else if (!connected) {
+            h.power_asserted = 0;
+        }
+
+        /* Same once-per-link-up assertion for the channel, which ml-linkd does not persist: without
+         * it every boot lands on ml-linkd's bring-up default. Only asserted if the user has ever
+         * picked one; ml-linkd ignores a channel outside the current band's valid set, leaving its
+         * own first-valid choice in place. */
+        if (connected && !h.channel_asserted) {
+            int channel = settings_get_int_in(h.settings, "goggle", "channel", -1);
+            if (channel >= 0) {
+                linkcmd_select_channel((unsigned) channel);
+            }
+
+            h.channel_asserted = 1;
+        } else if (!connected) {
+            h.channel_asserted = 0;
+        }
+
+        /* Same once-per-link-up assertion for the bitrate: ml-linkd applies it via SetLdCfg at
+         * association, so the push must land before (or between) sessions; re-asserting on every
+         * link-up edge covers both. */
+        if (connected && !h.bitrate_asserted) {
+            linkcmd_set_bitrate(settings_get_string_in(h.settings, "air_unit", "bitrate", "24 Mbps"));
+            h.bitrate_asserted = 1;
+        } else if (!connected) {
+            h.bitrate_asserted = 0;
+        }
+
         /* Turning auto-record off stops the recording it started (never a manual one). Level-checked
          * and cleared after the toggle, so it fires once - and also catches a recording that was
          * still starting when the toggle flipped (it stops once the pipeline reports RECORDING).
@@ -505,6 +555,7 @@ int main(int argc, char **argv)
 
             /* track the playback scrubber at loop rate, not the 1 s OSD cadence */
             menu_playback_tick();
+            menu_channel_tick();   /* pick up channel scans while the channel grid is shown */
         }
 
         /* Beeps: end any finished key tone; run the low-voltage alarm on its own cadence. */
@@ -531,7 +582,6 @@ int main(int argc, char **argv)
             };
 
             sysosd_update(&telemetry, &air, h.settings);
-            menu_refresh_link();   /* keep the Air Unit entry's dim in step with the live link */
         }
 
         /* Long BACK: fire once while held past the threshold. */
