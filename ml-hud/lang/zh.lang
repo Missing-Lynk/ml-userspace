@@ -23,6 +23,7 @@ goggles.key_tones_off      = 关闭按键音
 goggles.low_voltage_alarm  = 低电压报警
 goggles.min_cell_voltage   = 最低单节电压
 goggles.language           = 语言
+goggles.band               = 射频频段
 goggles.slot_switch        = 切换到插槽 A
 
 # 录制
@@ -46,4 +47,8 @@ playback.empty = 无录像
 # 通用
 common.off = 关
 common.cancel = 取消
+common.ok = 确定
+common.reboot = 重启
 slot_switch.prompt = 重启进入原厂插槽 A？
+band.reboot_prompt = 切换频段需要重启眼镜，是否继续？
+band.save_failed = 无法保存频段设置

@@ -121,7 +121,8 @@ static inline int bb_set_power_auto(uint8_t *frame, uint8_t enable, uint32_t seq
     return bb_build_frame(frame, BB_SET, 0, 0, SET_POWER_AUTO, seq, payload, 1);
 }
 
-/* DECODED: retune the local RX to channel `chan_idx` (0..15); the air re-associates autonomously. */
+/* DECODED: retune the local RX to a channel table index (0..18); the air re-associates
+ * autonomously. The index is the table position, passed verbatim - not the OSD channel number. */
 static inline int bb_select_channel(uint8_t *frame, uint8_t chan_idx, uint32_t seq)
 {
     const uint8_t payload[2] = { 0x02, chan_idx };

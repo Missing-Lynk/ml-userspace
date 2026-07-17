@@ -18,10 +18,12 @@
 
 #include "../../../ml-shared/mlm.h"
 
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 /* The palette (COLOR_*) lives in theme.h, shared with the player. Menu layout sizes: */
@@ -65,6 +67,13 @@ static const char *const cell_volt_options[] = {
     "3.4V", "3.5V", "3.6V", "3.7V", "3.8V", "3.9V", "4.0V", "4.1V", "4.2V", NULL };
 static const char *const msp_osd_options[]   = { "None", "BTFL", NULL };
 static const char *const language_options[]  = { "English", "中文", NULL };
+static const char *const band_options[]      = { "Race", "Normal", NULL };
+
+/* The RF band marker ml-video reads at boot to pick the baseband config. Under /usrdata (the
+ * usr_data UBI volume the ml-usrdata service mounts): it must outlive the reboot that applies it.
+ */
+#define BAND_MARKER_DIR  "/usrdata/missinglynk"
+#define BAND_MARKER_PATH BAND_MARKER_DIR "/rf-band"
 
 static const gog_item_t g_items[] = {
     { ITEM_STEPPER, "goggles.brightness",        "brightness",        brightness_options, 5, 0, "brightness" },
@@ -76,6 +85,7 @@ static const gog_item_t g_items[] = {
     { ITEM_TOGGLE,  "goggles.low_voltage_alarm", "low_voltage_alarm", NULL,               0, 1, "alarm" },
     { ITEM_STEPPER,  "goggles.min_cell_voltage", "min_cell_voltage",  cell_volt_options,  9, 0, "alarm_voltage" },
     { ITEM_DROPDOWN, "goggles.language",         "language",          language_options,   0, 0, "language" },
+    { ITEM_DROPDOWN, "goggles.band",             "band",              band_options,       0, 0, "band" },
     { ITEM_ACTION,   "goggles.slot_switch",      NULL,                NULL,               0, 0, "slot_switch" },
 };
 #define GOG_ITEM_COUNT ((int) (sizeof(g_items) / sizeof(g_items[0])))
@@ -150,6 +160,9 @@ static lv_obj_t          *g_select_row;            /* the content row that opene
 static int                g_select_open;
 static int                g_select_closing;        /* a deferred close is scheduled */
 static void             (*g_confirm_fn)(void);     /* action to run when a confirm overlay is accepted */
+static const char        *g_notice_pending;        /* notice to raise once the current overlay is torn down */
+static const char        *g_band_pending;          /* band option label awaiting its reboot confirm */
+static int                g_band_confirm_due;      /* raise that confirm once the select list is gone */
 
 static lv_font_t    g_menu_font;                   /* Montserrat with the CJK fallback */
 static lv_style_t   g_style_item;
@@ -161,6 +174,7 @@ extern const lv_font_t font_zh;                    /* baked CJK subset (services
 /* channel grid: 4 columns, up to ceil(19/4) rows; the descriptors must outlive the object. */
 #define CHAN_COLS          4
 #define CHAN_MAX_ROWS      5
+#define CHAN_REF_ROWS      4   /* the Race band's 16 channels: the tile size every band matches */
 #define COLOR_CHAN_ACTIVE  lv_color_hex(0x46D17B)   /* active-channel border (System OSD green) */
 
 static int32_t   g_chan_cols[CHAN_COLS + 1];
@@ -176,6 +190,8 @@ static void set_language(const char *option);
 static void apply_item(const gog_item_t *item, const char *value);
 static void open_select(const gog_item_t *item, lv_obj_t *row);
 static void open_confirm(const char *prompt, const char *confirm_label, void (*fn)(void), lv_obj_t *row);
+static void open_notice(const char *prompt);
+static void band_confirm_apply(void);
 static void slot_switch_to_a(void);
 static void format_sdcard(void);
 static void close_select(void);
@@ -789,11 +805,17 @@ static void chan_show_active(int idx)
  * menu_channel_tick reconciles it against ml-linkd's live channel ~1 s later - a select that did not
  * take reverts itself rather than leaving the UI claiming a channel the RX is not on.
  */
+/* Persist the pick so it survives a reboot (hud.c re-asserts it on the next link-up), the same
+ * contract as the air-unit power/bitrate/standby rows. ml-linkd holds the band's valid set and
+ * rejects a channel outside it, so a value saved under one band cannot retune the chip off a
+ * different one - it just falls back to the band's first channel.
+ */
 static void chan_tile_clicked(lv_event_t *event)
 {
     int idx = (int) (intptr_t) lv_event_get_user_data(event);
 
     linkcmd_select_channel((unsigned) idx);
+    settings_set_int_in(g_settings, GOG_SECTION, "channel", idx);
     chan_show_active(idx);
 }
 
@@ -858,7 +880,16 @@ static void render_channel(void)
         return;
     }
 
+    /* Rows are equal fractions of the content height, so templating only the rows a band fills
+     * would size the tiles by channel count: Normal's 3 channels would be one row stretched over
+     * the whole screen. Template at least the Race band's rows so a tile is the same size in every
+     * band; the surplus rows just stay empty.
+     */
     int nrows = (nvalid + CHAN_COLS - 1) / CHAN_COLS;
+    if (nrows < CHAN_REF_ROWS) {
+        nrows = CHAN_REF_ROWS;
+    }
+
     if (nrows > CHAN_MAX_ROWS) {
         nrows = CHAN_MAX_ROWS;
     }
@@ -1045,6 +1076,28 @@ static void select_close_async(void *unused)
         if (g_select_row != NULL) {
             lv_group_focus_obj(g_select_row);   /* land back on the row that opened the list */
         }
+
+        /* A band choice was made in the list that just closed: confirm it, since applying it
+         * reboots. Checked before the notice - the confirm is what raises the failure notice.
+         */
+        if (g_band_confirm_due) {
+            g_band_confirm_due = 0;   /* before open_confirm: its own close runs this path again */
+            open_confirm(T("band.reboot_prompt"), T("common.reboot"), band_confirm_apply,
+                         g_select_row);
+            return;
+        }
+
+        /* an overlay that asked for a notice (e.g. a failed band write) raises it now */
+        if (g_notice_pending != NULL) {
+            const char *prompt = g_notice_pending;
+            g_notice_pending = NULL;
+            open_notice(prompt);
+        }
+    } else {
+        /* the menu closed under the overlay: drop anything it was going to raise */
+        g_notice_pending = NULL;
+        g_band_pending = NULL;
+        g_band_confirm_due = 0;
     }
 }
 
@@ -1060,6 +1113,18 @@ static void close_select(void)
 static void select_apply(int index)
 {
     const gog_item_t *item = g_select_item;
+
+    /* The band only takes effect across a reboot, so it is confirmed before it is committed:
+     * stash the choice and let the close raise the confirm. Nothing is persisted until then, so
+     * Cancel needs no revert - the row still shows the old band because it never changed.
+     */
+    if (strcmp(item->action, "band") == 0) {
+        g_band_pending = item->options[index];
+        g_band_confirm_due = 1;
+        close_select();
+        return;
+    }
+
     settings_set_string_in(g_settings, section_key(), item->setting_key, item->options[index]);
     apply_item(item, item->options[index]);
     if (g_select_row != NULL) {
@@ -1184,6 +1249,68 @@ static void open_confirm(const char *prompt, const char *confirm_label, void (*f
     lv_group_add_obj(g_group, ok);
 
     lv_group_focus_obj(cancel);   /* default to Cancel */
+    g_select_open = 1;
+}
+
+/* Select the RF band by writing the marker ml-video reads at boot: "normal" = the 3-channel band,
+ * anything else = race (16 channels). The band is the baseband config's chan_valid_bmp, which only
+ * reaches the AR8030 at firmware upload, and artosyn_sdio must never be warm-reloaded, so this
+ * cannot take effect before the next boot: raise the notice saying so once the select list is gone.
+ * Deliberately does not reboot - on a RAM-booted slot B a watchdog reset lands in stock slot A, not
+ * back here.
+ */
+/* Confirm accepted: persist the band, drop the marker ml-video reads at boot, and reset. The band
+ * is the baseband config's chan_valid_bmp and only reaches the AR8030 at firmware upload, and
+ * artosyn_sdio must never be warm-reloaded, so a reboot is the only way to apply it.
+ *
+ * The reset boots whatever slot the GPT marks active, which is the point: it is stock slot A while
+ * slot B is only RAM-booted, so this returns to B only once B is the flashed active slot.
+ */
+static void band_confirm_apply(void)
+{
+    const char *band = (g_band_pending != NULL && strcmp(g_band_pending, "Normal") == 0)
+                       ? "normal" : "race";
+
+    mkdir(BAND_MARKER_DIR, 0755);
+
+    FILE *f = fopen(BAND_MARKER_PATH, "w");
+    if (f == NULL) {
+        /* Without the marker the band cannot survive the reboot that applies it, so do NOT reboot:
+         * say it failed instead. /usrdata is a mount (ml-usrdata) and may be absent.
+         */
+        fprintf(stderr, "menu: cannot write %s: %s\n", BAND_MARKER_PATH, strerror(errno));
+        g_notice_pending = T("band.save_failed");
+        g_band_pending = NULL;
+        return;
+    }
+
+    fputs(band, f);
+    fclose(f);
+
+    settings_set_string_in(g_settings, GOG_SECTION, "band", g_band_pending);
+    g_band_pending = NULL;
+    sync();
+
+    system("/usr/local/bin/wdt-reset");
+}
+
+/* A one-button acknowledgement modal. Same overlay state as the select list and the confirm prompt,
+ * so it can only be raised once theirs is torn down (g_notice_pending, drained in the close).
+ */
+static void open_notice(const char *prompt)
+{
+    g_select_item = NULL;
+    g_select_row = NULL;
+    g_confirm_fn = NULL;
+
+    lv_obj_t *box = make_modal(prompt);
+    lv_group_remove_all_objs(g_group);
+
+    lv_obj_t *ok = make_modal_button(box, T("common.ok"));
+    lv_obj_add_event_cb(ok, confirm_button_cb, LV_EVENT_CLICKED, (void *) (intptr_t) 0);
+    lv_group_add_obj(g_group, ok);
+    lv_group_focus_obj(ok);
+
     g_select_open = 1;
 }
 

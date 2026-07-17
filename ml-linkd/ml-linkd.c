@@ -200,6 +200,12 @@ static volatile int g_v1v1_plen;
 static struct mlm_scan g_scan;
 static volatile int g_scan_ready;           /* a GetScanResult reply has landed in g_scan */
 
+/* The current band's valid-channel mask (the config JSON's chan_valid_bmp, echoed by the chip in
+ * every GetScanResult reply). Its own global rather than a read of g_scan: udp_thread tests it to
+ * reject off-band selects, and g_scan belongs to the main thread. 0 = not read back yet, in which
+ * case the band is unknown and selects are allowed through rather than all rejected. */
+static volatile uint32_t g_valid_bmp;
+
 /* Air-unit RF config the HUD has commanded (MLM_T_RFCMD on link.sock). -1 = never commanded, so
  * nothing is pushed to the air until the HUD asserts it; the HUD re-asserts on every link-up edge.
  * ml-linkd re-sends the SetTranParm on a steady cadence while linked, so no per-change latch is
@@ -444,6 +450,7 @@ static void parse_scan(const uint8_t *pay, int plen)
 
     memset(&scan, 0, sizeof scan);
     scan.valid_bmp = bmp;
+    g_valid_bmp = bmp;
     scan.count = (uint8_t)count;
     scan.active_idx = (uint8_t)g_cur_chnidx;
 
@@ -475,6 +482,67 @@ static void parse_scan(const uint8_t *pay, int plen)
         printf(TAG " scan: count=%d valid_bmp=0x%08x\n", count, bmp);
         fflush(stdout);
     }
+}
+
+/* @return the lowest channel index set in @bmp, or -1 if none is. */
+static int first_valid_idx(uint32_t bmp)
+{
+    for (int i = 0; i < MLM_SCAN_MAX_CH; i++) {
+        if ((bmp >> i) & 1) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+/* Retune the RX onto the band if OPEN left it off it. OPEN_CHNIDX is a Race index, so a Normal-band
+ * chip (chan_valid_bmp = 0x7, indices 0..2) comes up tuned outside its own valid set: the channel
+ * grid then shows 3 tiles with the active one among none of them, and the OSD reports a channel the
+ * band does not contain. The band is only known from the chip (the config JSON's chan_valid_bmp,
+ * echoed in the GetScanResult reply), so it is read here rather than assumed.
+ *
+ * Runs once at the end of OPEN, before the air is associated: retuning here costs nothing, whereas
+ * doing it later would drop a working link. Cheap - the raw GetScanResult does not sweep.
+ */
+static void tune_into_band(uint8_t *frame, uint32_t *seq_link)
+{
+    uint8_t poll[19];
+    long t0;
+    int first;
+
+    g_scan_ready = 0;
+    bb_get(poll, GET_SCAN_RESULT, (*seq_link)++);
+    send_frame(poll, 19, "get-scan");
+    for (t0 = now_ms(); !g_scan_ready; ) {
+        if (now_ms() - t0 >= SWEEP_SCAN_MS) {
+            printf(TAG " band: no GetScanResult reply, staying on ch%d\n", g_cur_chnidx);
+            fflush(stdout);
+            return;
+        }
+
+        usleep(5000);
+    }
+
+    if ((g_scan.valid_bmp >> g_cur_chnidx) & 1) {
+        return;   /* already on a channel this band allows */
+    }
+
+    first = first_valid_idx(g_scan.valid_bmp);
+    if (first < 0) {
+        printf(TAG " band: valid_bmp=0x%08x has no channel, staying on ch%d\n",
+               g_scan.valid_bmp, g_cur_chnidx);
+        fflush(stdout);
+        return;
+    }
+
+    printf(TAG " band: ch%d is outside valid_bmp=0x%08x, retuning to ch%d\n",
+           g_cur_chnidx, g_scan.valid_bmp, first);
+    fflush(stdout);
+
+    send_frame(frame, bb_select_channel(frame, (uint8_t)first, (*seq_link)++), "band-retune");
+    g_cur_chnidx = first;
+    usleep(OPEN_STEP_US);
 }
 
 /* Send one Get1V1Info and wait for its reply. @return 1 on a fresh reply (g_v1v1_raw / g_v1v1_chan
@@ -941,10 +1009,19 @@ static void *udp_thread(void *arg)
                     /* Queue the retune for the bb-socket owner (main); issuing SelectChn from this
                      * thread would race the steady poll and get lost. Passed verbatim, no +1.
                      * The bound is the channel TABLE size: indices run 0..18, and Race's valid set is
-                     * 3..18, so a 0..15 bound would reject CH16/17/18 (5420/5380/5340 MHz). Whether
-                     * the index is valid in the current band is the chip's call, not ours. */
+                     * 3..18, so a 0..15 bound would reject CH16/17/18 (5420/5380/5340 MHz).
+                     *
+                     * The band is enforced here rather than left to the chip: the chip accepts an
+                     * index outside its own chan_valid_bmp and simply tunes there (a Normal-band
+                     * chip sat on Race ch5 until tune_into_band was added). The HUD re-asserts a
+                     * saved channel on every link-up, so without this a channel saved under Race
+                     * would retune a Normal-band chip straight back off its band. Rejecting leaves
+                     * the band's first valid channel in place. */
                     if (rc->arg >= MLM_SCAN_MAX_CH) {
                         fprintf(stderr, TAG " rfcmd: ignoring bad channel index %u\n", rc->arg);
+                    } else if (g_valid_bmp != 0 && !((g_valid_bmp >> rc->arg) & 1)) {
+                        fprintf(stderr, TAG " rfcmd: channel %u outside band valid_bmp=0x%08x,"
+                                " ignoring\n", rc->arg, g_valid_bmp);
                     } else {
                         printf(TAG " rfcmd: select channel %u\n", rc->arg);
                         fflush(stdout);
@@ -1275,6 +1352,10 @@ int main(int argc, char **argv)
                                          bf->seq, bf->payload, bf->plen), "open");
         usleep(OPEN_STEP_US);
     }
+
+    /* OPEN_SEQ's channel is a Race index, so correct it before the air associates if the chip's
+     * band does not contain it (Normal). */
+    tune_into_band(frame, &seq_link);
 
     /* 23 dBm */
     send_frame(frame, bb_set_power(frame, RF_TX, 0x17, seq_video++), "tx-power");

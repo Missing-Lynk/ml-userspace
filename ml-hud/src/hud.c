@@ -76,6 +76,7 @@ typedef struct {
     int            standby_asserted;   /* latch: the air-unit standby state was pushed for this link-up */
     int            power_asserted;     /* latch: the air-unit TX power was pushed for this link-up */
     int            bitrate_asserted;   /* latch: the air-unit bitrate was pushed for this link-up */
+    int            channel_asserted;   /* latch: the saved RF channel was pushed for this link-up */
     long           osd_frames;
     long           rendered;
     uint16_t       last_voltage_mV;  /* air-unit pack mV, from the 0x09/0x11 status frames */
@@ -488,6 +489,21 @@ int main(int argc, char **argv)
             h.power_asserted = 1;
         } else if (!connected) {
             h.power_asserted = 0;
+        }
+
+        /* Same once-per-link-up assertion for the channel, which ml-linkd does not persist: without
+         * it every boot lands on ml-linkd's bring-up default. Only asserted if the user has ever
+         * picked one; ml-linkd ignores a channel outside the current band's valid set, leaving its
+         * own first-valid choice in place. */
+        if (connected && !h.channel_asserted) {
+            int channel = settings_get_int_in(h.settings, "goggle", "channel", -1);
+            if (channel >= 0) {
+                linkcmd_select_channel((unsigned) channel);
+            }
+
+            h.channel_asserted = 1;
+        } else if (!connected) {
+            h.channel_asserted = 0;
         }
 
         /* Same once-per-link-up assertion for the bitrate: ml-linkd applies it via SetLdCfg at

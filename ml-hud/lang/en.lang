@@ -23,6 +23,7 @@ goggles.key_tones_off      = Disable Key Tones
 goggles.low_voltage_alarm  = Low Voltage Alarm
 goggles.min_cell_voltage   = Minimum Cell Voltage
 goggles.language           = Language
+goggles.band               = RF Band
 goggles.slot_switch        = Switch to Slot A
 
 # DVR section
@@ -46,4 +47,8 @@ playback.empty = No recordings
 # Generic
 common.off = Off
 common.cancel = Cancel
+common.ok = OK
+common.reboot = Reboot
 slot_switch.prompt = Reboot into stock slot A?
+band.reboot_prompt = Switching band reboots the goggle. Continue?
+band.save_failed = Could not save the band setting
