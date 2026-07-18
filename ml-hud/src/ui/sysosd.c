@@ -19,8 +19,21 @@
 #define COLOR_PARTIAL   lv_color_hex(0xD99A2B)   /* orange: standby cue */
 #define OSD_PAD_HOR     44
 #define OSD_FIELD_GAP   36
-#define OSD_BATTERY_WIDTH 170   /* fixed (fits "25.2V (6S)"), so the value changing does not reflow */
 #define OSD_FONT        (&lv_font_montserrat_28)
+
+/* Every continuously-varying field gets a fixed width, measured from its widest possible string
+ * (field_width), so a value changing width (more digits, "No Link", ...) never reflows the flex row
+ * and shifts its neighbours. The channel is the exception: it only changes on a deliberate channel
+ * switch, so it is content-sized (no idle slack) and the one-off reflow then is fine. Left-group text
+ * is left-aligned inside its box (grows rightward into the box); right-group text is right-aligned so
+ * each value's right edge stays pinned to the bar's right edge. */
+#define OSD_MAX_BATTERY  LV_SYMBOL_BATTERY_FULL " 25.2V (6S)"
+#define OSD_MAX_LINK     LV_SYMBOL_WIFI " 88 dB"
+#define OSD_MAX_BITRATE  LV_SYMBOL_DOWNLOAD " 88.8 Mbps"
+#define OSD_MAX_SDCARD   LV_SYMBOL_SD_CARD " 256G"   /* largest card realistically used */
+#define OSD_MAX_TEMP     "88°C"
+#define OSD_MAX_AIRBAT   LV_SYMBOL_BATTERY_2 " 25.20V"   /* 6S full, %d.%02dV format */
+#define OSD_MAX_DISTANCE LV_SYMBOL_GPS " 8888 m"
 
 /* Low-battery blink: half-period of the battery-icon blink while the alarm is active. */
 #define ALARM_TICK_MS   250
@@ -86,6 +99,16 @@ static lv_color_t signal_color(int level, int max)
     return lv_color_hsv_to_rgb((uint16_t) hue, 80, 95);
 }
 
+/* Pixel width of @p text rendered in the OSD font. Fields are fixed to the width of their widest
+ * possible string so a changing value never reflows the bar. */
+static int32_t field_width(const char *text)
+{
+    lv_point_t size;
+
+    lv_text_get_size(&size, text, OSD_FONT, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    return size.x;
+}
+
 static lv_obj_t *add_field(lv_obj_t *group, const char *icon, const char *value, lv_color_t color)
 {
     lv_obj_t *label = lv_label_create(group);
@@ -143,38 +166,52 @@ void sysosd_create(lv_obj_t *parent)
     lv_obj_set_style_bg_color(g_osd, COLOR_OSD, 0);
     lv_obj_set_style_bg_opa(g_osd, LV_OPA_TRANSP, 0);   /* transparent until the menu opens */
 
-    /* LEFT: goggle + connection. Channel and link come from ml-linkd (services/linkstate); battery,
-     * SD and temperature are goggle-local (hal/telemetry). */
+    /* LEFT: goggle + connection, ordered channel - link - battery - bitrate - SD - REC - temp.
+     * Channel and link come from ml-linkd (services/linkstate); battery, SD and temperature are
+     * goggle-local (hal/telemetry). */
     g_group_left = make_group();
     g_lbl_channel = add_field(g_group_left, NULL, "CH --", COLOR_TEXT_DIM);
+    g_lbl_link = add_field(g_group_left, LV_SYMBOL_WIFI, "-- dB", COLOR_WARN);
+    lv_obj_set_width(g_lbl_link, field_width(OSD_MAX_LINK));
     g_lbl_battery = add_field(g_group_left, LV_SYMBOL_BATTERY_FULL, "--.-V", COLOR_TEXT);
-    lv_obj_set_width(g_lbl_battery, OSD_BATTERY_WIDTH);   /* fixed width: no reflow on value change */
-    g_lbl_link = add_field(g_group_left, LV_SYMBOL_WIFI, "No Link", COLOR_WARN);
-    g_lbl_sdcard = add_field(g_group_left, LV_SYMBOL_SD_CARD, "--", COLOR_TEXT);
-    /* Incoming-video bitrate, between the SD card and temperature. Only meaningful while the air-unit
-     * downlink is up, so it reads a dim placeholder otherwise (like the RF fields). */
-    g_lbl_bitrate = add_field(g_group_left, LV_SYMBOL_DOWNLOAD, "-- Mbps", COLOR_TEXT_DIM);
-    g_lbl_temp = add_field(g_group_left, NULL, "--°C", COLOR_TEXT);
-    lv_obj_add_flag(g_lbl_temp, LV_OBJ_FLAG_HIDDEN);   /* shown only when enabled and a reading exists */
-    /* Last in the goggle group: toggling REC grows into the middle slack instead of shifting the
-     * other fields, so the bar does not jump when recording starts/stops. */
-    g_lbl_rec = add_field(g_group_left, NULL, "REC", COLOR_REC);
-    lv_obj_add_flag(g_lbl_rec, LV_OBJ_FLAG_HIDDEN);    /* shown only while recording */
+    lv_obj_set_width(g_lbl_battery, field_width(OSD_MAX_BATTERY));
 
-    /* RIGHT: air unit. Battery + temperature ride the :10000 status frames; distance is a local
-     * baseband reading via ml-linkd; standby is the air's work-mode readback (SetStandyMode 0x12),
-     * shown only when the air reports standby.
-     * Standby is the OUTERMOST (leftmost) field, then temperature: the group is pinned to the bar's
-     * right edge, so hiding a left field leaves the fields to its right in place instead of shifting
-     * them. Standby toggles with the air's arm state, so putting it leftmost keeps the rest of the
-     * air group steady as it appears/disappears; temperature (Show Temperature) sits just inside it. */
+    /* Incoming-video bitrate. Only meaningful while the air-unit downlink is up, so it reads a dim
+     * placeholder otherwise (like the RF fields). */
+    g_lbl_bitrate = add_field(g_group_left, LV_SYMBOL_DOWNLOAD, "--.- Mbps", COLOR_TEXT_DIM);
+    lv_obj_set_width(g_lbl_bitrate, field_width(OSD_MAX_BITRATE));
+    g_lbl_sdcard = add_field(g_group_left, LV_SYMBOL_SD_CARD, "--", COLOR_TEXT);
+    lv_obj_set_width(g_lbl_sdcard, field_width(OSD_MAX_SDCARD));
+
+    /* REC sits mid-group, so it keeps its slot when idle (opacity toggled, not hidden): hiding it
+     * would shift the temperature field each time recording starts/stops. */
+    g_lbl_rec = add_field(g_group_left, NULL, "REC", COLOR_REC);
+    lv_obj_set_width(g_lbl_rec, field_width("REC"));
+    lv_obj_set_style_opa(g_lbl_rec, LV_OPA_TRANSP, 0);   /* visible only while recording */
+    g_lbl_temp = add_field(g_group_left, NULL, "--°C", COLOR_TEXT);
+    lv_obj_set_width(g_lbl_temp, field_width(OSD_MAX_TEMP));
+    lv_obj_add_flag(g_lbl_temp, LV_OBJ_FLAG_HIDDEN);   /* shown only when enabled and a reading exists */
+
+    /* RIGHT: air unit, ordered standby - temp - distance - battery. Battery + temperature ride the
+     * :10000 status frames; distance is a local baseband reading via ml-linkd; standby is the air's
+     * work-mode readback (SetStandyMode 0x12), shown only when the air reports standby.
+     * The group is pinned to the bar's right edge, so hiding a left field leaves the fields to its
+     * right in place instead of shifting them. The two toggling fields (standby with the air's arm
+     * state, temperature with Show Temperature) are therefore the leftmost, keeping the always-on
+     * distance + battery steady. */
     g_group_right = make_group();
     g_lbl_standby = add_field(g_group_right, LV_SYMBOL_POWER, "", COLOR_PARTIAL);
     lv_obj_add_flag(g_lbl_standby, LV_OBJ_FLAG_HIDDEN);
     g_lbl_quad_temp = add_field(g_group_right, NULL, "--°C", COLOR_TEXT_DIM);
+    lv_obj_set_width(g_lbl_quad_temp, field_width(OSD_MAX_TEMP));
+    lv_obj_set_style_text_align(g_lbl_quad_temp, LV_TEXT_ALIGN_RIGHT, 0);
     lv_obj_add_flag(g_lbl_quad_temp, LV_OBJ_FLAG_HIDDEN);
-    g_lbl_quad_battery = add_field(g_group_right, LV_SYMBOL_BATTERY_2, "--.-V", COLOR_TEXT_DIM);
     g_lbl_distance = add_field(g_group_right, LV_SYMBOL_GPS, "-- m", COLOR_TEXT_DIM);
+    lv_obj_set_width(g_lbl_distance, field_width(OSD_MAX_DISTANCE));
+    lv_obj_set_style_text_align(g_lbl_distance, LV_TEXT_ALIGN_RIGHT, 0);
+    g_lbl_quad_battery = add_field(g_group_right, LV_SYMBOL_BATTERY_2, "--.-V", COLOR_TEXT_DIM);
+    lv_obj_set_width(g_lbl_quad_battery, field_width(OSD_MAX_AIRBAT));
+    lv_obj_set_style_text_align(g_lbl_quad_battery, LV_TEXT_ALIGN_RIGHT, 0);
 
     lv_timer_create(alarm_tick_cb, ALARM_TICK_MS, NULL);
 }
@@ -193,11 +230,8 @@ void sysosd_set_recording(int recording)
         return;
     }
 
-    if (recording) {
-        lv_obj_remove_flag(g_lbl_rec, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_obj_add_flag(g_lbl_rec, LV_OBJ_FLAG_HIDDEN);
-    }
+    /* Opacity, not hide: the field keeps its slot so the fields after it never shift. */
+    lv_obj_set_style_opa(g_lbl_rec, recording ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
 }
 
 void sysosd_set_visible(int visible)
@@ -274,7 +308,8 @@ static void update_link_fields(int connected)
         int level = snr <= 0 ? 0 : snr >= 20 ? SIGNAL_MAX : snr / 5;
         lv_obj_set_style_text_color(g_lbl_link, signal_color(level, SIGNAL_MAX), 0);
     } else {
-        lv_label_set_text_fmt(g_lbl_link, "%s No Link", LV_SYMBOL_WIFI);
+        /* Down/no-reading: dim dashes like the other fields; the warn colour alone flags the state. */
+        lv_label_set_text_fmt(g_lbl_link, "%s -- dB", LV_SYMBOL_WIFI);
         lv_obj_set_style_text_color(g_lbl_link, COLOR_WARN, 0);
     }
 
@@ -365,7 +400,7 @@ void sysosd_update(const telemetry_t *telemetry, const air_telem_t *air, setting
         lv_label_set_text_fmt(g_lbl_bitrate, "%s %d.%d Mbps", LV_SYMBOL_DOWNLOAD, tenths / 10, tenths % 10);
         lv_obj_set_style_text_color(g_lbl_bitrate, COLOR_TEXT, 0);
     } else {
-        lv_label_set_text_fmt(g_lbl_bitrate, "%s -- Mbps", LV_SYMBOL_DOWNLOAD);
+        lv_label_set_text_fmt(g_lbl_bitrate, "%s --.- Mbps", LV_SYMBOL_DOWNLOAD);
         lv_obj_set_style_text_color(g_lbl_bitrate, COLOR_TEXT_DIM, 0);
     }
 
