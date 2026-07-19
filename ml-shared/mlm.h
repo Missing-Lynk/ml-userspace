@@ -59,8 +59,14 @@ struct mlm_framestats {
 } __attribute__((packed));
 
 struct mlm_ready {
-    uint32_t frames_seen; /* 0 = pipeline up but no video datagrams yet; 1 = frames arriving */
-    uint32_t reserved;
+    uint32_t frames_seen; /* 0 = pipeline up but no video datagrams yet; 1 = frames arriving (latched) */
+    uint32_t rx_pkts;     /* low 32 bits of the pipeline's raw :10001 datagram counter. Advances iff
+                           * the air is actually sending video (independent of decode/playback), so
+                           * ml-linkd uses it to catch a mid-session video stall the :10000 telemetry
+                           * hides (an air-side link bounce rebuilds the air's encoder but never
+                           * silences telemetry, so the air-loss watch cannot see it) and re-runs the
+                           * media handshake. Old producers send 0 here; a never-changing counter
+                           * disables the stall watch, so the field is backward compatible. */
 } __attribute__((packed));
 
 /* MLM_T_LINK payload (ml-linkd -> telemetry.sock consumer) */
@@ -175,6 +181,15 @@ enum mlm_cmd_type {
                              *  running recording keeps its format). The HUD sends it off the
                              *  dvr.resolution setting: on change and again just before each
                              *  record-start toggle, so a restarted pipeline reconverges. */
+    MLM_CMD_OSD_CELL   = 11, /* one rendered BTFL OSD glyph cell for the DVR burn-in: a struct
+                             *  mlm_osd_cell followed by w*h RGBA pixels rides after the mlm_cmd.
+                             *  The HUD renders the cell with its own loaded MSP font (so the
+                             *  recording uses the exact glyphs on the panel) and sends only
+                             *  changed cells; ml-pipeline caches them and, while recording,
+                             *  overwrites the opaque pixels into each composite before the
+                             *  encoder. A header with no pixel payload clears that cell; row =
+                             *  col = MLM_OSD_CLEAR_ALL clears the whole cache. The sender (the
+                             *  HUD) gates on the dvr.record_osd setting + recording state. */
 };
 
 struct mlm_cmd {
@@ -184,6 +199,27 @@ struct mlm_cmd {
 /* MLM_CMD_PLAY carries the file path as bytes after the mlm_cmd in the same datagram; the
  * full frame is { mlm_hdr, mlm_cmd, char path[] } (NUL-terminated, bounded by MLM_PATH_MAX). */
 #define MLM_PATH_MAX 512
+
+/* MLM_CMD_OSD_CELL payload: one BTFL OSD grid cell, pre-rendered by the HUD at composite
+ * resolution. The rect is the cell's luma-pixel rectangle in the 1920x1080 composite (the same
+ * rectangle the HUD draws on the overlay plane, so the burned glyphs sit exactly under the
+ * displayed ones). w*h RGBA pixels follow the struct: alpha >= 128 = opaque glyph pixel, else
+ * transparent (the HUD's own binary-alpha draw rule); ml-pipeline only ever writes the opaque
+ * pixels. A frame with no pixel bytes clears the cell.
+ */
+#define MLM_OSD_ROWS      20    /* BTFL HD DisplayPort grid (mirrors BTFL_OSD_ROWS/COLS) */
+#define MLM_OSD_COLS      53
+#define MLM_OSD_CLEAR_ALL 0xffff /* row = col = this: clear every cached cell */
+#define MLM_OSD_CELL_WMAX 64    /* rect bounds a receiver must enforce */
+#define MLM_OSD_CELL_HMAX 64
+#define MLM_OSD_CELL_MAX  (sizeof(struct mlm_osd_cell) + \
+                           (size_t) MLM_OSD_CELL_WMAX * MLM_OSD_CELL_HMAX * 4)
+
+struct mlm_osd_cell {
+    uint16_t row, col;  /* grid cell being replaced (or MLM_OSD_CLEAR_ALL / MLM_OSD_CLEAR_ALL) */
+    uint16_t x, y;      /* cell rect top-left in composite luma pixels */
+    uint16_t w, h;      /* cell rect size; w*h*4 RGBA bytes follow (0 bytes = cell cleared) */
+} __attribute__((packed));
 
 /* MLM_T_STATE payload (ml-pipeline -> HUD on telemetry.sock). The pipeline broadcasts its current
  * mode on every change and re-asserts periodically, so a restarted HUD (or one that missed a
@@ -235,7 +271,47 @@ enum mlm_rfcmd_type {
     MLM_RF_SCAN         = 5, /* trigger a one-shot RF channel scan (GetScanResult); ml-linkd fires it
                              * on its bb-socket thread and publishes MLM_T_SCAN. arg ignored. Read-only:
                              * the sweep self-restores the active channel. */
+    MLM_RF_SET_CAMERA   = 6, /* arg = (selector << 16) | value, selector = enum mlm_cam_sel, value a
+                             * u16. Rides SetCameraInfo (:10000 msg 0x0C), the air's selector-tagged
+                             * ISP union: one datagram sets one field, applied live (seamless except
+                             * rotation, which blips the feed). Exposure packs both of its fields into
+                             * the one value: 0 = auto, nonzero = manual with that exposure time in
+                             * microseconds. ml-linkd accepts only the HW-captured selectors and
+                             * clamps/rejects out-of-range values. */
+    MLM_RF_SET_SCALE    = 7, /* arg = (aspect << 16) | zoom_pct. Rides SetScaleMode (:10000 msg 0x15),
+                             * the air's VIN scale: aspect 0 = 16:9, 1 = 4:3; zoom_pct = zoom factor
+                             * in percent, one of {100, 70} (the two HW-captured stock values).
+                             * Applied live; a change blips the feed (geometry restart). */
 };
+
+/* MLM_RF_SET_CAMERA selectors, the air's SetCameraInfo union tags. Only the ones the stock Camera
+ * page exposed and the slot-A capture confirmed are listed; the others (brightness 0, WB 4,
+ * aspect-as-0x0C 6, NR2D 8, ISO 9, banding 10) exist on the air but were never captured, so
+ * ml-linkd does not send them. */
+enum mlm_cam_sel {
+    MLM_CAM_EXPOSURE   = 1,  /* value: 0 = auto, else manual exposure time in us */
+    MLM_CAM_SATURATION = 2,  /* value: 0..100 (stock default 50) */
+    MLM_CAM_SHARPNESS  = 3,  /* value: 0..100 (stock default 55) */
+    MLM_CAM_ROTATION   = 5,  /* value: 0 = normal, 1 = 180 degrees */
+    MLM_CAM_NR3D       = 7,  /* value: 0 = off, 1 = on (3D noise reduction) */
+};
+
+/* The air's cold-boot camera defaults (from the captured SetLdCfg base's camera block): the values
+ * a (re)association resets the air's ISP to. Shared so the HUD's menu defaults and reset action,
+ * and ml-linkd's cached wire state (mp-cmd.h MP_CAMERA_DEFAULTS), cannot drift apart. */
+#define MLM_CAM_DEF_BRIGHTNESS   1
+#define MLM_CAM_DEF_EXPOSURE     0      /* auto */
+#define MLM_CAM_DEF_EXPOSURE_US  16666  /* manual exposure time seed (1/60 s) */
+#define MLM_CAM_DEF_SATURATION   50
+#define MLM_CAM_DEF_SHARPNESS    55
+#define MLM_CAM_DEF_WB_MANUAL    0
+#define MLM_CAM_DEF_WB_KELVIN    5000
+#define MLM_CAM_DEF_ISO          100
+#define MLM_CAM_DEF_ROTATION     0
+#define MLM_CAM_DEF_NR3D         1
+#define MLM_CAM_DEF_NR2D         1
+#define MLM_CAM_DEF_ZOOM_PCT     100
+#define MLM_CAM_DEF_ASPECT       0      /* 16:9 */
 
 struct mlm_rfcmd {
     uint32_t cmd; /* enum mlm_rfcmd_type */
@@ -360,6 +436,43 @@ static inline int mlm_ctrl_send(uint32_t cmd, uint32_t arg, const char *path)
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
     strncpy(addr.sun_path, MLM_CTRL_SOCK, sizeof addr.sun_path - 1);
     int ok = sendto(sock, &frame, len, 0, (struct sockaddr *)&addr, sizeof addr) == (ssize_t)len ? 0 : -1;
+    close(sock);
+
+    return ok;
+}
+
+/* Send one MLM_T_CMD with an arbitrary binary payload after the mlm_cmd (MLM_CMD_OSD_CELL's
+ * cell frame). Same connectionless-DGRAM contract as mlm_ctrl_send; @p len is bounded by
+ * MLM_OSD_CELL_MAX (the largest defined payload).
+ */
+static inline int mlm_ctrl_send_blob(uint32_t cmd, uint32_t arg, const void *data, size_t len)
+{
+    struct { struct mlm_hdr h; struct mlm_cmd cmd; unsigned char blob[MLM_OSD_CELL_MAX]; }
+        __attribute__((packed)) frame;
+    size_t total = sizeof frame.h + sizeof frame.cmd + len;
+
+    if (len > sizeof frame.blob) {
+        return -1;
+    }
+
+    frame.h.magic = MLM_MAGIC;
+    frame.h.type = MLM_T_CMD;
+    frame.h.flags = 0;
+    frame.cmd.cmd = cmd;
+    frame.cmd.arg = arg;
+    if (len > 0) {
+        memcpy(frame.blob, data, len);
+    }
+
+    int sock = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        return -1;
+    }
+
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    strncpy(addr.sun_path, MLM_CTRL_SOCK, sizeof addr.sun_path - 1);
+    int ok = sendto(sock, &frame, total, 0, (struct sockaddr *)&addr, sizeof addr)
+             == (ssize_t) total ? 0 : -1;
     close(sock);
 
     return ok;

@@ -43,12 +43,27 @@ air_unit.connected = 天空端已连接
 air_unit.power = 功率
 air_unit.bitrate = 码率
 air_unit.standby = 待机
+air_unit.camera = 摄像头
+
+# 摄像头叠层
+camera.exposure = 曝光
+camera.saturation = 饱和度
+camera.sharpness = 锐度
+camera.rotation = 画面旋转
+camera.nr3d = 3D 降噪
+camera.zoom = 变焦
+camera.aspect = 画面比例
+camera.auto = 自动
+camera.rot_normal = 正常
+camera.rot_flipped = 翻转
+camera.reset = 恢复默认设置
 
 # 回放
 playback.empty = 无录像
 
 # 通用
 common.off = 关
+common.on = 开
 common.cancel = 取消
 common.ok = 确定
 common.reboot = 重启

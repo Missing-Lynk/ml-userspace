@@ -43,4 +43,9 @@ void menu_playback_tick(void);
  *  loop tick; a no-op unless the channel section is shown. */
 void menu_channel_tick(void);
 
+/** @brief Push every persisted camera setting (and the zoom/aspect scale pair) to the air unit via
+ *  ml-linkd. hud.c calls this on every link-up edge: a re-association resets the air's ISP to its
+ *  association defaults, so the saved values need re-asserting like power and standby. */
+void menu_camera_assert(void);
+
 #endif /* HUD_UI_MENU_H */

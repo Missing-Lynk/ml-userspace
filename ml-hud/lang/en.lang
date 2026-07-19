@@ -43,12 +43,27 @@ air_unit.connected = Air unit connected
 air_unit.power = Power
 air_unit.bitrate = Bitrate
 air_unit.standby = Standby
+air_unit.camera = Camera
+
+# Camera overlay
+camera.exposure = Exposure
+camera.saturation = Saturation
+camera.sharpness = Sharpness
+camera.rotation = Rotation
+camera.nr3d = 3D DNR
+camera.zoom = Zoom
+camera.aspect = Aspect Ratio
+camera.auto = Auto
+camera.rot_normal = Normal
+camera.rot_flipped = Flipped
+camera.reset = Reset to defaults
 
 # Playback
 playback.empty = No recordings
 
 # Generic
 common.off = Off
+common.on = On
 common.cancel = Cancel
 common.ok = OK
 common.reboot = Reboot

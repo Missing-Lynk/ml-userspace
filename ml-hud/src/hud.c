@@ -80,6 +80,7 @@ typedef struct {
     int            power_asserted;     /* latch: the air-unit TX power was pushed for this link-up */
     int            bitrate_asserted;   /* latch: the air-unit bitrate was pushed for this link-up */
     int            channel_asserted;   /* latch: the saved RF channel was pushed for this link-up */
+    int            camera_asserted;    /* latch: the saved camera/scale settings were pushed for this link-up */
     long           osd_frames;
     long           rendered;
     uint16_t       last_voltage_mV;  /* air-unit pack mV, from the 0x09/0x11 status frames */
@@ -404,6 +405,7 @@ static void assert_air_settings(hud_ctx_t *h, int connected)
         h->power_asserted = 0;
         h->channel_asserted = 0;
         h->bitrate_asserted = 0;
+        h->camera_asserted = 0;
         return;
     }
 
@@ -430,6 +432,12 @@ static void assert_air_settings(hud_ctx_t *h, int connected)
     if (!h->bitrate_asserted) {
         linkcmd_set_bitrate(settings_get_string_in(h->settings, "air_unit", "bitrate", "24 Mbps"));
         h->bitrate_asserted = 1;
+    }
+
+    if (!h->camera_asserted) {
+        /* a re-association resets the air's ISP to its association defaults; push the saved values */
+        menu_camera_assert();
+        h->camera_asserted = 1;
     }
 }
 

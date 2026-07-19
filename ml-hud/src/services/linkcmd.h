@@ -25,6 +25,18 @@ void linkcmd_set_power(const char *level);
  *  ml-linkd drops any value it does not know. */
 void linkcmd_set_bitrate(const char *level);
 
+/** @brief Set one air-unit camera (ISP) field: @p sel is an mlm.h MLM_CAM_* selector, @p value its
+ *  u16 payload (exposure: 0 = auto, else the manual exposure time in us). Rides SetCameraInfo
+ *  (:10000 msg 0x0C), applied live by the air; rotation blips the feed, the rest are seamless.
+ *  ml-linkd validates the selector and clamps the value. */
+void linkcmd_set_camera(unsigned sel, unsigned value);
+
+/** @brief Set the air unit's VIN scale: @p aspect_4_3 (0 = 16:9, 1 = 4:3) and @p zoom_pct (zoom
+ *  factor in percent, 100 or 70 - the two stock values). Rides SetScaleMode (:10000 msg 0x15),
+ *  applied live; a change blips the feed (geometry restart). Both fields ride one message, so both
+ *  are always sent together. */
+void linkcmd_set_scale(int aspect_4_3, unsigned zoom_pct);
+
 /** @brief Request a one-shot RF channel scan; ml-linkd fires it and publishes the result as a scan
  *  telemetry record (read by linkstate_scan). Read-only - the sweep self-restores the active channel. */
 void linkcmd_request_scan(void);

@@ -607,7 +607,8 @@ gboolean rf_ready_tick(gpointer u)
     struct ctx *c = u;
     struct { struct mlm_hdr h; struct mlm_ready r; } __attribute__((packed)) rec = {
         .h = { .magic = MLM_MAGIC, .type = MLM_T_READY, .flags = 0 },
-        .r = { .frames_seen = (c->composed > 0) ? 1u : 0u },
+        .r = { .frames_seen = (c->composed > 0) ? 1u : 0u,
+               .rx_pkts = (uint32_t) c->rx_pkts },
     };
     sendto(c->lsock, &rec, sizeof rec, MSG_DONTWAIT,
            (struct sockaddr *)&c->laddr, sizeof c->laddr);

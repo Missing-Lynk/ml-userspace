@@ -59,6 +59,16 @@ void linkcmd_set_bitrate(const char *level)
     mlm_rfcmd_send(MLM_RF_SET_BITRATE, (uint32_t) mbps);
 }
 
+void linkcmd_set_camera(unsigned sel, unsigned value)
+{
+    mlm_rfcmd_send(MLM_RF_SET_CAMERA, (sel << 16) | (value & 0xffffu));
+}
+
+void linkcmd_set_scale(int aspect_4_3, unsigned zoom_pct)
+{
+    mlm_rfcmd_send(MLM_RF_SET_SCALE, ((aspect_4_3 ? 1u : 0u) << 16) | (zoom_pct & 0xffffu));
+}
+
 void linkcmd_request_scan(void)
 {
     mlm_rfcmd_send(MLM_RF_SCAN, 0);

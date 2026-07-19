@@ -14,6 +14,8 @@
 #include "pipecmd.h"
 #include "recordings.h"
 
+#include "../../../ml-shared/mlm.h"   /* MLM_CAM_* selectors for the camera overlay */
+
 #include "lvgl.h"
 
 #include <errno.h>
@@ -117,8 +119,68 @@ static const gog_item_t g_airunit_items[] = {
     { ITEM_STEPPER, "air_unit.power",   "power",   power_options,   1, 0, "power" },
     { ITEM_STEPPER, "air_unit.bitrate", "bitrate", bitrate_options, 2, 0, "bitrate" },
     { ITEM_TOGGLE,  "air_unit.standby", "standby", NULL,            0, 1, "standby" },
+    { ITEM_ACTION,  "air_unit.camera",  NULL,      NULL,            0, 0, "camera" },
 };
 #define AIRUNIT_ITEM_COUNT ((int) (sizeof(g_airunit_items) / sizeof(g_airunit_items[0])))
+
+/* Camera overlay: the live-image-first camera settings strip. Each item is applied to the air unit
+ * the moment it changes (SetCameraInfo / SetScaleMode over ml-linkd), so the point is to judge the
+ * change against the live feed: the overlay hides the menu chrome and shows only this compact strip.
+ * Values are ints persisted in AIRUNIT_SECTION; hud.c re-asserts them on every link-up edge
+ * (menu_camera_assert), because a re-association resets the air's ISP to its SetLdCfg defaults.
+ * Only the HW-captured items are exposed (plans/rf-air-config.md section 1). */
+typedef struct {
+    const char        *title_key;    /* i18n key */
+    const char        *setting_key;  /* int setting in AIRUNIT_SECTION */
+    const char *const *labels;       /* list item: NULL-terminated labels (run through T()), else NULL */
+    const int         *values;       /* list item: the value behind each label */
+    int                min, max, step; /* numeric item (labels == NULL) */
+    int                def;          /* default VALUE (matches the air's cold-boot ISP state) */
+    int                cam_sel;      /* MLM_CAM_* selector; 0 = the zoom/aspect SetScaleMode pair */
+} cam_item_t;
+
+static const char *const cam_exposure_labels[] = { "camera.auto", "1/60", "1/120", "1/250",
+                                                   "1/500", "1/1000", NULL };
+static const int         cam_exposure_values[] = { 0, 16666, 8333, 4000, 2000, 1000 };
+static const char *const cam_rotation_labels[] = { "camera.rot_normal", "camera.rot_flipped", NULL };
+static const int         cam_rotation_values[] = { 0, 1 };
+static const char *const cam_onoff_labels[]    = { "common.off", "common.on", NULL };
+static const int         cam_onoff_values[]    = { 0, 1 };
+static const char *const cam_zoom_labels[]     = { "1.0x", "0.7x", NULL };
+static const int         cam_zoom_values[]     = { 100, 70 };
+static const char *const cam_aspect_labels[]   = { "16:9", "4:3", NULL };
+static const int         cam_aspect_values[]   = { 0, 1 };
+
+/* The zoom/aspect settings keys, named because cam_push_scale reads them outside the table (both
+ * fields ride the ONE SetScaleMode message, so either item pushes the pair). */
+#define CAM_KEY_ZOOM   "camera_zoom_pct"
+#define CAM_KEY_ASPECT "camera_aspect"
+
+static const cam_item_t g_camera_items[] = {
+    { "camera.exposure",   "camera_exposure_us", cam_exposure_labels, cam_exposure_values, 0, 0, 0,
+      MLM_CAM_DEF_EXPOSURE, MLM_CAM_EXPOSURE },
+    { "camera.saturation", "camera_saturation",  NULL,                NULL,                0, 100, 5,
+      MLM_CAM_DEF_SATURATION, MLM_CAM_SATURATION },
+    { "camera.sharpness",  "camera_sharpness",   NULL,                NULL,                0, 100, 5,
+      MLM_CAM_DEF_SHARPNESS, MLM_CAM_SHARPNESS },
+    { "camera.rotation",   "camera_rotation",    cam_rotation_labels, cam_rotation_values, 0, 0, 0,
+      MLM_CAM_DEF_ROTATION, MLM_CAM_ROTATION },
+    { "camera.nr3d",       "camera_nr3d",        cam_onoff_labels,    cam_onoff_values,    0, 0, 0,
+      MLM_CAM_DEF_NR3D, MLM_CAM_NR3D },
+    { "camera.zoom",       CAM_KEY_ZOOM,         cam_zoom_labels,     cam_zoom_values,     0, 0, 0,
+      MLM_CAM_DEF_ZOOM_PCT, 0 },
+    { "camera.aspect",     CAM_KEY_ASPECT,       cam_aspect_labels,   cam_aspect_values,   0, 0, 0,
+      MLM_CAM_DEF_ASPECT, 0 },
+};
+#define CAMERA_ITEM_COUNT ((int) (sizeof(g_camera_items) / sizeof(g_camera_items[0])))
+
+/* compact strip metrics (the menu rows are too fat for an overlay meant to stay out of the image);
+ * the panel width is computed from the widest title/value in the set (cam_panel_width), floored
+ * here so a short catalog does not produce a sliver */
+#define CAM_PANEL_MIN_WIDTH 360
+#define CAM_PANEL_MARGIN    24
+#define CAM_ROW_PAD_VER     10
+#define CAM_VALUE_PAD_HOR   20
 
 /* Catalog search order: an on-device override, the dev staging dir, the shipped rootfs path, then
  * the build tree.
@@ -173,6 +235,9 @@ static const char        *g_notice_pending;        /* notice to raise once the c
 static const char        *g_band_pending;          /* band option label awaiting its reboot confirm */
 static int                g_band_confirm_due;      /* raise that confirm once the select list is gone */
 
+static lv_obj_t          *g_cam_panel;             /* the camera overlay strip, NULL when closed */
+static lv_obj_t          *g_cam_row;               /* the Air Unit row that opened it (return focus) */
+
 static lv_font_t    g_menu_font;                   /* Montserrat with the CJK fallback */
 static lv_style_t   g_style_item;
 static lv_style_t   g_style_item_focused;
@@ -186,6 +251,9 @@ static void open_select(const gog_item_t *item, lv_obj_t *row);
 static void open_confirm(const char *prompt, const char *confirm_label, void (*fn)(void), lv_obj_t *row);
 static void open_notice(const char *prompt);
 static void band_confirm_apply(void);
+static void camera_open(lv_obj_t *row);
+static void camera_close(void);
+static lv_obj_t *make_modal_button(lv_obj_t *box, const char *text);
 static void slot_switch_to_a(void);
 static void format_sdcard(void);
 static void close_select(void);
@@ -385,17 +453,30 @@ static void refresh_stepper_row(lv_obj_t *row, const gog_item_t *item)
     set_caret(lv_obj_get_child(row, 3), index < count - 1);
 }
 
+/* The "left-caret  value  right-caret" triplet, appended to @p parent as three labels. Used by the
+ * settings-list stepper rows and the camera strip's value lines. @p value_width >= 0 fixes the
+ * value label to that text width (centered), so the carets never move as the value steps; < 0
+ * leaves it content-sized. */
+static void add_caret_value_labels(lv_obj_t *parent, int32_t pad_hor, int32_t value_width)
+{
+    lv_obj_t *left = lv_label_create(parent);
+    lv_label_set_text(left, LV_SYMBOL_LEFT);
+
+    lv_obj_t *value = lv_label_create(parent);
+    lv_obj_set_style_pad_hor(value, pad_hor, 0);
+    if (value_width >= 0) {
+        lv_obj_set_style_text_align(value, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_width(value, value_width + 2 * pad_hor);
+    }
+
+    lv_obj_t *right = lv_label_create(parent);
+    lv_label_set_text(right, LV_SYMBOL_RIGHT);
+}
+
 /* A stepper row's right side: "left-caret  value  right-caret". */
 static void add_stepper_value(lv_obj_t *row, const gog_item_t *item)
 {
-    lv_obj_t *left = lv_label_create(row);
-    lv_label_set_text(left, LV_SYMBOL_LEFT);
-
-    lv_obj_t *value = lv_label_create(row);
-    lv_obj_set_style_pad_hor(value, 14, 0);
-
-    lv_obj_t *right = lv_label_create(row);
-    lv_label_set_text(right, LV_SYMBOL_RIGHT);
+    add_caret_value_labels(row, 14, -1);
 
     refresh_stepper_row(row, item);
 }
@@ -543,6 +624,8 @@ static void item_clicked_cb(lv_event_t *event)
         open_confirm(T("slot_switch.prompt"), T("system.slot_switch"), slot_switch_to_a, row);
     } else if (item->type == ITEM_ACTION && strcmp(item->action, "format") == 0) {
         open_confirm(T("dvr.format_prompt"), T("dvr.format"), format_sdcard, row);
+    } else if (item->type == ITEM_ACTION && strcmp(item->action, "camera") == 0) {
+        camera_open(row);
     }
     /* Steppers ignore CENTER: they change only via LEFT/RIGHT (item_key_cb). */
 }
@@ -816,6 +899,290 @@ static void enter_content_zone(void)
             lv_obj_remove_state(g_sidebar_buttons[i], LV_STATE_CHECKED);
         }
     }
+}
+
+/* camera overlay */
+static int cam_value(const cam_item_t *item)
+{
+    return settings_get_int_in(g_settings, AIRUNIT_SECTION, item->setting_key, item->def);
+}
+
+/* list items: the label index of the current value (falls back to the default's index, then 0) */
+static int cam_label_index(const cam_item_t *item)
+{
+    int value = cam_value(item);
+    int def_index = 0;
+    for (int i = 0; item->labels[i] != NULL; i++) {
+        if (item->values[i] == value) {
+            return i;
+        }
+
+        if (item->values[i] == item->def) {
+            def_index = i;
+        }
+    }
+
+    return def_index;
+}
+
+/* Push the persisted zoom/aspect pair to the air unit: both ride the ONE SetScaleMode message. */
+static void cam_push_scale(void)
+{
+    linkcmd_set_scale(settings_get_int_in(g_settings, AIRUNIT_SECTION, CAM_KEY_ASPECT,
+                                          MLM_CAM_DEF_ASPECT),
+                      (unsigned) settings_get_int_in(g_settings, AIRUNIT_SECTION, CAM_KEY_ZOOM,
+                                                     MLM_CAM_DEF_ZOOM_PCT));
+}
+
+/* Push one item's persisted value to the air unit via ml-linkd. */
+static void cam_push(const cam_item_t *item)
+{
+    if (item->cam_sel != 0) {
+        linkcmd_set_camera((unsigned) item->cam_sel, (unsigned) cam_value(item));
+    } else {
+        cam_push_scale();
+    }
+}
+
+void menu_camera_assert(void)
+{
+    for (int i = 0; i < CAMERA_ITEM_COUNT; i++) {
+        if (g_camera_items[i].cam_sel != 0) {
+            cam_push(&g_camera_items[i]);
+        }
+    }
+
+    cam_push_scale();   /* the zoom/aspect pair rides once, not once per item */
+}
+
+/* A section is a column: the setting name on its own line, the "< value >" line below it (children
+ * of the value row: left caret, value, right caret). */
+static void refresh_cam_row(lv_obj_t *section, const cam_item_t *item)
+{
+    lv_obj_t *line = lv_obj_get_child(section, 1);
+    lv_obj_t *value = lv_obj_get_child(line, 1);
+    if (item->labels != NULL) {
+        int index = cam_label_index(item);
+        lv_label_set_text(value, T(item->labels[index]));
+        set_caret(lv_obj_get_child(line, 0), index > 0);
+        set_caret(lv_obj_get_child(line, 2), item->labels[index + 1] != NULL);
+    } else {
+        int v = cam_value(item);
+        lv_label_set_text_fmt(value, "%d", v);
+        set_caret(lv_obj_get_child(line, 0), v > item->min);
+        set_caret(lv_obj_get_child(line, 2), v < item->max);
+    }
+}
+
+/* The fixed width of a section's value label: the widest option in its set, so the carets around it
+ * never move as the value steps. */
+static int32_t cam_value_width(const cam_item_t *item)
+{
+    lv_point_t size;
+    int32_t max_w = 0;
+
+    if (item->labels != NULL) {
+        for (int i = 0; item->labels[i] != NULL; i++) {
+            lv_text_get_size(&size, T(item->labels[i]), &g_menu_font, 0, 0, LV_COORD_MAX,
+                             LV_TEXT_FLAG_NONE);
+            if (size.x > max_w) {
+                max_w = size.x;
+            }
+        }
+    } else {
+        char buf[16];
+        const int bounds[2] = { item->min, item->max };
+        for (unsigned i = 0; i < 2; i++) {
+            snprintf(buf, sizeof buf, "%d", bounds[i]);
+            lv_text_get_size(&size, buf, &g_menu_font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+            if (size.x > max_w) {
+                max_w = size.x;
+            }
+        }
+    }
+
+    return max_w;
+}
+
+/* The panel width that hugs the content: the widest of every section's title line and its
+ * caret-value-caret line, plus the panel and section padding. Computed per open (from the value
+ * widths camera_open already measured), so it adapts to the loaded language catalog. */
+static int32_t cam_panel_width(const int32_t *value_widths)
+{
+    lv_point_t size;
+    int32_t caret_w;
+    int32_t max_w = 0;
+
+    lv_text_get_size(&size, LV_SYMBOL_LEFT, &g_menu_font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    caret_w = size.x;
+
+    for (int i = 0; i < CAMERA_ITEM_COUNT; i++) {
+        int32_t line_w = 2 * caret_w + value_widths[i] + 2 * CAM_VALUE_PAD_HOR;
+
+        lv_text_get_size(&size, T(g_camera_items[i].title_key), &g_menu_font, 0, 0, LV_COORD_MAX,
+                         LV_TEXT_FLAG_NONE);
+        if (size.x > max_w) {
+            max_w = size.x;
+        }
+
+        if (line_w > max_w) {
+            max_w = line_w;
+        }
+    }
+
+    lv_text_get_size(&size, T("camera.reset"), &g_menu_font, 0, 0, LV_COORD_MAX,
+                     LV_TEXT_FLAG_NONE);
+    if (size.x > max_w) {
+        max_w = size.x;
+    }
+
+    max_w += 2 * (SIDEBAR_PAD + ITEM_PAD_HOR);
+    return max_w > CAM_PANEL_MIN_WIDTH ? max_w : CAM_PANEL_MIN_WIDTH;
+}
+
+/* The reset row: persist every camera default, push the lot to the air (menu_camera_assert reads
+ * the freshly-persisted settings, so zoom/aspect ride one coherent scale message), and refresh all
+ * the visible sections. */
+static void cam_reset_clicked_cb(lv_event_t *event)
+{
+    (void) event;
+    for (int i = 0; i < CAMERA_ITEM_COUNT; i++) {
+        /* memory-only per key: one settings_save below instead of a flash rewrite per key */
+        settings_set_int_in_nosave(g_settings, AIRUNIT_SECTION, g_camera_items[i].setting_key,
+                                   g_camera_items[i].def);
+    }
+
+    settings_save(g_settings);
+    menu_camera_assert();
+    for (int i = 0; i < CAMERA_ITEM_COUNT; i++) {
+        refresh_cam_row(lv_obj_get_child(g_cam_panel, i), &g_camera_items[i]);
+    }
+}
+
+/* LEFT/RIGHT on a camera row: step the value, persist it, push it live, refresh the row. */
+static void cam_key_cb(lv_event_t *event)
+{
+    uint32_t key = lv_event_get_key(event);
+    if (key != LV_KEY_LEFT && key != LV_KEY_RIGHT) {
+        return;
+    }
+
+    const cam_item_t *item = (const cam_item_t *) lv_event_get_user_data(event);
+    lv_obj_t *row = (lv_obj_t *) lv_event_get_target(event);
+    int value = cam_value(item);
+
+    if (item->labels != NULL) {
+        int index = cam_label_index(item);
+        if (key == LV_KEY_RIGHT && item->labels[index + 1] != NULL) {
+            value = item->values[index + 1];
+        } else if (key == LV_KEY_LEFT && index > 0) {
+            value = item->values[index - 1];
+        } else {
+            return;
+        }
+    } else {
+        int next = value + (key == LV_KEY_RIGHT ? item->step : -item->step);
+        if (next < item->min || next > item->max) {
+            return;
+        }
+
+        value = next;
+    }
+
+    /* Memory-only: a held key sweeps saturation/sharpness in ~20 steps, and a full settings-file
+     * flash rewrite per step is pure wear - the live cam_push is the feedback that matters.
+     * camera_close persists the batch once. */
+    settings_set_int_in_nosave(g_settings, AIRUNIT_SECTION, item->setting_key, value);
+    cam_push(item);
+    refresh_cam_row(row, item);
+}
+
+/* Hide the menu (and the System OSD bar) and show the compact strip over the live feed: the point
+ * of every camera item is to judge its effect against the live image, so all chrome gets out of the
+ * way. Each setting is a section: the name on its own line, the "< value >" line below it, and a
+ * thin divider between sections. BACK restores everything (camera_close), landing back on the
+ * Camera row. */
+static void camera_open(lv_obj_t *row)
+{
+    /* one text-measure pass: both the panel width and each value label's fixed width use these */
+    int32_t widths[CAMERA_ITEM_COUNT];
+    for (int i = 0; i < CAMERA_ITEM_COUNT; i++) {
+        widths[i] = cam_value_width(&g_camera_items[i]);
+    }
+
+    g_cam_row = row;
+    lv_obj_add_flag(g_menu, LV_OBJ_FLAG_HIDDEN);
+    sysosd_set_visible(0);   /* every strip of live image counts here */
+
+    g_cam_panel = lv_obj_create(lv_screen_active());
+    lv_obj_remove_style_all(g_cam_panel);
+    lv_obj_set_size(g_cam_panel, cam_panel_width(widths), LV_SIZE_CONTENT);
+    lv_obj_align(g_cam_panel, LV_ALIGN_LEFT_MID, CAM_PANEL_MARGIN, 0);
+    lv_obj_set_style_bg_color(g_cam_panel, COLOR_BG, 0);
+    lv_obj_set_style_bg_opa(g_cam_panel, LV_OPA_50, 0);   /* the live feed stays visible behind */
+    lv_obj_set_style_radius(g_cam_panel, ITEM_RADIUS, 0);
+    lv_obj_set_style_pad_all(g_cam_panel, SIDEBAR_PAD, 0);
+    lv_obj_set_flex_flow(g_cam_panel, LV_FLEX_FLOW_COLUMN);
+
+    lv_group_remove_all_objs(g_group);   /* the strip sections become the keypad sink */
+    for (int i = 0; i < CAMERA_ITEM_COUNT; i++) {
+        const cam_item_t *item = &g_camera_items[i];
+
+        lv_obj_t *section = make_modal_button(g_cam_panel, T(item->title_key));
+        lv_obj_set_style_pad_ver(section, CAM_ROW_PAD_VER, 0);
+        lv_obj_set_flex_flow(section, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(section, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START,
+                              LV_FLEX_ALIGN_START);
+
+        /* divider between sections (the reset row below is always last) */
+        lv_obj_set_style_border_side(section, LV_BORDER_SIDE_BOTTOM, 0);
+        lv_obj_set_style_border_width(section, 2, 0);
+        lv_obj_set_style_border_color(section, COLOR_TEXT_DIM, 0);
+        lv_obj_set_style_border_opa(section, LV_OPA_40, 0);
+
+        lv_obj_t *line = lv_obj_create(section);
+        lv_obj_remove_style_all(line);
+        lv_obj_set_width(line, lv_pct(100));
+        lv_obj_set_height(line, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(line, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(line, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER);
+        add_caret_value_labels(line, CAM_VALUE_PAD_HOR, widths[i]);
+
+        refresh_cam_row(section, item);
+        lv_obj_add_event_cb(section, cam_key_cb, LV_EVENT_KEY, (void *) item);
+        lv_group_add_obj(g_group, section);
+    }
+
+    /* the last entry: reset every camera setting to its default (CENTER activates it) */
+    lv_obj_t *reset = make_modal_button(g_cam_panel, T("camera.reset"));
+    lv_obj_set_style_pad_ver(reset, CAM_ROW_PAD_VER, 0);
+    lv_obj_add_event_cb(reset, cam_reset_clicked_cb, LV_EVENT_CLICKED, NULL);
+    lv_group_add_obj(g_group, reset);
+
+    lv_group_focus_obj(lv_obj_get_child(g_cam_panel, 0));
+}
+
+static void camera_close(void)
+{
+    if (g_cam_panel == NULL) {
+        return;
+    }
+
+    lv_obj_delete(g_cam_panel);
+    g_cam_panel = NULL;
+    settings_save(g_settings);   /* persist the batch the memory-only steppers accumulated */
+    sysosd_set_visible(1);       /* the update tick re-applies the show_system_osd setting */
+
+    if (g_menu != NULL) {
+        lv_obj_remove_flag(g_menu, LV_OBJ_FLAG_HIDDEN);
+        enter_content_zone();
+        if (g_cam_row != NULL) {
+            lv_group_focus_obj(g_cam_row);   /* land back on the Camera row */
+        }
+    }
+
+    g_cam_row = NULL;
 }
 
 /* modal overlay: a full-screen dim with a centered box, used by the dropdown select-list
@@ -1198,6 +1565,9 @@ void menu_close(void)
     g_select_open = 0;
     g_select_closing = 0;
 
+    /* one teardown path: the transient menu-restore inside is harmless, g_menu is deleted below */
+    camera_close();
+
     if (g_menu != NULL) {
         lv_group_remove_all_objs(g_group);
         lv_obj_delete(g_menu);
@@ -1253,6 +1623,11 @@ void menu_back(void)
 
     if (player_is_open()) {
         player_close(1);   /* stop playback, return to the recordings list */
+        return;
+    }
+
+    if (g_cam_panel != NULL) {
+        camera_close();   /* restore the menu, focus back on the Camera row */
         return;
     }
 

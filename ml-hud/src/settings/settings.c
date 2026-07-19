@@ -295,7 +295,7 @@ int settings_set_string_in(settings_t *settings, const char *section, const char
     return settings_save(settings);
 }
 
-int settings_set_int_in(settings_t *settings, const char *section, const char *key, int value)
+int settings_set_int_in_nosave(settings_t *settings, const char *section, const char *key, int value)
 {
     cJSON *object = section_get_or_create(settings, section);
     if (object == NULL) {
@@ -309,6 +309,15 @@ int settings_set_int_in(settings_t *settings, const char *section, const char *k
 
     cJSON_DeleteItemFromObjectCaseSensitive(object, key);
     cJSON_AddItemToObject(object, key, item);
+    return 0;
+}
+
+int settings_set_int_in(settings_t *settings, const char *section, const char *key, int value)
+{
+    if (settings_set_int_in_nosave(settings, section, key, value) != 0) {
+        return -1;
+    }
+
     return settings_save(settings);
 }
 

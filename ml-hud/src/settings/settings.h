@@ -46,4 +46,8 @@ int settings_set_string_in(settings_t *settings, const char *section, const char
 int settings_set_int_in(settings_t *settings, const char *section, const char *key, int value);
 int settings_set_bool_in(settings_t *settings, const char *section, const char *key, int value);
 
+/* Like settings_set_int_in, but updates memory only - no file write. For bursts (a key-repeat value
+ * sweep, a multi-key reset): set each key with this, then persist the batch with one settings_save. */
+int settings_set_int_in_nosave(settings_t *settings, const char *section, const char *key, int value);
+
 #endif /* HUD_SETTINGS_H */

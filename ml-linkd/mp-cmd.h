@@ -18,6 +18,8 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "../ml-shared/mlm.h"   /* MLM_CAM_DEF_* camera defaults shared with the HUD */
+
 /* :10000 message types (LE u32 at byte 0). Goggle->air are the ones we build below; air->goggle are
  * listed too so the receive-side switch reads from one canonical map. */
 enum mp_type {
@@ -25,10 +27,13 @@ enum mp_type {
     MP_REPLY       = 0x02,   /* MEDIA_PARAMS reply        (air->goggle) */
     MP_ACK         = 0x03,   /* MEDIA_PARAMS type-3 ack   (goggle->air) */
     MP_STATUS_A    = 0x09,   /* air status frame          (air->goggle) */
+    MP_SETLDCFG    = 0x0a,   /* low-delay/video config    (goggle->air) */
+    MP_SETCAMERA   = 0x0c,   /* camera ISP selector set   (goggle->air) */
     MP_SETTRANPARM = 0x0d,   /* TX power + standby arm    (goggle->air) */
     MP_MSP         = 0x10,   /* MSP DisplayPort canvas    (air->goggle) */
     MP_STATUS_B    = 0x11,   /* air status frame          (air->goggle) */
     MP_STANDBY     = 0x12,   /* SetStandyMode work-mode   (air->goggle) */
+    MP_SETSCALE    = 0x15,   /* VIN scale (zoom/aspect)   (goggle->air) */
     MP_STBACK      = 0x1b,   /* STB_EVENT_ACK             (goggle->air) */
 };
 
@@ -160,7 +165,7 @@ struct __attribute__((packed)) mp_ldcfg {
     uint16_t tran_blk4;         /* 0x6c  SetTranParm mirror [4:5] (cold-boot=1080; verbatim)      [C] */
     uint8_t  tran_blk6;         /* 0x6e  SetTranParm mirror [6] (verbatim)                        [I] */
     uint8_t  tran_blk7;         /* 0x6f  SetTranParm mirror [7] (verbatim)                        [I] */
-    uint8_t  standby_mode_en;   /* 0x70  u8StandbyModeEn (handle+0x120; verbatim here)            [C] */
+    uint8_t  standby_mode_en;   /* 0x70  u8StandbyModeEn (handle+0x120)                  [C][SET]     */
     uint8_t  flags71[2];        /* 0x71  (=01 01)                                                 [?] */
     uint8_t  caps_flags2;       /* 0x73  session capability bitfield (=0x12; NOT ROI)             [C] */
     uint8_t  unk74;             /* 0x74  (=0x10)                                                  [?] */
@@ -197,8 +202,14 @@ static const uint8_t mp_ldcfg_base[MP_LDCFG_LEN] = {
 };
 
 /* Build a SetLdCfg from the captured base, varying only the decoded fields via the struct overlay.
- * Pass dbm/mbps = 0 to keep the base value for that field. */
-static inline int mp_set_ld_cfg(uint8_t *frame, uint8_t dbm, uint8_t mbps, uint32_t stamp)
+ * Pass dbm/mbps = 0 (or standby_arm < 0) to keep the base value for that field.
+ *
+ * standby_arm MUST track the commanded standby state: the air seeds u8StandbyModeEn (handle+0x120)
+ * from this blob on EVERY association, so the captured base's 1 silently re-arms standby each
+ * session no matter what SetTranParm byte[8] said - and an armed, disarmed-quad air drops to 5 dBm
+ * / duty-cycled TX, which kills the video downlink (HW post-mortem 2026-07-19). */
+static inline int mp_set_ld_cfg(uint8_t *frame, uint8_t dbm, uint8_t mbps, int standby_arm,
+                                uint32_t stamp)
 {
     memcpy(frame, mp_ldcfg_base, MP_LDCFG_LEN);
     memcpy(frame + MP_OFF_STAMP, &stamp, 4);
@@ -212,7 +223,114 @@ static inline int mp_set_ld_cfg(uint8_t *frame, uint8_t dbm, uint8_t mbps, uint3
         cfg->bitrate_q = (uint16_t) (mbps * 4);      /* 250 kbps units */
     }
 
+    if (standby_arm >= 0) {
+        cfg->standby_mode_en = standby_arm ? 1 : 0;
+    }
+
     return MP_LDCFG_LEN;
+}
+
+/* SetCameraInfo (0x0C): one live camera/ISP set. The body is a selector-tagged union: body[0] (u32)
+ * names the ONE field this message sets, and the air's handler (SetCameraInfo @00447138, a switch on
+ * the selector) reads and applies exactly that field, ignoring the rest of the struct - so the
+ * non-selected fields safely ride the sender's cached state. Body = 0x28 bytes at datagram offset 24
+ * (the [20..23] word is zero on the wire - HW capture 2026-07-14); header length field = 0x28 (the
+ * goggle builder SetCameraSettingToTx @0043bc88 copies exactly 40 bytes).
+ *
+ * Air-side value handling (RE): rotation and the NR enables are booleans (nonzero = on; the NR
+ * strength is the air's own constant 50); exposure_manual nonzero puts the AEC in manual mode with
+ * exposure_time in us, 0 returns it to auto; iso only applies while the AEC is already manual;
+ * banding accepts only 0 (off) / 50 / 60 (Hz, anti-flicker) and forces anything else to off;
+ * brightness (sel 0) is stored but drives no ISP call. Saturation/sharpness/WB pass straight to the
+ * ISP layer, which owns the clamping.
+ *
+ * Body offset: 20, the same MP_OFF_BODY as every other :10000 frame (SetLdCfg's body is at 20 too).
+ * An earlier capture note claimed 24 for 0x0C; HW-refuted 2026-07-19: with the selector at 24 the
+ * air parsed every message as selector 0 (brightness, no ISP apply) - the air reads the selector at
+ * [20..23], matching the RE event-struct mapping (payload at event+0x1c = wire 20). */
+#define MP_CAM_LEN       60      /* 20-byte header + 0x28 body */
+#define MP_CAM_BODY_OFF  MP_OFF_BODY
+#define MP_CAM_BODY_LEN  0x28
+
+/* The selector values are mlm.h's enum mlm_cam_sel, sent verbatim as body[0]: there is exactly one
+ * selector namespace and it IS the wire encoding. The sel numbers on each field below are the air's
+ * full union map (sel 10 is anti-flicker banding, NOT contrast: air log "u16Banding"). */
+struct __attribute__((packed)) mp_camera {
+    uint32_t selector;         /* 0x00  mlm_cam_sel: the ONE field this message applies */
+    uint16_t brightness;       /* 0x04  sel 0 (air: stored only, no ISP apply) */
+    uint16_t exposure_manual;  /* 0x06  sel 1: 0 = auto AEC, nonzero = manual */
+    uint16_t exposure_time;    /* 0x08  sel 1: manual exposure time in us */
+    uint16_t unk0a;            /* 0x0a */
+    uint16_t unk0c;            /* 0x0c */
+    uint16_t iso;              /* 0x0e  sel 9 (air: applied only while the AEC is manual) */
+    uint16_t unk10;            /* 0x10 */
+    uint16_t unk12;            /* 0x12 */
+    uint16_t saturation;       /* 0x14  sel 2 */
+    uint16_t sharpness;        /* 0x16  sel 3 */
+    uint16_t wb_manual;        /* 0x18  sel 4: 0 = auto */
+    uint16_t white_balance;    /* 0x1a  sel 4: color temperature K */
+    uint16_t rotation;         /* 0x1c  sel 5: nonzero = 180 degrees */
+    uint16_t aspect_ratio;     /* 0x1e  sel 6 (unused here) */
+    uint16_t nr3d_en;          /* 0x20  sel 7: nonzero = on */
+    uint16_t nr2d_en;          /* 0x22  sel 8: nonzero = on */
+    uint16_t banding;          /* 0x24  sel 10: 0 = off, 50 / 60 = mains Hz */
+    uint16_t unk26;            /* 0x26 */
+};
+_Static_assert(sizeof(struct mp_camera) == MP_CAM_BODY_LEN, "mp_camera body must be 0x28 bytes");
+
+/* The air's cold-boot ISP state, from the captured SetLdCfg base's camera block: a full mp_camera
+ * seeded from this plus the commanded fields matches what the air is already running, so a message
+ * never carries a fabricated value in the fields it does not select. */
+#define MP_CAMERA_DEFAULTS { \
+    .selector = 0, \
+    .brightness = MLM_CAM_DEF_BRIGHTNESS, \
+    .exposure_manual = MLM_CAM_DEF_EXPOSURE, \
+    .exposure_time = MLM_CAM_DEF_EXPOSURE_US, \
+    .iso = MLM_CAM_DEF_ISO, \
+    .saturation = MLM_CAM_DEF_SATURATION, \
+    .sharpness = MLM_CAM_DEF_SHARPNESS, \
+    .wb_manual = MLM_CAM_DEF_WB_MANUAL, \
+    .white_balance = MLM_CAM_DEF_WB_KELVIN, \
+    .rotation = MLM_CAM_DEF_ROTATION, \
+    .aspect_ratio = MLM_CAM_DEF_ASPECT, \
+    .nr3d_en = MLM_CAM_DEF_NR3D, \
+    .nr2d_en = MLM_CAM_DEF_NR2D, \
+    .banding = 0 }
+
+/* Build a SetCameraInfo applying selector `sel` on top of the full cached state. */
+static inline int mp_set_camera_info(uint8_t *frame, unsigned sel,
+                                     const struct mp_camera *state, uint32_t stamp)
+{
+    mp_stamp(frame, MP_CAM_LEN, MP_SETCAMERA, stamp, MP_CAM_BODY_LEN);
+
+    struct mp_camera *body = (struct mp_camera *) (frame + MP_CAM_BODY_OFF);
+    *body = *state;
+    body->selector = sel;
+
+    return MP_CAM_LEN;
+}
+
+/* SetScaleMode (0x15): the air's VIN scale, zoom + aspect in one message. Body = 12 bytes at
+ * datagram offset 20 (MP_OFF_BODY, like 0x0C - see the offset note there): aspect flag (u32,
+ * 1 = 4:3, 0 = 16:9), zoom enable (u32), zoom ratio (f32). The air treats ratio 1.0 (or 0.0) as
+ * zoom-off regardless of the enable flag and accepts any other ratio as-is (RE:
+ * ProcessVinScaleEvent); the stock UI only ever uses 1.0 and 0.7. A change with media running tears
+ * down and rebuilds the air's pipeline: expect a brief feed blip. */
+#define MP_SCALE_LEN       32     /* 20-byte header + 12-byte body */
+#define MP_SCALE_BODY_OFF  MP_OFF_BODY
+#define MP_SCALE_BODY_LEN  0x0c
+
+static inline int mp_set_scale_mode(uint8_t *frame, int aspect_4_3, float zoom, uint32_t stamp)
+{
+    uint32_t aspect = aspect_4_3 ? 1 : 0;
+    uint32_t enable = (zoom > 0.0f && zoom != 1.0f) ? 1 : 0;
+
+    mp_stamp(frame, MP_SCALE_LEN, MP_SETSCALE, stamp, MP_SCALE_BODY_LEN);
+    memcpy(frame + MP_SCALE_BODY_OFF + 0, &aspect, 4);
+    memcpy(frame + MP_SCALE_BODY_OFF + 4, &enable, 4);
+    memcpy(frame + MP_SCALE_BODY_OFF + 8, &zoom, 4);
+
+    return MP_SCALE_LEN;
 }
 
 #endif /* MP_CMD_H */
