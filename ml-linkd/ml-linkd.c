@@ -78,7 +78,7 @@
 #define SETTLE_TICKS     15               /* ~2.5 s of SETTLE */
 #define ALIVE_EVERY      720              /* STEADY ticks between alive lines (~30 s) */
 #define OPEN_RETRY_EVERY 30               /* WAIT_DEV: log every Nth failed open */
-#define POLL_LINK_EVERY  4                /* Get1V1Info + GetDistance every Nth STEADY tick (~6 Hz) */
+#define POLL_LINK_EVERY  4                /* Get1V1Info every Nth STEADY tick (~6 Hz) */
 #define FF02_EVERY       7                /* ff02 every Nth STEADY tick (~3.4 Hz) */
 #define LINKINFO_EVERY   24               /* publish MLM_T_LINKINFO every Nth STEADY tick (~1 Hz) */
 #define SEQ_START        0x15             /* initial poll sequence number */
@@ -89,7 +89,7 @@
 
 /* Baseband GET reply field offsets. Replies arrive on the request channel BB_GET (0x01), port =
  * selector. Get1V1Info (0x73) carries a linear SNR at +0x06 (dB = 10*log10(raw/36); zero until a
- * video link is up); GetDistanceResult (0x05) a u32 at +0 (0xFFFFFFFF = no ranging fix). */
+ * video link is up) and the distance in metres at +0x08. */
 #define REPLY_CH         0x01
 #define V1V1_OFF_SNR     0x06
 
@@ -101,8 +101,11 @@
  * The +0x25 = working-channel binding is inferred from that usage, not confirmed by a symbol. */
 #define V1V1_OFF_CHAN    0x25
 
-#define DIST_OFF_RESULT  0x00
-#define DIST_NONE        0xFFFFFFFFu   /* GetDistance result when no ranging fix (bench / no GPS) */
+/* Get1V1Info +0x08 is the OSD distance: signed i32, metres, negative = no fix. The vendor's
+ * AR_MID_GET_REALTIME_SYS_INFO (ar_lowdelay-full.txt:59482-59486) reads exactly this field,
+ * clamps < 0 to 0 and truncates to u16; no scaling. GetDistanceResult (0x05) is NOT the source:
+ * it has no call sites in the vendor stack and its u32 at +0 ticks at 1 kHz (a ms counter). */
+#define V1V1_OFF_DIST    0x08
 
 /* Per-channel SNR sweep timings, from the vendor sweep (ar_lowdelay-full.txt:58393-58440). Per
  * channel it polls Get1V1Info every 10 ms until the reply's working channel matches (500 ms budget,
@@ -168,6 +171,16 @@ static volatile int g_params_acked;         /* type3 ACK sent this session */
 static volatile int g_air_lost;             /* >5 s :10000 silence flagged */
 static volatile int g_ready;                /* consumer READY (heartbeat fresh) */
 static volatile int g_video_confirmed;      /* consumer reported frames_seen after our ACK */
+
+/* Video-stall watch. The air-loss watch only sees :10000 silence, but an air-side link bounce
+ * (chip LinkDown/LinkUp) tears down and rebuilds the air's video path WITHOUT ever silencing its
+ * telemetry - the session then sits "acked" forever with zero video (HW post-mortem 2026-07-19).
+ * The consumer's READY heartbeat carries its raw :10001 datagram counter (mlm_ready.rx_pkts); when
+ * that counter stops advancing mid-session, the media handshake is re-run. All owned by udp_thread. */
+static uint32_t g_rx_pkts_last;             /* last heartbeat's counter value */
+static long g_rx_pkts_change_ms;            /* when it last advanced */
+static int g_rx_counting;                   /* counter has advanced at least once this session */
+#define MEDIA_STALL_MS 6000                 /* 3 heartbeats of a frozen counter = video is dead */
 static volatile long g_last_telem_ms;       /* last :10000 RX */
 static volatile long g_last_ready_ms;       /* last MLM_T_READY heartbeat */
 static volatile long g_last_ack_ms;         /* last type3 ACK sent */
@@ -222,6 +235,19 @@ static volatile int g_standby_state;        /* air's LIVE work-mode from SetStan
 static volatile int g_pending_chnidx = -1;  /* HUD-requested channel table index (0..18), -1 = none */
 static volatile int g_cur_chnidx = OPEN_CHNIDX; /* channel the local RX is tuned to; tracks SelectChn for the OSD */
 static volatile int g_pending_scan;         /* HUD requested a one-shot scan (MLM_RF_SCAN); STEADY fires it */
+
+/* Camera/scale state the HUD has commanded (MLM_RF_SET_CAMERA / MLM_RF_SET_SCALE). Owned entirely
+ * by udp_thread: the commands arrive on link.sock and the :10000 datagrams leave on params_sock,
+ * both on that thread. Each commanded selector is marked pending and sent as one live SetCameraInfo
+ * (0x0C) once the session is up; the pending set is re-armed from the commanded set on every
+ * (re)association, because the SetLdCfg the air latches there resets its ISP to the association
+ * defaults. Scale (zoom + aspect) rides its own SetScaleMode (0x15) with the same latching. */
+static struct mp_camera g_cam = MP_CAMERA_DEFAULTS;  /* full ISP state; defaults = air cold boot */
+static uint32_t g_cam_pending;              /* bit per MLM_CAM_* selector awaiting a send */
+static uint32_t g_cam_commanded;            /* bit per selector the HUD has commanded (re-assert set) */
+static int g_scale_aspect = -1;             /* 0 = 16:9, 1 = 4:3; -1 = never commanded */
+static int g_scale_zoom_pct = 100;          /* zoom factor in percent (100 or 70) */
+static int g_scale_pending;
 
 /* Map a HUD-commanded mW level to the air's SetTranParm dBm byte; -1 rejects anything not captured. */
 static int map_power_dbm(uint32_t mw)
@@ -824,23 +850,23 @@ static void *reader(void *arg)
 
                 if (raw > 0) {
                     g_snr_db = (int)lroundf(10.0f * log10f((float)raw / 36.0f));
+
+                    /* distance rides the same populated reply: i32 at +0x08, metres, vendor-style
+                     * clamp of negative (no fix) to 0. Empty inter-poll replies keep the last good
+                     * value, same as SNR. */
+                    if (plen >= V1V1_OFF_DIST + 4) {
+                        int32_t dist = (int32_t)((uint32_t)payload[V1V1_OFF_DIST]
+                                     | ((uint32_t)payload[V1V1_OFF_DIST + 1] << 8)
+                                     | ((uint32_t)payload[V1V1_OFF_DIST + 2] << 16)
+                                     | ((uint32_t)payload[V1V1_OFF_DIST + 3] << 24));
+
+                        g_distance_m = dist < 0 ? 0 : (int)dist;
+                    }
                 }
 
                 if (g_verbose) {
-                    printf(TAG " 1v1info snr_raw=%u snr_db=%d\n", raw, g_snr_db);
-                    fflush(stdout);
-                }
-            } else if (buf[i + 5] == REPLY_CH && buf[i + 8] == GET_DISTANCE && plen >= DIST_OFF_RESULT + 4) {
-                /* GetDistanceResult reply: u32 ranging result at +0, in metres per the vendor OSD.
-                 * 0xFFFFFFFF = no ranging fix (the bench value); publish NONE so the OSD shows a
-                 * placeholder. A real value awaits a live ranging flight.
-                 */
-                unsigned d = payload[DIST_OFF_RESULT] | (payload[DIST_OFF_RESULT + 1] << 8)
-                           | (payload[DIST_OFF_RESULT + 2] << 16) | (payload[DIST_OFF_RESULT + 3] << 24);
-
-                g_distance_m = d == DIST_NONE ? MLM_LINKINFO_NONE : (int)d;
-                if (g_verbose) {
-                    printf(TAG " distance=%d m (raw 0x%08x)\n", g_distance_m, d);
+                    printf(TAG " 1v1info snr_raw=%u snr_db=%d dist_m=%d\n", raw, g_snr_db,
+                           g_distance_m);
                     fflush(stdout);
                 }
             } else if (buf[i + 5] == REPLY_CH && buf[i + 8] == GET_SCAN_RESULT) {
@@ -1027,6 +1053,86 @@ static void *udp_thread(void *arg)
                         fflush(stdout);
                         g_pending_chnidx = (int)rc->arg;
                     }
+                } else if (rc->cmd == MLM_RF_SET_CAMERA) {
+                    /* arg = (MLM_CAM_* selector << 16) | u16 value. Only the HW-captured selectors
+                     * are accepted; values are bounds-checked (an ISP value is not an RF byte, but
+                     * garbage still has no business on the wire). Applied live below. */
+                    unsigned sel = rc->arg >> 16;
+                    unsigned value = rc->arg & 0xffffu;
+                    int ok = 1;
+
+                    switch (sel) {
+                        case MLM_CAM_EXPOSURE: {
+                            /* 0 = auto; else manual with the exposure time in us (down to 1/10000,
+                             * up to 1/30 - the stock page never leaves that range) */
+                            ok = value == 0 || (value >= 100 && value <= 33333);
+                            if (ok) {
+                                g_cam.exposure_manual = value != 0;
+                                if (value != 0) {
+                                    g_cam.exposure_time = (uint16_t) value;
+                                }
+                            }
+                        } break;
+
+                        case MLM_CAM_SATURATION: {
+                            ok = value <= 100;
+                            if (ok) {
+                                g_cam.saturation = (uint16_t) value;
+                            }
+                        } break;
+
+                        case MLM_CAM_SHARPNESS: {
+                            ok = value <= 100;
+                            if (ok) {
+                                g_cam.sharpness = (uint16_t) value;
+                            }
+                        } break;
+
+                        case MLM_CAM_ROTATION: {
+                            ok = value <= 1;
+                            if (ok) {
+                                g_cam.rotation = (uint16_t) value;
+                            }
+                        } break;
+
+                        case MLM_CAM_NR3D: {
+                            ok = value <= 1;
+                            if (ok) {
+                                g_cam.nr3d_en = (uint16_t) value;
+                            }
+                        } break;
+
+                        default: {
+                            ok = 0;
+                        } break;
+                    }
+
+                    if (!ok) {
+                        fprintf(stderr, TAG " rfcmd: ignoring bad camera sel=%u value=%u\n",
+                                sel, value);
+                    } else {
+                        g_cam_commanded |= 1u << sel;
+                        g_cam_pending |= 1u << sel;
+                        if (g_verbose) {
+                            printf(TAG " rfcmd: camera sel=%u value=%u\n", sel, value);
+                            fflush(stdout);
+                        }
+                    }
+                } else if (rc->cmd == MLM_RF_SET_SCALE) {
+                    /* arg = (aspect << 16) | zoom_pct; only the two HW-captured zoom factors */
+                    unsigned zoom_pct = rc->arg & 0xffffu;
+                    if (zoom_pct != 100 && zoom_pct != 70) {
+                        fprintf(stderr, TAG " rfcmd: ignoring bad zoom %u%%\n", zoom_pct);
+                    } else {
+                        g_scale_aspect = (rc->arg >> 16) & 1;
+                        g_scale_zoom_pct = (int) zoom_pct;
+                        g_scale_pending = 1;
+                        if (g_verbose) {
+                            printf(TAG " rfcmd: scale aspect=%d zoom=%d%%\n",
+                                   g_scale_aspect, g_scale_zoom_pct);
+                            fflush(stdout);
+                        }
+                    }
                 } else if (rc->cmd == MLM_RF_SCAN) {
                     /* Queue a one-shot scan for the bb-socket owner (main); read-only, self-restores. */
                     g_pending_scan = 1;
@@ -1050,12 +1156,33 @@ static void *udp_thread(void *arg)
             }
 
             g_last_ready_ms = now;
-            if (((struct mlm_ready *)(rx + sizeof *hdr))->frames_seen
-                && g_params_acked && !g_video_confirmed) {
+            struct mlm_ready *ready = (struct mlm_ready *)(rx + sizeof *hdr);
+            if (ready->frames_seen && g_params_acked && !g_video_confirmed) {
                 g_video_confirmed = 1;
                 printf(TAG " consumer confirms frames arriving\n");
                 fflush(stdout);
             }
+
+            /* feed the video-stall watch: note every advance of the consumer's datagram counter */
+            if (ready->rx_pkts != g_rx_pkts_last) {
+                g_rx_pkts_last = ready->rx_pkts;
+                g_rx_pkts_change_ms = now;
+                g_rx_counting = 1;
+            }
+        }
+
+        /* Video-stall watch: the session is "acked" and video was confirmed flowing, but the
+         * consumer's :10001 counter has frozen while the air's telemetry stays alive - the
+         * air-side link bounce rebuilt its video path and now waits for a media handshake this
+         * session already latched past. Re-arm the handshake: the ungated 2 s poll keeps running,
+         * and the next 0x02 reply re-fires SetLdCfg + the type-3 ack (and the camera re-assert). */
+        if (g_params_acked && g_video_confirmed && g_rx_counting && !g_air_lost
+            && now - g_rx_pkts_change_ms > MEDIA_STALL_MS) {
+            g_params_acked = 0;
+            g_video_confirmed = 0;
+            g_rx_counting = 0;
+            link_event(MLM_LINK_SESSION_RESTART,
+                       "video datagrams stalled, re-running the media handshake");
         }
 
         if (g_ready && now - g_last_ready_ms > READY_WINDOW_MS) {
@@ -1141,7 +1268,11 @@ static void *udp_thread(void *arg)
                 if (!g_params_acked && (g_power_dbm >= 0 || g_bitrate_mbps > 0)) {
                     uint8_t cfg[MP_LDCFG_LEN];
                     uint8_t dbm = g_power_dbm >= 0 ? (uint8_t) g_power_dbm : 0;
-                    sendto(params_sock, cfg, mp_set_ld_cfg(cfg, dbm, (uint8_t) g_bitrate_mbps, stamp_us),
+                    /* standby: armed only when the HUD commanded it; never the base's 1 (an
+                     * uncommanded first association must not arm the standby trap) */
+                    sendto(params_sock, cfg,
+                           mp_set_ld_cfg(cfg, dbm, (uint8_t) g_bitrate_mbps, g_standby_arm > 0,
+                                         stamp_us),
                            MSG_DONTWAIT, (struct sockaddr *)&air_params, sizeof air_params);
                     if (g_verbose) {
                         fprintf(stderr, TAG " tx SetLdCfg (power=0x%02x bitrate=%d Mbps)\n",
@@ -1158,6 +1289,12 @@ static void *udp_thread(void *arg)
                     g_params_acked = 1;
                     link_event(MLM_LINK_PARAMS_ACKED, "MEDIA_PARAMS acked, video should start");
                     led_cmd(MLM_LED_SOLID, 0x00, 0xff, 0x00, 0);
+
+                    /* The SetLdCfg the air just latched reset its ISP to the association defaults:
+                     * re-arm every commanded camera selector (and the scale pair) so the live
+                     * sender below re-applies the HUD's state on top. */
+                    g_cam_pending = g_cam_commanded;
+                    g_scale_pending = g_scale_aspect >= 0;
                 }
             } else if (msg_type == MP_MSP) {
                 mlm_pub(MLM_OSD_SOCK, MLM_T_MSP, rx, n);
@@ -1220,6 +1357,38 @@ static void *udp_thread(void *arg)
 
         /* (SetLdCfg is sent in the MEDIA_PARAMS 0x02-reply handler above, before the 0x03 ack, to match
          * the vendor's per-cycle 01->02->0a->03 sequence - not here.) */
+
+        /* Live camera/scale pushes: one SetCameraInfo (0x0C) per pending selector plus one
+         * SetScaleMode (0x15), the vendor's own live-set path (one datagram per menu change).
+         * Gated on an established session: the air only applies ISP sets with a running encoder,
+         * and anything commanded earlier stays pending until the ack above re-arms and lands here. */
+        if (params_bound && g_params_acked && !g_air_lost) {
+            while (g_cam_pending != 0) {
+                unsigned sel = (unsigned) __builtin_ctz(g_cam_pending);
+                uint8_t frame[MP_CAM_LEN];
+
+                g_cam_pending &= g_cam_pending - 1;
+                sendto(params_sock, frame, mp_set_camera_info(frame, sel, &g_cam, stamp_us),
+                       MSG_DONTWAIT, (struct sockaddr *)&air_params, sizeof air_params);
+                if (g_verbose) {
+                    fprintf(stderr, TAG " tx SetCameraInfo sel=%u\n", sel);
+                }
+            }
+
+            if (g_scale_pending) {
+                uint8_t frame[MP_SCALE_LEN];
+
+                g_scale_pending = 0;
+                sendto(params_sock, frame,
+                       mp_set_scale_mode(frame, g_scale_aspect == 1,
+                                         (float) g_scale_zoom_pct / 100.0f, stamp_us),
+                       MSG_DONTWAIT, (struct sockaddr *)&air_params, sizeof air_params);
+                if (g_verbose) {
+                    fprintf(stderr, TAG " tx SetScaleMode aspect=%d zoom=%d%%\n",
+                            g_scale_aspect, g_scale_zoom_pct);
+                }
+            }
+        }
 
         /* re-assert the LED ~1 Hz so a late-started/restarted ml-ledd reconverges;
          * also paints breathe-red from the first tick, before any link is up */
@@ -1400,8 +1569,6 @@ int main(int argc, char **argv)
         if (ticks % POLL_LINK_EVERY == 0) {
             bb_get(poll, GET_1V1INFO, seq_link++);
             send_frame(poll, 19, "get-1v1");
-            bb_get(poll, GET_DISTANCE, seq_link++);
-            send_frame(poll, 19, "get-distance");
         }
 
         if (ticks % FF02_EVERY == 0) {
