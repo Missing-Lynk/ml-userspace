@@ -99,6 +99,7 @@ static void slot_reset(struct comp_slot *sl)
  */
 static void slot_push(struct ctx *c, struct comp_slot *sl)
 {
+    lat_mark_pair(c, sl->pts);
     if (c->planes_on) {
         struct ditem it = { .cbi = -1 };
 
@@ -186,6 +187,7 @@ GstFlowReturn on_tile(GstAppSink *sink, gpointer u)
      * completion also keeps the display idle until both decoders are fully up.
      */
     gint64 t_mapped = g_get_monotonic_time();
+    lat_mark_dec(c, ch, GST_BUFFER_PTS(b), t_in);
     pthread_mutex_lock(&c->comp_lock);
     c->out_pts[ch] = GST_BUFFER_PTS(b);
 
@@ -511,6 +513,7 @@ void *rf_rx(void *arg)
         GstBuffer *buf = gst_buffer_new_allocate(NULL, stream_len, NULL);
         gst_buffer_fill(buf, 0, es, stream_len);
         GstClockTime pts = c->pts_epoch + gst_util_uint64_scale(frame_id, GST_SECOND, RF_FPS);
+        lat_mark_rx(c, pts);
         GST_BUFFER_PTS(buf) = pts;
         GST_BUFFER_DTS(buf) = pts;
         GST_BUFFER_DURATION(buf) = gst_util_uint64_scale(1, GST_SECOND, RF_FPS);

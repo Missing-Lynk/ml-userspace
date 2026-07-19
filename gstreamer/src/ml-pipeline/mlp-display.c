@@ -135,6 +135,11 @@ static void drm_flip_handler(int fd, unsigned int seq, unsigned int tv_s,
         c->retire_arm = 0;
     }
 
+    /* The event completes pending_it's flip: that frame is (about to be) latched. */
+    if (!ditem_empty(&c->pending_it)) {
+        lat_mark_flip(c, c->pending_it.pts);
+    }
+
     if (!ditem_empty(&c->prev_it)) {
         if (c->retire_dumps > 0 && c->prev_it.cbi >= 0) {
             char path[64];
@@ -322,6 +327,7 @@ static void *drm_disp_run(void *arg)
             } else {
                 c->pending_it = it;
                 c->pending_since = g_get_monotonic_time();
+                lat_mark_submit(c, it.pts);
             }
         } else {
             /* composite: scan out the pool buffer's FB; single: the frame's own imported FB. */
@@ -343,6 +349,7 @@ static void *drm_disp_run(void *arg)
             } else {
                 c->pending_it = it;
                 c->pending_since = g_get_monotonic_time();
+                lat_mark_submit(c, it.pts);
             }
         }
     }
@@ -361,6 +368,7 @@ void drm_disp_submit(struct ctx *c, const struct ditem *it, GstClockTime pts)
     pthread_mutex_lock(&c->disp_lock);
     displaced = c->next_it;
     c->next_it = *it;
+    c->next_it.pts = pts;
     c->next_pts = pts;
     pthread_mutex_unlock(&c->disp_lock);
 

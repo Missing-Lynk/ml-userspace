@@ -284,6 +284,7 @@ struct ctx {
         GstBuffer *buf;                 /* composite mode: pool buffer ref */
         GstSample *smp[RF_NCHN];        /* plane mode: the two tile samples */
         guint32 fb[RF_NCHN];            /* plane mode: their cached DRM FBs */
+        GstClockTime pts;               /* frame PTS, carried for the latency trace */
     } next_it,                          /* mailbox: newest frame awaiting flip */
       front_it, pending_it,             /* display-thread-only: on-screen / flip-in-flight */
       prev_it;                          /* retired one flip late, see drm_flip_handler */
@@ -382,6 +383,30 @@ struct ctx {
     guint32 pb_pos_ms, pb_dur_ms;       /* last queried playback position + duration */
     gboolean rf_planes;                 /* RF display mode (planes_on) to restore after playback */
     guint rf_bus_watch;                 /* bus watch id on the RF pipe (re-added on each rebuild) */
+
+    /* Latency trace (ML_LATSTATS=1, mlp-latstats.c): per-frame stage timestamps keyed by PTS,
+     * flushed to a 1 Hz summary line. All fields display-path-hot, so collection is fully
+     * disabled unless lat_on.
+     */
+    gboolean lat_on;
+    pthread_mutex_t lat_lock;           /* guards lat_ent[] and the flush accumulators */
+    struct lat_ent {
+        GstClockTime pts;
+        gint64 t_rx;                    /* first datagram of the FrameId seen in rf_rx (us) */
+        gint64 t_dec[RF_NCHN];          /* tile decode-out (appsink new-sample entry) */
+        gint64 t_pair;                  /* both halves complete (slot_push) */
+        gint64 t_submit;                /* flip submitted to DRM */
+        gboolean done;                  /* flip event consumed; ignore late duplicate marks */
+    } lat_ent[256];
+    struct lat_acc {                    /* completed samples since the last 1 Hz flush (us) */
+        gint32 rxflip[256], rxdec0[256], rxdec1[256], pairw[256], subflip[256];
+        int n;
+        gint32 fdt[256];                /* flip-to-flip intervals, completeness-independent */
+        int nfdt;
+        guint32 judder, repeat;         /* fdt outside +-20% nominal / > 1.5x nominal */
+    } lat_acc;
+    gint64 lat_last_flip;               /* previous flip-event time (us), 0 = none yet */
+    guint lat_timer;                    /* 1 Hz flush g_timeout id */
 };
 
 
@@ -451,6 +476,14 @@ GstFlowReturn on_tile(GstAppSink *sink, gpointer u);
 void clear_pending(struct ctx *c);
 void *rf_rx(void *arg);
 gboolean rf_ready_tick(gpointer u);
+
+/* mlp-latstats.c: per-frame latency trace (ML_LATSTATS=1). All marks are no-ops when off. */
+void lat_init(struct ctx *c);
+void lat_mark_rx(struct ctx *c, GstClockTime pts);
+void lat_mark_dec(struct ctx *c, int ch, GstClockTime pts, gint64 t_us);
+void lat_mark_pair(struct ctx *c, GstClockTime pts);
+void lat_mark_submit(struct ctx *c, GstClockTime pts);
+void lat_mark_flip(struct ctx *c, GstClockTime pts);
 
 /* rf decode-graph lifecycle (ml-pipeline.c) - built/torn down around playback swaps */
 int rf_decode_start(struct ctx *c);
