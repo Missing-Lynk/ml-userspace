@@ -16,13 +16,15 @@
 
 #include "lvgl.h"
 
+#include <stdbool.h>
+
 /** @brief The menu objects + callback the player needs. All accessors return the current value, so
  *  the player always sees the live object (the menu rebuilds/destroys these as it opens and closes). */
 typedef struct {
     lv_group_t *(*group)(void);      /**< keypad group (the player takes it over while revealed) */
     lv_obj_t   *(*menu_root)(void);  /**< the menu's top object, hidden behind the video during playback */
     lv_obj_t   *(*content)(void);    /**< content pane holding the recordings rows (the spinner's parent) */
-    int         (*menu_open)(void);  /**< whether the menu is still open (guards the focus restore) */
+    bool         (*menu_open)(void);  /**< whether the menu is still open (guards the focus restore) */
     void        (*restore_list)(int row_index);  /**< re-enter the recordings list, focus @p row_index */
 } player_host_t;
 
@@ -38,8 +40,8 @@ void player_start(int row_index, const char *name);
  *  bar. A no-op when nothing is playing. */
 void player_tick(void);
 
-int  player_is_open(void);     /**< @brief The transport bar is up (a frame is on screen). */
-int  player_is_loading(void);  /**< @brief A clip was picked but no frame is up yet. */
+bool  player_is_open(void);     /**< @brief The transport bar is up (a frame is on screen). */
+bool  player_is_loading(void);  /**< @brief A clip was picked but no frame is up yet. */
 
 /* Key routing while the player owns input (menu.c dispatches to these when open). */
 void player_key_left(void);    /**< @brief Step toward rewind. */

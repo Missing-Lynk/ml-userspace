@@ -16,6 +16,8 @@
 #ifndef MSP_FONT_H
 #define MSP_FONT_H
 
+#include <stdbool.h>
+
 #define MSP_FONT_GLYPHS  256
 #define MSP_FONT_GLYPH_W 24
 #define MSP_FONT_GLYPH_H 36
@@ -28,7 +30,7 @@
 int msp_font_load(const char *path);
 
 /** @brief Is a font currently loaded (so glyphs can be drawn)? */
-int msp_font_loaded(void);
+bool msp_font_is_loaded(void);
 
 /**
  * @brief RGBA pixels of glyph @p code, row-major, MSP_FONT_GLYPH_W * MSP_FONT_GLYPH_H * 4 bytes.

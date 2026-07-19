@@ -3,6 +3,7 @@
  */
 #include "msp_canvas.h"
 
+#include <stdbool.h>
 #include <stddef.h>
 
 /* The canvas is Betaflight MSP DisplayPort glyph data in Artosyn's packing (see
@@ -16,7 +17,7 @@
 #define RECORD_HEADER_LEN         3      /* row, col, attr */
 
 /** @brief Whether an MSP DisplayPort write-string marker (b6 03) begins at packed[pos]. */
-static int is_record_marker(const unsigned char *packed, int pos, int n)
+static bool is_record_marker(const unsigned char *packed, int pos, int n)
 {
     return pos + 1 < n
         && packed[pos] == MSP_DISPLAYPORT_CMD

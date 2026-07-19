@@ -185,7 +185,7 @@ static void on_button(void *ctx, hud_button_t button, hud_button_edge_t edge)
      * a running recording is auto-stopped on stream loss by the main loop).
      */
     if (button == HUD_BTN_RECORD && edge == HUD_EDGE_DOWN) {
-        if (linkstate_airunit_connected()) {
+        if (linkstate_is_airunit_connected()) {
             send_dvr_format(h);   /* a starting toggle records in the configured format */
             pipecmd_record_toggle();
             h->rec_is_auto = 0;   /* manual control: this recording is not auto-record's to stop */
@@ -368,7 +368,7 @@ static void record_policy_tick(hud_ctx_t *h, int connected, int recording, int s
         h->rec_autostop_sent = 0;
     }
 
-    if (autorecord && connected && linkstate_pipeline_seen() && state == MLM_STATE_IDLE
+    if (autorecord && connected && linkstate_has_pipeline_state() && state == MLM_STATE_IDLE
         && !h->rec_autostart_sent) {
         send_dvr_format(h);        /* the auto-started recording uses the configured format */
         pipecmd_record_toggle();   /* idle-guarded: a toggle from idle starts recording */
@@ -453,7 +453,7 @@ static void nosignal_tick(hud_ctx_t *h, int connected, int state)
         return;
     }
 
-    if (state != MLM_STATE_IDLE || !linkstate_pipeline_seen() || h->nosignal_sent) {
+    if (state != MLM_STATE_IDLE || !linkstate_has_pipeline_state() || h->nosignal_sent) {
         return;
     }
 
@@ -489,7 +489,7 @@ static void sysosd_tick(hud_ctx_t *h, uint32_t now)
 
     /* Air-unit values decoded from the :10000 status frames; blanked when the link is down so the
      * bar shows placeholders rather than stale readings. */
-    int air_up = linkstate_airunit_connected();
+    int air_up = linkstate_is_airunit_connected();
     air_telem_t air = {
         .have_voltage = air_up && h->have_voltage,
         .voltage_mV = h->last_voltage_mV,
@@ -724,14 +724,14 @@ int main(int argc, char **argv)
         linkstate_poll(link_fd);
 
         if (h.drm != NULL) {
-            drm_overlay_extern_refresh(h.drm, linkstate_video_live());
+            drm_overlay_extern_refresh(h.drm, linkstate_is_video_live());
         }
 
         /* ml-linkd's connection state is the single source of truth for whether a stream is
          * present; every policy below keys off this one read. */
         int state = linkstate_pipeline_state();
         int recording = (state == MLM_STATE_RECORDING);
-        int connected = linkstate_airunit_connected();
+        int connected = linkstate_is_airunit_connected();
 
         record_policy_tick(&h, connected, recording, state);
         assert_air_settings(&h, connected);

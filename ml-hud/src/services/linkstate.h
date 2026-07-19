@@ -14,6 +14,8 @@
 
 #include "../channel/osd_channel.h"
 
+#include <stdbool.h>
+
 /** @brief Bind the telemetry seam. @return fd on success, -1 on error (the link then reads as down). */
 int linkstate_open(void);
 
@@ -26,12 +28,12 @@ void linkstate_poll(int fd);
 void linkstate_set_osd_cb(const osd_channel_cb_t *cb, void *ctx);
 
 /** @brief Whether the air unit is currently connected (its telemetry seen within the staleness window). */
-int linkstate_airunit_connected(void);
+bool linkstate_is_airunit_connected(void);
 
 /** @brief Whether ml-pipeline reports live display flips (MLM_STATE_F_VIDEO_LIVE, fresh within 2.5 s).
  *  While true the pipeline's own commits latch the HUD overlay's pixels, so the HUD suppresses its
  *  per-present plane re-assert (drm_overlay_extern_refresh), which otherwise stalls video flips. */
-int linkstate_video_live(void);
+bool linkstate_is_video_live(void);
 
 /** @brief Local baseband link metrics from ml-linkd's MLM_T_LINKINFO. Each returns MLM_LINKINFO_NONE
  *  (-1) until a value has been received / while the link is down, so the System OSD shows a dim
@@ -43,7 +45,7 @@ int linkstate_distance_m(void);
 
 /** @brief Whether the air unit is currently in standby (quad disarmed + standby armed), from
  *  ml-linkd's SetStandyMode readback. 0 when active or no link. */
-int linkstate_standby(void);
+bool linkstate_is_standby(void);
 
 struct mlm_scan;   /* ml-shared/mlm.h */
 
@@ -62,7 +64,7 @@ int linkstate_pipeline_state(void);
  *  linkstate_pipeline_state() returns the default (IDLE), which callers must not act on - e.g.
  *  auto-record must wait for the true state so it does not toggle a recording it cannot yet see.
  */
-int linkstate_pipeline_seen(void);
+bool linkstate_has_pipeline_state(void);
 
 /**
  * @brief Playback progress from the pipeline's MLM_T_STATE.
@@ -74,10 +76,10 @@ int linkstate_pipeline_seen(void);
 int linkstate_playback(int *paused, unsigned *pos_ms, unsigned *dur_ms);
 
 /** @brief Whether the current clip has reached end-of-clip (last frame held, awaiting replay/exit). */
-int linkstate_playback_ended(void);
+bool linkstate_is_playback_ended(void);
 
 /** @brief Whether the first decoded frame of the current clip is on the display (playback visible). */
-int linkstate_playback_rendering(void);
+bool linkstate_is_playback_rendering(void);
 
 /** @brief Close the seam. */
 void linkstate_close(int fd);

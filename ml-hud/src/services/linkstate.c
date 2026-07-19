@@ -147,7 +147,7 @@ int linkstate_pipeline_state(void)
     return (int) g_pipeline_state;
 }
 
-int linkstate_pipeline_seen(void)
+bool linkstate_has_pipeline_state(void)
 {
     return g_pipeline_seen;
 }
@@ -169,23 +169,23 @@ int linkstate_playback(int *paused, unsigned *pos_ms, unsigned *dur_ms)
     return g_pipeline_state == MLM_STATE_PLAYBACK;
 }
 
-int linkstate_playback_ended(void)
+bool linkstate_is_playback_ended(void)
 {
     return g_pipeline_state == MLM_STATE_PLAYBACK && (g_pb_flags & MLM_STATE_F_ENDED) != 0;
 }
 
-int linkstate_playback_rendering(void)
+bool linkstate_is_playback_rendering(void)
 {
     return g_pipeline_state == MLM_STATE_PLAYBACK && (g_pb_flags & MLM_STATE_F_RENDERING) != 0;
 }
 
-int linkstate_video_live(void)
+bool linkstate_is_video_live(void)
 {
     return (g_pb_flags & MLM_STATE_F_VIDEO_LIVE) != 0
         && g_state_ms != 0 && (uint32_t) (now_ms() - g_state_ms) < 2500;
 }
 
-int linkstate_airunit_connected(void)
+bool linkstate_is_airunit_connected(void)
 {
     return g_last_seen_ms != 0 && (uint32_t) (now_ms() - g_last_seen_ms) < LINK_STALE_MS;
 }
@@ -205,7 +205,7 @@ int linkstate_distance_m(void)
     return g_distance_m;
 }
 
-int linkstate_standby(void)
+bool linkstate_is_standby(void)
 {
     return g_standby;
 }

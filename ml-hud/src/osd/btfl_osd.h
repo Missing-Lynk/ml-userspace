@@ -17,6 +17,8 @@
 
 #include "surface.h"
 
+#include <stdbool.h>
+
 /* Betaflight HD DisplayPort grid. Each cell is scaled from the font's 24x36 glyph to its slice of the
  * target surface; the scale uses a global (col*W/COLS) mapping so adjacent cells tile seamlessly. */
 #define BTFL_OSD_COLS 53
@@ -30,7 +32,7 @@
 int btfl_osd_init(const char *font_path);
 
 /** @brief Is a font loaded (so updates will draw)? */
-int btfl_osd_ready(void);
+bool btfl_osd_is_ready(void);
 
 /**
  * @brief Set the target size and the colour a changed cell is cleared to before its glyph is drawn.

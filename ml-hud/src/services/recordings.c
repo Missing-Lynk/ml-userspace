@@ -3,6 +3,7 @@
 #include "board.h"
 
 #include <dirent.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,7 +15,7 @@
  * aborted capture (0-byte, or a header-only stub) with nothing to play - hidden from the list. */
 #define MIN_PLAYABLE_BYTES (64 * 1024)
 
-static int has_mp4_suffix(const char *name)
+static bool has_mp4_suffix(const char *name)
 {
     size_t length = strlen(name);
     if (length < 4) {

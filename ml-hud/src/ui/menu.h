@@ -13,6 +13,8 @@
 
 #include "settings.h"
 
+#include <stdbool.h>
+
 /** @brief One-time setup: styles, fonts, the keypad group. Call after LVGL init and the display. */
 void menu_init(settings_t *settings);
 
@@ -23,7 +25,7 @@ void menu_apply_persisted(void);
 
 void menu_open(void);      /**< @brief Build and show the menu (sidebar zone). No-op if already open. */
 void menu_close(void);     /**< @brief Destroy the menu. */
-int  menu_is_open(void);   /**< @brief Whether the menu is shown. */
+bool  menu_is_open(void);   /**< @brief Whether the menu is shown. */
 int  menu_depth(void);     /**< @brief Nesting depth (0 = sidebar, 1 = inside a section). */
 
 /* Navigation, driven by the button controller (called outside LVGL event context). */

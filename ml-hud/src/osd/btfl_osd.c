@@ -45,9 +45,9 @@ int btfl_osd_init(const char *font_path)
     return -1;
 }
 
-int btfl_osd_ready(void)
+bool btfl_osd_is_ready(void)
 {
-    return msp_font_loaded();
+    return msp_font_is_loaded();
 }
 
 void btfl_osd_configure(int screen_w, int screen_h,
@@ -136,7 +136,7 @@ static void grid_sink(void *ctx, int row, int col, int attr, unsigned char glyph
 
 int btfl_osd_update(surface_t *dst, const unsigned char *canvas, int len, rect_t *rects, int max_rects)
 {
-    if (dst == NULL || dst->px == NULL || !msp_font_loaded()) {
+    if (dst == NULL || dst->px == NULL || !msp_font_is_loaded()) {
         return 0;
     }
 
@@ -183,7 +183,7 @@ int btfl_osd_update(surface_t *dst, const unsigned char *canvas, int len, rect_t
 
 int btfl_osd_clear(surface_t *dst, rect_t *rects, int max_rects)
 {
-    if (dst == NULL || dst->px == NULL || !msp_font_loaded()) {
+    if (dst == NULL || dst->px == NULL || !msp_font_is_loaded()) {
         return 0;
     }
 

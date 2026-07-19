@@ -12,6 +12,8 @@
 
 #include "lvgl.h"
 
+#include <stdbool.h>
+
 /** @brief The menu objects + callbacks the channel grid borrows. Accessors return the current value,
  *  so the grid always sees the live object (the menu rebuilds/destroys these as sections change). */
 typedef struct {
@@ -19,7 +21,7 @@ typedef struct {
     lv_group_t *(*group)(void);               /**< keypad group, for grid-navigation refocus */
     lv_style_t *(*style_item)(void);          /**< base row/tile style */
     lv_style_t *(*style_item_focused)(void);  /**< focused row/tile style */
-    int         (*in_sidebar)(void);          /**< focus is in the sidebar (a full rebuild is safe) */
+    bool         (*in_sidebar)(void);          /**< focus is in the sidebar (a full rebuild is safe) */
     void        (*centered_hint)(const char *text);  /**< fill the content pane with a dim message */
     void        (*rebuild)(void);             /**< re-render the whole content pane (render_content) */
     void        (*persist_channel)(int idx);  /**< save the picked channel to settings */

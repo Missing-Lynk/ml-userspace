@@ -332,7 +332,7 @@ static void update_link_fields(int connected, settings_t *settings)
 
     /* Standby cue: the power glyph, shown only when the air reports standby (quad disarmed +
      * standby armed). Hidden otherwise, so the bar is unchanged when the air is active. */
-    if (connected && linkstate_standby()) {
+    if (connected && linkstate_is_standby()) {
         lv_obj_remove_flag(g_lbl_standby, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_add_flag(g_lbl_standby, LV_OBJ_FLAG_HIDDEN);
@@ -387,7 +387,7 @@ void sysosd_update(const telemetry_t *telemetry, const air_telem_t *air, setting
         return;
     }
 
-    int connected = linkstate_airunit_connected();
+    int connected = linkstate_is_airunit_connected();
     int show_temp = settings_get_bool_in(settings, GOG_SECTION, "show_temperature", 1);
 
     update_goggle_battery(telemetry, settings);

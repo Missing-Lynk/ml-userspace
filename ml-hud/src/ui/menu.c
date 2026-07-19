@@ -382,7 +382,7 @@ static int stepper_index(const gog_item_t *item)
     return index;
 }
 
-static int toggle_on(const gog_item_t *item)
+static bool toggle_is_on(const gog_item_t *item)
 {
     return settings_get_bool_in(g_settings, section_key(), item->setting_key, item->default_on);
 }
@@ -617,7 +617,7 @@ static void item_clicked_cb(lv_event_t *event)
     lv_obj_t *row = (lv_obj_t *) lv_event_get_target(event);
 
     if (item->type == ITEM_TOGGLE) {
-        set_toggle(row, item, !toggle_on(item));
+        set_toggle(row, item, !toggle_is_on(item));
     } else if (item->type == ITEM_DROPDOWN) {
         open_select(item, row);   /* CENTER opens the select-list overlay */
     } else if (item->type == ITEM_ACTION && strcmp(item->action, "slot_switch") == 0) {
@@ -724,7 +724,7 @@ static void render_settings_list(const gog_item_t *items, int count, lv_obj_t **
         } else if (item->type == ITEM_ACTION) {
             add_action_value(row);
         } else {
-            add_toggle_switch(row, toggle_on(item));
+            add_toggle_switch(row, toggle_is_on(item));
         }
 
         lv_obj_add_event_cb(row, item_clicked_cb, LV_EVENT_CLICKED, (void *) item);
@@ -1467,7 +1467,7 @@ static void format_sdcard(void)
 static lv_group_t *host_group(void)     { return g_group; }
 static lv_obj_t   *host_menu_root(void) { return g_menu; }
 static lv_obj_t   *host_content(void)   { return g_content; }
-static int         host_menu_open(void) { return g_is_open; }
+static bool         host_menu_is_open(void) { return g_is_open; }
 
 /* Re-enter the recordings list after playback and land on the clip that was played (not the top). */
 static void restore_recordings_list(int row_index)
@@ -1482,14 +1482,14 @@ static const player_host_t g_player_host = {
     .group        = host_group,
     .menu_root    = host_menu_root,
     .content      = host_content,
-    .menu_open    = host_menu_open,
+    .menu_open    = host_menu_is_open,
     .restore_list = restore_recordings_list,
 };
 
 /* channel host: the shared menu objects + callbacks the channel grid borrows (menu_channel.h). */
 static lv_style_t *host_style_item(void)         { return &g_style_item; }
 static lv_style_t *host_style_item_focused(void) { return &g_style_item_focused; }
-static int         host_in_sidebar(void)         { return g_zone == 0; }
+static bool         host_is_in_sidebar(void)         { return g_zone == 0; }
 static void        host_persist_channel(int idx) { settings_set_int_in(g_settings, GOG_SECTION, "channel", idx); }
 
 static const menu_channel_host_t g_channel_host = {
@@ -1497,7 +1497,7 @@ static const menu_channel_host_t g_channel_host = {
     .group              = host_group,
     .style_item         = host_style_item,
     .style_item_focused = host_style_item_focused,
-    .in_sidebar         = host_in_sidebar,
+    .in_sidebar         = host_is_in_sidebar,
     .centered_hint      = render_centered_hint,
     .rebuild            = render_content,
     .persist_channel    = host_persist_channel,
@@ -1595,7 +1595,7 @@ void menu_close_all(void)
     menu_close();
 }
 
-int menu_is_open(void)
+bool menu_is_open(void)
 {
     return g_is_open;
 }

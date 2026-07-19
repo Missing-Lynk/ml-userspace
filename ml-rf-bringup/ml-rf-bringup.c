@@ -17,6 +17,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -67,7 +68,7 @@ static int write_attr(const char *path, const char *value)
 }
 
 /* True if the named module is present in /proc/modules (matched at the start of a line). */
-static int module_loaded(const char *name)
+static bool module_is_loaded(const char *name)
 {
     FILE *modules = fopen("/proc/modules", "r");
     if (modules == NULL) {
@@ -320,7 +321,7 @@ int main(int argc, char **argv)
     const char *fw = argv[1];
     const char *cfg = argv[2];
 
-    if (module_loaded(RF_MODULE)) {
+    if (module_is_loaded(RF_MODULE)) {
         fprintf(stderr, PROG ": %s already loaded; nothing to do\n", RF_MODULE);
         return 0;
     }

@@ -115,7 +115,7 @@ static void ditem_release(struct ditem *it)
     it->cbi = -1;
 }
 
-static gboolean ditem_empty(const struct ditem *it)
+static gboolean ditem_is_empty(const struct ditem *it)
 {
     return !it->buf && !it->smp[0];
 }
@@ -146,11 +146,11 @@ static void drm_flip_handler(int fd, unsigned int seq, unsigned int tv_s,
     pthread_mutex_lock(&c->disp_lock);
 
     /* The event completes pending_it's flip: that frame is (about to be) latched. */
-    if (!ditem_empty(&c->pending_it)) {
+    if (!ditem_is_empty(&c->pending_it)) {
         lat_mark_flip(c, c->pending_it.pts);
     }
 
-    if (!ditem_empty(&c->prev_it)) {
+    if (!ditem_is_empty(&c->prev_it)) {
         if (c->retire_dumps > 0 && c->prev_it.cbi >= 0) {
             char path[64];
             snprintf(path, sizeof path, "/tmp/retire%d.raw", c->retire_seq++);
@@ -188,7 +188,7 @@ static void drm_flip_handler(int fd, unsigned int seq, unsigned int tv_s,
 static void disp_try_submit(struct ctx *c)
 {
     pthread_mutex_lock(&c->disp_lock);
-    if (!c->modeset_done || !ditem_empty(&c->pending_it) || ditem_empty(&c->next_it)) {
+    if (!c->modeset_done || !ditem_is_empty(&c->pending_it) || ditem_is_empty(&c->next_it)) {
         pthread_mutex_unlock(&c->disp_lock);
         return;
     }
@@ -338,7 +338,7 @@ static void *drm_disp_run(void *arg)
         }
 
         pfd[0].revents = pfd[1].revents = 0;
-        if (!ditem_empty(&c->pending_it)) {
+        if (!ditem_is_empty(&c->pending_it)) {
             /* A flip is in flight; wait for its completion event. Bounded: the completion
              * rides the VO vsync IRQ, and a lost edge would otherwise block this thread
              * forever. After FLIP_TIMEOUT_US force-retire as if the event had arrived. If
@@ -375,7 +375,7 @@ static void *drm_disp_run(void *arg)
         memset(&c->next_it, 0, sizeof c->next_it);
         c->next_it.cbi = -1;
         pthread_mutex_unlock(&c->disp_lock);
-        if (ditem_empty(&it)) {
+        if (ditem_is_empty(&it)) {
             continue;
         }
 
@@ -437,7 +437,7 @@ void drm_disp_submit(struct ctx *c, const struct ditem *it, GstClockTime pts)
     c->next_pts = pts;
     pthread_mutex_unlock(&c->disp_lock);
 
-    if (!ditem_empty(&displaced)) {
+    if (!ditem_is_empty(&displaced)) {
         ditem_release(&displaced);     /* never shown -> released (pool / decoder) */
     }
 

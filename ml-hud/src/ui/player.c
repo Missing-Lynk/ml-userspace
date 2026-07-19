@@ -82,7 +82,7 @@ static void player_update(void)
         return;
     }
 
-    int ended = linkstate_playback_ended();
+    int ended = linkstate_is_playback_ended();
 
     /* Prefer the header-parsed length: the pipeline's live duration grows for fragmented clips. */
     if (g_player_dur_ms > 0) {
@@ -342,13 +342,13 @@ void player_on_menu_closing(void)
  * clip never renders (empty/aborted recording, or a decode that timed out). */
 static void player_loading_tick(void)
 {
-    if (linkstate_playback_rendering()) {
+    if (linkstate_is_playback_rendering()) {
         player_reveal();
         return;
     }
 
     /* No frame will come from an empty clip (it EOSes without rendering); do not spin forever. */
-    if (linkstate_playback_ended() || (int32_t) (lv_tick_get() - g_loading_deadline_ms) >= 0) {
+    if (linkstate_is_playback_ended() || (int32_t) (lv_tick_get() - g_loading_deadline_ms) >= 0) {
         player_cancel_loading();
     }
 }
@@ -363,12 +363,12 @@ void player_tick(void)
     player_update();   /* advance the playback bar + auto-close on end (no-op unless open) */
 }
 
-int player_is_open(void)
+bool player_is_open(void)
 {
     return g_player_open;
 }
 
-int player_is_loading(void)
+bool player_is_loading(void)
 {
     return g_player_loading;
 }
@@ -402,7 +402,7 @@ void player_key_right(void)
 void player_key_center(void)
 {
     /* At end-of-clip, CENTER replays from the start. */
-    if (linkstate_playback_ended()) {
+    if (linkstate_is_playback_ended()) {
         g_player_speed_index = PLAYER_SPEED_NORMAL;
         pipecmd_playback_play(g_player_path);
         return;

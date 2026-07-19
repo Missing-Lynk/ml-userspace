@@ -40,7 +40,7 @@ int msp_font_load(const char *path)
     return 0;
 }
 
-int msp_font_loaded(void)
+bool msp_font_is_loaded(void)
 {
     return g_loaded;
 }
