@@ -287,10 +287,18 @@ static void update_goggle_battery(const telemetry_t *telemetry, settings_t *sett
  * or a value has not arrived. The channel is the table index our RX is tuned to - a local fact that
  * holds whether or not the air is connected - so it is shown whenever known (green while linked, plain
  * otherwise) so a pilot can always read off their channel. */
-static void update_link_fields(int connected)
+static void update_link_fields(int connected, settings_t *settings)
 {
+    /* Before ml-linkd's first report, fall back to the saved channel (the value the HUD asserts on
+     * every link-up; default 0, the Normal-band bring-up channel), so the field is right from the
+     * first paint instead of flashing "CH --" and reflowing the bar. The content-sized label then
+     * only changes on an actual channel switch. */
     int channel = linkstate_channel();
-    if (channel != MLM_LINKINFO_NONE) {
+    if (channel == MLM_LINKINFO_NONE) {
+        channel = settings_get_int_in(settings, GOG_SECTION, "channel", 0);
+    }
+
+    if (channel >= 0) {
         char label[24];
 
         channel_label(label, sizeof label, channel);
@@ -383,7 +391,7 @@ void sysosd_update(const telemetry_t *telemetry, const air_telem_t *air, setting
     int show_temp = settings_get_bool_in(settings, GOG_SECTION, "show_temperature", 1);
 
     update_goggle_battery(telemetry, settings);
-    update_link_fields(connected);
+    update_link_fields(connected, settings);
     update_air_fields(air, show_temp);
 
     if (telemetry->have_sdcard) {

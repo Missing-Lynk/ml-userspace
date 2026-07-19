@@ -191,8 +191,11 @@ int btfl_osd_clear(surface_t *dst, rect_t *rects, int max_rects)
     int overflow = 0;
     for (int r = 0; r < BTFL_OSD_ROWS; r++) {
         for (int c = 0; c < BTFL_OSD_COLS; c++) {
-            /* Empty cells drew nothing, so there is nothing to clear. */
-            if (g_grid[r][c] == CELL_EMPTY) {
+            /* Empty cells drew nothing, so there is nothing to clear. UNSET cells (fresh grid or
+             * post-invalidate) never drew either - clearing them would count every cell, overflow
+             * the rect list and force a full-plane present that clobbers the System OSD strip.
+             * They stay UNSET so the next update still does its full redraw. */
+            if (g_grid[r][c] == CELL_EMPTY || g_grid[r][c] == CELL_UNSET) {
                 continue;
             }
 

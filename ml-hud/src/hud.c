@@ -377,9 +377,9 @@ static void record_policy_tick(hud_ctx_t *h, int connected, int recording, int s
  * matter here: a user who never touches a row still needs standby armed and power/bitrate pushed.
  * ml-linkd re-applies standby and power on its own session restarts, and applies the bitrate via
  * SetLdCfg at association, so re-asserting on every link-up edge covers both. The channel, which
- * ml-linkd does not persist (without this every boot lands on its bring-up default), is asserted
- * only if the user has ever picked one; ml-linkd ignores a channel outside the current band's valid
- * set, leaving its own first-valid choice in place.
+ * ml-linkd does not persist (without this every boot lands on its bring-up default), defaults to 0
+ * - the Normal-band bring-up channel - until the user picks one; ml-linkd ignores a channel outside
+ * the current band's valid set, leaving its own first-valid choice in place.
  */
 static void assert_air_settings(hud_ctx_t *h, int connected)
 {
@@ -403,7 +403,7 @@ static void assert_air_settings(hud_ctx_t *h, int connected)
     }
 
     if (!h->channel_asserted) {
-        int channel = settings_get_int_in(h->settings, "goggle", "channel", -1);
+        int channel = settings_get_int_in(h->settings, "goggle", "channel", 0);
         if (channel >= 0) {
             linkcmd_select_channel((unsigned) channel);
         }
@@ -445,6 +445,9 @@ static void nosignal_tick(hud_ctx_t *h, int connected, int state)
         int n = btfl_osd_clear(h->fb, rects, (int) (sizeof(rects) / sizeof(rects[0])));
         if (n != 0) {
             drm_overlay_present(h->drm, h->fb, rects, n);
+            if (n < 0) {
+                sysosd_invalidate();   /* a full present repacks the whole plane, clobbering the bar strip */
+            }
         }
     }
 }

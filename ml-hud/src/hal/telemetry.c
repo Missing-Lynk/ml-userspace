@@ -69,7 +69,9 @@ static uint32_t mono_ms(void)
 /* Incoming-video bitrate: the SDIO netdev RX byte counter differentiated over wall time, smoothed and
  * held. The counter is monotonic per boot, so a smaller reading than last means a reset (driver reload)
  * - treated as no movement. have_bitrate stays set while bytes moved within the hold window, so the
- * field reflects the real downlink rate even when the telemetry-liveness flag gaps. */
+ * field reflects the real downlink rate even when the telemetry-liveness flag gaps. Until the first
+ * nonzero delta the field stays unset, so a zero-flow interface reads as the placeholder rather than
+ * "0.0 Mbps". */
 static void read_bitrate(const board_profile_t *board, telemetry_t *out)
 {
     static long long last_bytes = -1;
@@ -77,16 +79,18 @@ static void read_bitrate(const board_profile_t *board, telemetry_t *out)
     static uint32_t  last_move_ms;   /* last tick the counter actually advanced */
     static float     ema_mbps;       /* smoothed rate */
     static int       have_ema;
+    static int       seen_flow;      /* a nonzero delta has been observed since the source appeared */
 
     long long bytes = read_u64_file(board->sdio_rx_bytes_path);
     uint32_t now = mono_ms();
     if (bytes < 0) {                 /* source vanished: hard reset -> placeholder */
         last_bytes = -1;
         have_ema = 0;
+        seen_flow = 0;
         return;
     }
 
-    if (last_bytes < 0) {            /* first sample: baseline only, assume live */
+    if (last_bytes < 0) {            /* first sample: baseline only */
         last_bytes = bytes;
         last_ms = now;
         last_move_ms = now;
@@ -103,6 +107,7 @@ static void read_bitrate(const board_profile_t *board, telemetry_t *out)
 
         if (delta > 0) {
             last_move_ms = now;
+            seen_flow = 1;
         }
 
         float inst = (float) (delta * 8) / ((double) elapsed * 1000.0);
@@ -112,7 +117,7 @@ static void read_bitrate(const board_profile_t *board, telemetry_t *out)
         last_ms = now;
     }
 
-    if (have_ema && (uint32_t) (now - last_move_ms) < BITRATE_HOLD_MS) {
+    if (have_ema && seen_flow && (uint32_t) (now - last_move_ms) < BITRATE_HOLD_MS) {
         out->have_bitrate = 1;
         out->bitrate_mbps = ema_mbps;
     }
