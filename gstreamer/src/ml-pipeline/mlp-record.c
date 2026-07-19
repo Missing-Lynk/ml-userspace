@@ -576,6 +576,7 @@ void rec_stop(struct ctx *c)
 
     gst_object_unref(c->rec_bin);
     c->rec_bin = NULL;
+    osd_burn_clear(c);   /* the burn cells were this recording's OSD state; the HUD re-sends */
     printf("ml-pipeline: DVR stopped -> %s (pushed=%llu dropped=%llu)\n",
            c->rec_path, (unsigned long long)c->rec_pushed, (unsigned long long)c->rec_dropped);
 }
@@ -764,7 +765,8 @@ gboolean state_tick(gpointer u)
 gboolean on_ctrl(gint fd, GIOCondition cond, gpointer u)
 {
     struct ctx *c = u;
-    char buf[sizeof(struct mlm_hdr) + sizeof(struct mlm_cmd) + MLM_PATH_MAX];
+    /* sized for the largest payload: an OSD burn-in cell frame (> MLM_PATH_MAX) */
+    char buf[sizeof(struct mlm_hdr) + sizeof(struct mlm_cmd) + MLM_OSD_CELL_MAX];
     const size_t head = sizeof(struct mlm_hdr) + sizeof(struct mlm_cmd);
 
     (void)cond;
@@ -821,6 +823,12 @@ gboolean on_ctrl(gint fd, GIOCondition cond, gpointer u)
             if (path && *path) {
                 rec_srt_text(c, path);
             }
+        } break;
+
+        case MLM_CMD_OSD_CELL: {
+            /* one rendered BTFL OSD cell (or a clear) for the DVR burn-in; the cell frame rides
+             * after the cmd like PLAY's path */
+            osd_burn_cell(c, (const guint8 *)buf + head, n - (gssize)head);
         } break;
 
         case MLM_CMD_DVR_RES: {

@@ -17,6 +17,7 @@
 #include "hal/input.h"
 #include "hal/telemetry.h"
 #include "hud_state.h"
+#include "osd/btfl_burn.h"
 #include "osd/btfl_osd.h"
 #include "services/linkcmd.h"
 #include "services/linkstate.h"
@@ -75,6 +76,7 @@ typedef struct {
     uint32_t       alarm_next_ms;    /* next low-voltage alarm check */
     uint32_t       sysosd_next_ms;   /* next System OSD telemetry refresh */
     uint32_t       srt_next_ms;      /* next DVR subtitle line (while recording, save_srt on) */
+    int            burn_active;      /* DVR OSD burn-in gate is open (recording + dvr.record_osd) */
     uint32_t       rec_seen_ms;      /* when RECORDING was first observed (FlightTime base); 0 = not recording */
     int            rec_autostop_sent;  /* latch: the "stream lost" record-stop toggle was already sent */
     int            rec_autostart_sent; /* latch: the "stream up" auto-record start toggle was already sent */
@@ -120,6 +122,15 @@ static void on_osd(void *ctx, const unsigned char *canvas, int len)
 {
     hud_ctx_t *h = ctx;
     h->osd_frames++;
+
+    /* DVR OSD burn-in: forward changed cells to the pipeline while the gate is open. NOT behind
+     * the visibility gates below - the recording keeps its OSD while the menu hides the on-screen
+     * one, and independent of the msp_osd overlay setting (dvr.record_osd is its own intent).
+     */
+    if (h->burn_active) {
+        btfl_burn_update(canvas, len);
+    }
+
     if (!hud_btfl_visible(h->state)) {
         return;
     }
@@ -348,6 +359,26 @@ static void srt_tick(hud_ctx_t *h, int recording, int connected, uint32_t now)
         if (settings_get_bool_in(h->settings, "dvr", "save_srt", 0)) {
             srt_send_line(h, connected, now);
         }
+    }
+}
+
+/* DVR OSD burn-in gate: open while recording with dvr.record_osd on. On the rising edge the
+ * pipeline's cell cache is cleared and the burn grid invalidated, so the next canvas re-sends
+ * every occupied cell and the two sides restart in sync (also covers a setting toggled on
+ * mid-recording). On the falling edge (setting toggled off mid-recording) the cache is cleared
+ * so the still-running recording stops burning; a recording that simply ended needs nothing
+ * (the pipeline clears its cache at record stop).
+ */
+static void burn_tick(hud_ctx_t *h, int recording)
+{
+    int active = recording && settings_get_bool_in(h->settings, "dvr", "record_osd", 0);
+
+    if (active != h->burn_active) {
+        pipecmd_osd_clear();
+        if (active) {
+            btfl_burn_invalidate();
+        }
+        h->burn_active = active;
     }
 }
 
@@ -787,6 +818,7 @@ int main(int argc, char **argv)
         tone_tick(now);   /* end any finished key-tone beep */
         alarm_tick(&h, now);
         srt_tick(&h, recording, connected, now);
+        burn_tick(&h, recording);
         sysosd_tick(&h, now);
         tempwarn_tick(&h, connected, now);
         back_longpress_tick(&h);

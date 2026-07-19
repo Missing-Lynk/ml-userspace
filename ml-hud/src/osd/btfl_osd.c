@@ -71,7 +71,7 @@ void btfl_osd_invalidate(void)
 /* Screen rectangle of grid cell (row,col). The col*W/COLS mapping aligns adjacent cells exactly, so
  * glyphs tile seamlessly across cell boundaries.
  */
-static rect_t cell_rect(int row, int col)
+rect_t btfl_osd_cell_rect(int row, int col)
 {
     int x0 = col * g_screen_width / BTFL_OSD_COLS;
     int x1 = (col + 1) * g_screen_width / BTFL_OSD_COLS;
@@ -85,7 +85,7 @@ static rect_t cell_rect(int row, int col)
 /* Clear a cell to the background, then blit its (scaled) glyph. Writes exactly the cell rectangle. */
 static void draw_cell(surface_t *dst, int row, int col, int glyph)
 {
-    rect_t rect = cell_rect(row, col);
+    rect_t rect = btfl_osd_cell_rect(row, col);
     const unsigned char *glyph_px = glyph >= 0 ? msp_font_glyph(glyph) : NULL;
 
     for (int y = 0; y < rect.h; y++) {
@@ -162,7 +162,7 @@ int btfl_osd_update(surface_t *dst, const unsigned char *canvas, int len, rect_t
             draw_cell(dst, r, c, g_new[r][c]);
 
             if (count < max_rects) {
-                rects[count] = cell_rect(r, c);
+                rects[count] = btfl_osd_cell_rect(r, c);
             } else {
                 overflow = 1;
             }
@@ -203,7 +203,7 @@ int btfl_osd_clear(surface_t *dst, rect_t *rects, int max_rects)
             g_grid[r][c] = CELL_EMPTY;
 
             if (count < max_rects) {
-                rects[count] = cell_rect(r, c);
+                rects[count] = btfl_osd_cell_rect(r, c);
             } else {
                 overflow = 1;
             }

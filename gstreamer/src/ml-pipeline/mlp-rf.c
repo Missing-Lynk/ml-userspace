@@ -117,6 +117,14 @@ static void slot_push(struct ctx *c, struct comp_slot *sl)
         return;
     }
 
+    if (c->rec_on) {
+        /* DVR OSD burn-in: overwrite the cached BTFL glyph spans into the completed composite
+         * before it is flushed, displayed and encoded. On the panel they sit exactly under the
+         * overlay plane's identical glyphs; in the recording they are the OSD.
+         */
+        osd_burn_apply(c, c->comp_pool[sl->cbi].map);
+    }
+
     /* end CPU write: flush to DDR for the DC */
     ml_dmabuf_sync(c->comp_pool[sl->cbi].fd, 0);
     if (c->rec_on) {

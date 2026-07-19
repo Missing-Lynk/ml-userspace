@@ -74,6 +74,7 @@ add_executable(hud
     src/osd/msp_canvas.c
     src/osd/msp_font.c
     src/osd/btfl_osd.c
+    src/osd/btfl_burn.c
     src/channel/osd_channel.c
     src/fb/surface.c
     src/fb/drmoverlay.c

@@ -135,6 +135,24 @@ struct rec_fmt {
                                          * into an eviction storm (composed ~1 fps, evict ~60/s).
                                          */
 
+/* One precomputed DVR OSD burn-in copy: @p len bytes from the cell's packed pixel store at
+ * @p src land at absolute composite-buffer offset @p dst (the plane base is folded in). Spans
+ * cover only the opaque glyph pixels, so the burn never reads the composite (it is WC memory)
+ * and never writes video pixels outside the glyph.
+ */
+struct osd_span {
+    guint32 dst, src, len;
+};
+
+/* One cached BTFL OSD cell (MLM_CMD_OSD_CELL): its packed Y/U/V bytes + the spans that place
+ * them. px == NULL = cell empty.
+ */
+struct osd_cell {
+    guint8 *px;
+    struct osd_span *spans;
+    int nspans;
+};
+
 struct ctx {
     int tsock;
     struct sockaddr_un taddr;
@@ -196,7 +214,7 @@ struct ctx {
                                          * buffer pins a composite pool slot */
     gboolean rec_import;                /* encoder in dmabuf-import mode (no videoscale) */
 
-    /* Downscaled DVR (plans/hw-downscaled-dvr-scaler.md): the HUD latches the recording format via
+    /* Downscaled DVR (plans/done/hw-downscaled-dvr-scaler.md): the HUD latches the recording format via
      * MLM_CMD_DVR_RES; rec_start resolves it to a g_rec_fmts row. A scaled (non-native) format runs
      * each composite through the ar_scaler on a dedicated worker thread - rec_push runs under
      * comp_lock on a decoder streaming thread, where the ~6 ms synchronous scale ioctl would stall
@@ -238,6 +256,18 @@ struct ctx {
     guint64 rec_last_ms;                /* rebased PTS of the last frame pushed to the encoder,
                                          * in ms: the cue timestamps' source, so the sidecar
                                          * tracks the MP4 timeline, not the wall clock */
+
+    /* DVR OSD burn-in (dvr.record_osd): the HUD renders each changed BTFL OSD cell with its own
+     * MSP font and sends the RGBA patch over ctrl.sock (MLM_CMD_OSD_CELL); osd_burn_cell converts
+     * it ONCE to YUV + opaque-pixel spans, and while recording osd_burn_apply overwrites the
+     * spans into every completed composite (slot_push, before the flush + rec_push) - so the
+     * recording carries exactly the glyphs the panel shows, and on screen they hide under the
+     * overlay plane's identical ones. Pure malloc state: no CMA/MMZ is spent, and the composite
+     * is only ever written (opaque overwrite, binary alpha), never read back.
+     */
+    pthread_mutex_t osd_lock;           /* guards the cell cache (ctrl thread vs decoder threads) */
+    struct osd_cell osd_cells[MLM_OSD_ROWS][MLM_OSD_COLS];
+    int osd_ncells;                     /* occupied cells (0 = burn is a no-op) */
 
     /* Composite dma-heap pool: a fixed set of contiguous CMA buffers, each scanned out
      * zero-copy by kmssink (COMP_* layout). Claimed per composite, returned to comp_free
@@ -481,6 +511,11 @@ guint32 tile_fb_get(struct ctx *c, int ch, const struct tileview *t);
 int drm_disp_init(struct ctx *c);
 void drm_disp_shutdown(struct ctx *c);
 int drm_make_idle_fb(struct ctx *c);
+
+/* osdburn */
+void osd_burn_cell(struct ctx *c, const guint8 *frame, gssize len);
+void osd_burn_clear(struct ctx *c);
+void osd_burn_apply(struct ctx *c, guint8 *map);
 
 /* record */
 gboolean rec_hw_init(struct ctx *c);
