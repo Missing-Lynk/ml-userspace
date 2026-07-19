@@ -43,7 +43,11 @@ air_unit.connected = Air unit connected
 air_unit.power = Power
 air_unit.bitrate = Bitrate
 air_unit.standby = Standby
+air_unit.temp_warn = Temperature Warning
 air_unit.camera = Camera
+
+# Warnings
+warn.overheating = OVERHEATING
 
 # Camera overlay
 camera.exposure = Exposure

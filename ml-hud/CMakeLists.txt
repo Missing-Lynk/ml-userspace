@@ -74,7 +74,8 @@ add_executable(hud
     src/ui/menu.c
     src/ui/menu_channel.c
     src/ui/player.c
-    src/ui/sysosd.c)
+    src/ui/sysosd.c
+    src/ui/tempwarn.c)
 target_include_directories(hud PRIVATE
     src src/osd src/fb src/channel src/settings src/services src/hal src/ui)
 target_link_libraries(hud PRIVATE lvgl lodepng cjson)

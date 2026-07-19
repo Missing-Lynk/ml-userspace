@@ -114,12 +114,18 @@ static const gog_item_t g_dvr_items[] = {
 static const char *const power_options[]   = { "25 mW", "100 mW", "200 mW", NULL };
 static const char *const bitrate_options[] = { "8 Mbps", "16 Mbps", "24 Mbps", NULL };
 
+/* Overheat-banner threshold against the air's transmitted temperature; the vendor threshold is
+ * 105. "Off" disables the banner (hud.c parses the label with atoi). */
+static const char *const temp_warn_options[] = { "Off", "90°C", "95°C", "100°C",
+                                                 "105°C", "110°C", "115°C", NULL };
+
 /* Air-unit settings; stored on the goggle and latched by the air unit at association (render_air_unit). */
 static const gog_item_t g_airunit_items[] = {
-    { ITEM_STEPPER, "air_unit.power",   "power",   power_options,   1, 0, "power" },
-    { ITEM_STEPPER, "air_unit.bitrate", "bitrate", bitrate_options, 2, 0, "bitrate" },
-    { ITEM_TOGGLE,  "air_unit.standby", "standby", NULL,            0, 1, "standby" },
-    { ITEM_ACTION,  "air_unit.camera",  NULL,      NULL,            0, 0, "camera" },
+    { ITEM_STEPPER, "air_unit.power",     "power",       power_options,     1, 0, "power" },
+    { ITEM_STEPPER, "air_unit.bitrate",   "bitrate",     bitrate_options,   2, 0, "bitrate" },
+    { ITEM_TOGGLE,  "air_unit.standby",   "standby",     NULL,              0, 1, "standby" },
+    { ITEM_STEPPER, "air_unit.temp_warn", "temp_warn_c", temp_warn_options, 4, 0, "" },
+    { ITEM_ACTION,  "air_unit.camera",    NULL,          NULL,              0, 0, "camera" },
 };
 #define AIRUNIT_ITEM_COUNT ((int) (sizeof(g_airunit_items) / sizeof(g_airunit_items[0])))
 

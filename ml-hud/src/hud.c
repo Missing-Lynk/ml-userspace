@@ -25,6 +25,7 @@
 #include "ui/display.h"
 #include "ui/menu.h"
 #include "ui/sysosd.h"
+#include "ui/tempwarn.h"
 #include "ui/tone.h"
 
 #include "lvgl.h"
@@ -41,6 +42,9 @@
 #define ALARM_PERIOD_MS 2000   /* low-voltage alarm chirp interval while active */
 #define SYSOSD_PERIOD_MS 1000  /* System OSD telemetry refresh interval */
 #define SRT_PERIOD_MS   1000   /* DVR subtitle-sidecar line interval while recording */
+
+#define TEMPWARN_HYST_C    5    /* the banner latches off this many deg C below the threshold */
+#define TEMPWARN_CHIRP_MS  2000 /* overheat chirp interval while the banner is latched */
 
 static volatile sig_atomic_t g_stop;
 
@@ -88,6 +92,9 @@ typedef struct {
     int            have_version;     /* saw a version frame (fw string + link metrics) */
     int            air_temp_c;       /* air-unit temperature (0x09 frame @98), whole deg C */
     int            have_air_temp;
+    int            tempwarn_latched;  /* overheat banner state, with TEMPWARN_HYST_C hysteresis */
+    int            tempwarn_shown;    /* last state pushed to the banner, for edge sync */
+    uint32_t       tempwarn_next_ms;  /* next overheat chirp while latched */
 } hud_ctx_t;
 
 static void render_and_present(hud_ctx_t *h, const unsigned char *canvas, int len)
@@ -476,6 +483,43 @@ static void nosignal_tick(hud_ctx_t *h, int connected, int state)
     }
 }
 
+/* Air-unit overheat warning: compare the transmitted air temperature (0x09 frame @98) against the
+ * air_unit.temp_warn_c threshold ("Off" parses to 0 = disabled) and drive the top-center banner.
+ * The latch has TEMPWARN_HYST_C of hysteresis and clears on link-down, so a reconnect re-evaluates
+ * fresh. This mirrors the vendor: the air sends only the raw temperature, the goggle applies the
+ * threshold (stock: >105). While latched, a chirp sounds every TEMPWARN_CHIRP_MS.
+ */
+static void tempwarn_tick(hud_ctx_t *h, int connected, uint32_t now)
+{
+    if (h->drm == NULL) {
+        return;
+    }
+
+    /* the stored value is the option label ("105°C"); atoi stops at the unit */
+    int threshold = atoi(settings_get_string_in(h->settings, "air_unit", "temp_warn_c", "105°C"));
+    if (threshold <= 0 || !connected || !h->have_air_temp) {
+        h->tempwarn_latched = 0;
+    } else if (h->air_temp_c >= threshold) {
+        h->tempwarn_latched = 1;
+    } else if (h->air_temp_c <= threshold - TEMPWARN_HYST_C) {
+        h->tempwarn_latched = 0;
+    }
+
+    if (h->tempwarn_latched != h->tempwarn_shown) {
+        tempwarn_set_active(h->tempwarn_latched);
+        if (!h->tempwarn_latched) {
+            btfl_osd_invalidate();   /* the banner erased the glyphs beneath it: full OSD redraw */
+        }
+
+        h->tempwarn_shown = h->tempwarn_latched;
+    }
+
+    if (h->tempwarn_latched && (int32_t) (now - h->tempwarn_next_ms) >= 0) {
+        h->tempwarn_next_ms = now + TEMPWARN_CHIRP_MS;
+        tone_beep(now);
+    }
+}
+
 /* System OSD refresh, on its own SYSOSD_PERIOD_MS cadence. */
 static void sysosd_tick(hud_ctx_t *h, uint32_t now)
 {
@@ -645,6 +689,7 @@ int main(int argc, char **argv)
         menu_init(settings);
         menu_apply_persisted();   /* load the saved language + push brightness/buzzer to the hardware */
         sysosd_create(lv_screen_active());
+        tempwarn_create(lv_screen_active());
     }
 
     hud_ctx_t h;
@@ -750,6 +795,7 @@ int main(int argc, char **argv)
         alarm_tick(&h, now);
         srt_tick(&h, recording, connected, now);
         sysosd_tick(&h, now);
+        tempwarn_tick(&h, connected, now);
         back_longpress_tick(&h);
         menu_state_sync(&h);
 
