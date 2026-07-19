@@ -82,6 +82,21 @@ void lat_mark_pair(struct ctx *c, GstClockTime pts)
     pthread_mutex_unlock(&c->lat_lock);
 }
 
+void lat_mark_issue(struct ctx *c, GstClockTime pts)
+{
+    if (!c->lat_on) {
+        return;
+    }
+
+    pthread_mutex_lock(&c->lat_lock);
+    struct lat_ent *e = lat_ent_get(c, pts);
+    if (!e->t_issue) {
+        e->t_issue = g_get_monotonic_time();
+    }
+
+    pthread_mutex_unlock(&c->lat_lock);
+}
+
 void lat_mark_submit(struct ctx *c, GstClockTime pts)
 {
     if (!c->lat_on) {
@@ -126,6 +141,13 @@ void lat_mark_flip(struct ctx *c, GstClockTime pts)
     c->lat_last_flip = now;
 
     struct lat_ent *e = &c->lat_ent[(pts / LAT_DUR_NS) % LAT_N];
+    if (c->lat_raw && e->pts == pts && !e->done) {
+        /* one line per flip, absolute monotonic us: exact submit/latch interleave analysis */
+        fprintf(stderr, "ml-pipeline: latraw pts=%llu pair=%lld issue=%lld sub=%lld evt=%lld\n",
+                (unsigned long long)(pts / GST_MSECOND), (long long)e->t_pair,
+                (long long)e->t_issue, (long long)e->t_submit, (long long)now);
+    }
+
     if (e->pts == pts && !e->done && e->t_rx && e->t_dec[0] && e->t_dec[1]
         && e->t_pair && e->t_submit && c->lat_acc.n < LAT_ACC_N) {
         struct lat_acc *a = &c->lat_acc;
@@ -205,6 +227,8 @@ void lat_init(struct ctx *c)
     if (!c->lat_on) {
         return;
     }
+
+    c->lat_raw = getenv("ML_LATRAW") != NULL;
 
     pthread_mutex_init(&c->lat_lock, NULL);
     memset(c->lat_ent, 0, sizeof c->lat_ent);

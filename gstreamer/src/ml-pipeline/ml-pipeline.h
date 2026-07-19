@@ -289,6 +289,8 @@ struct ctx {
       front_it, pending_it,             /* display-thread-only: on-screen / flip-in-flight */
       prev_it;                          /* retired one flip late, see drm_flip_handler */
     gint64 pending_since;               /* monotonic us when pending_it's flip was submitted */
+    gint64 flip_last_us;                /* monotonic us of the last flip event; send_state derives
+                                         * MLM_STATE_F_VIDEO_LIVE from its freshness */
     GstClockTime next_pts;
     int wake_r, wake_w;                 /* self-pipe to kick the display thread */
 
@@ -389,13 +391,15 @@ struct ctx {
      * disabled unless lat_on.
      */
     gboolean lat_on;
+    gboolean lat_raw;                   /* ML_LATRAW=1: one line per flip (short captures only) */
     pthread_mutex_t lat_lock;           /* guards lat_ent[] and the flush accumulators */
     struct lat_ent {
         GstClockTime pts;
         gint64 t_rx;                    /* first datagram of the FrameId seen in rf_rx (us) */
         gint64 t_dec[RF_NCHN];          /* tile decode-out (appsink new-sample entry) */
         gint64 t_pair;                  /* both halves complete (slot_push) */
-        gint64 t_submit;                /* flip submitted to DRM */
+        gint64 t_issue;                 /* flip ioctl entered (issue time) */
+        gint64 t_submit;                /* flip ioctl returned (submitted) */
         gboolean done;                  /* flip event consumed; ignore late duplicate marks */
     } lat_ent[256];
     struct lat_acc {                    /* completed samples since the last 1 Hz flush (us) */
@@ -482,6 +486,7 @@ void lat_init(struct ctx *c);
 void lat_mark_rx(struct ctx *c, GstClockTime pts);
 void lat_mark_dec(struct ctx *c, int ch, GstClockTime pts, gint64 t_us);
 void lat_mark_pair(struct ctx *c, GstClockTime pts);
+void lat_mark_issue(struct ctx *c, GstClockTime pts);
 void lat_mark_submit(struct ctx *c, GstClockTime pts);
 void lat_mark_flip(struct ctx *c, GstClockTime pts);
 

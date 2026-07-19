@@ -723,6 +723,10 @@ int main(int argc, char **argv)
         /* drain link/telemetry datagrams; updates air-unit + pipeline state */
         linkstate_poll(link_fd);
 
+        if (h.drm != NULL) {
+            drm_overlay_extern_refresh(h.drm, linkstate_video_live());
+        }
+
         /* ml-linkd's connection state is the single source of truth for whether a stream is
          * present; every policy below keys off this one read. */
         int state = linkstate_pipeline_state();

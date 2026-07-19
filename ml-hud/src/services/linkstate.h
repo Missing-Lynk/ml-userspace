@@ -28,6 +28,11 @@ void linkstate_set_osd_cb(const osd_channel_cb_t *cb, void *ctx);
 /** @brief Whether the air unit is currently connected (its telemetry seen within the staleness window). */
 int linkstate_airunit_connected(void);
 
+/** @brief Whether ml-pipeline reports live display flips (MLM_STATE_F_VIDEO_LIVE, fresh within 2.5 s).
+ *  While true the pipeline's own commits latch the HUD overlay's pixels, so the HUD suppresses its
+ *  per-present plane re-assert (drm_overlay_extern_refresh), which otherwise stalls video flips. */
+int linkstate_video_live(void);
+
 /** @brief Local baseband link metrics from ml-linkd's MLM_T_LINKINFO. Each returns MLM_LINKINFO_NONE
  *  (-1) until a value has been received / while the link is down, so the System OSD shows a dim
  *  placeholder. Channel is the table index the RX is tuned to (the select value); SNR is in dB;

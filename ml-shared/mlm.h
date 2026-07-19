@@ -243,6 +243,12 @@ struct mlm_state {
                                 *  awaiting the user (replay or exit). Still MLM_STATE_PLAYBACK. */
 #define MLM_STATE_F_RENDERING 0x4 /* first decoded frame is on the display (the clip is visible); before
                                    *  this the HUD keeps the menu up with a loading spinner. */
+#define MLM_STATE_F_VIDEO_LIVE 0x8 /* the pipeline is actively flipping frames to the display (a flip
+                                    *  event within the last 500 ms). Video commits latch the whole VO
+                                    *  shadow state including the HUD overlay's pixels, so while this
+                                    *  is fresh the HUD suppresses its own per-present plane re-assert
+                                    *  (a blocking SETPLANE commit that stalls the next video flip a
+                                    *  full vblank in DRM's stall_checks). */
 
 /* MLM_T_RFCMD payload (HUD -> ml-linkd on link.sock). ml-linkd owns /dev/artosyn_sdio and the
  * :10000 message channel, so the HUD never touches the air directly: it sends intent, and ml-linkd

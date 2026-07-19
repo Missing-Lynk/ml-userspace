@@ -120,6 +120,9 @@ static gboolean ditem_empty(const struct ditem *it)
     return !it->buf && !it->smp[0];
 }
 
+static void disp_try_submit(struct ctx *c);
+static int plane_commit(struct ctx *c, const struct ditem *it);
+
 static void drm_flip_handler(int fd, unsigned int seq, unsigned int tv_s,
                              unsigned int tv_us, void *data)
 {
@@ -134,6 +137,13 @@ static void drm_flip_handler(int fd, unsigned int seq, unsigned int tv_s,
         c->retire_dumps += c->retire_arm;
         c->retire_arm = 0;
     }
+
+    c->flip_last_us = g_get_monotonic_time();
+
+    /* pending_it/front_it/prev_it rotate under disp_lock: disp_try_submit runs on the
+     * COMPOSITOR thread too and reads pending_it as the flip-in-flight gate.
+     */
+    pthread_mutex_lock(&c->disp_lock);
 
     /* The event completes pending_it's flip: that frame is (about to be) latched. */
     if (!ditem_empty(&c->pending_it)) {
@@ -160,6 +170,57 @@ static void drm_flip_handler(int fd, unsigned int seq, unsigned int tv_s,
     c->front_it = c->pending_it;
     memset(&c->pending_it, 0, sizeof c->pending_it);
     c->pending_it.cbi = -1;
+    pthread_mutex_unlock(&c->disp_lock);
+
+    /* Re-arm at once: a frame parked during this flip goes out before the next latch edge
+     * instead of waiting for the poll loop, so back-to-back flips can sustain source rate.
+     */
+    disp_try_submit(c);
+}
+
+/* Submit the newest parked frame if no flip is in flight. Runs on the display thread (poll
+ * loop + flip-event handler tail) AND on the compositor thread at frame completion
+ * (drm_disp_submit): the display rate ceiling is 1 / (submit-to-event round trip), so the
+ * submit must happen at completion/event time, not on the next loop wake. The first frame
+ * after a (re)init needs the blocking modeset and stays in the display loop (!modeset_done
+ * bails here). Caller must not hold disp_lock.
+ */
+static void disp_try_submit(struct ctx *c)
+{
+    pthread_mutex_lock(&c->disp_lock);
+    if (!c->modeset_done || !ditem_empty(&c->pending_it) || ditem_empty(&c->next_it)) {
+        pthread_mutex_unlock(&c->disp_lock);
+        return;
+    }
+
+    struct ditem it = c->next_it;
+    memset(&c->next_it, 0, sizeof c->next_it);
+    c->next_it.cbi = -1;
+
+    /* A real frame is going out: video is back, drop the splash. */
+    c->show_idle = c->idle_shown = 0;
+
+    int rc;
+    lat_mark_issue(c, it.pts);
+    if (c->planes_on) {
+        rc = plane_commit(c, &it);
+    } else {
+        guint32 fbid = c->single ? it.fb[0] : c->fb_id[it.cbi];
+        rc = drmModePageFlip(c->drm_fd, c->crtc_id, fbid, DRM_MODE_PAGE_FLIP_EVENT, c);
+    }
+
+    if (rc) {
+        pthread_mutex_unlock(&c->disp_lock);
+        perror("ml-pipeline: flip submit");
+        ditem_release(&it);
+
+        return;
+    }
+
+    c->pending_it = it;
+    c->pending_since = g_get_monotonic_time();
+    pthread_mutex_unlock(&c->disp_lock);
+    lat_mark_submit(c, it.pts);
 }
 
 /* Plane-scanout: commit both tiles' FBs to video0/video1 in ONE atomic request. Both
@@ -248,11 +309,15 @@ static void drm_show_idle(struct ctx *c)
         perror("ml-pipeline: drmModeSetCrtc(no-signal)");
     }
 
-    /* Wait past the shadow latch before releasing the old frame. */
+    /* Wait past the shadow latch before releasing the old frame. Under disp_lock: the
+     * compositor-thread disp_try_submit reads pending_it as its flip-in-flight gate.
+     */
     usleep(2 * 1000000 / RF_FPS);
+    pthread_mutex_lock(&c->disp_lock);
     ditem_release(&c->prev_it);
     ditem_release(&c->front_it);
     ditem_release(&c->pending_it);
+    pthread_mutex_unlock(&c->disp_lock);
 }
 
 static void *drm_disp_run(void *arg)
@@ -295,6 +360,16 @@ static void *drm_disp_run(void *arg)
             c->idle_shown = 1;
         }
 
+        if (c->modeset_done) {
+            /* Steady state: submissions happen at frame completion (drm_disp_submit) and at
+             * flip-event time (drm_flip_handler tail); this is the fallback re-arm for wakes
+             * that raced those paths (and after a force-retire).
+             */
+            disp_try_submit(c);
+            continue;
+        }
+
+        /* First frame after a (re)init: the blocking modeset path (display-thread-only). */
         pthread_mutex_lock(&c->disp_lock);
         struct ditem it = c->next_it;
         memset(&c->next_it, 0, sizeof c->next_it);
@@ -308,49 +383,39 @@ static void *drm_disp_run(void *arg)
         c->show_idle = c->idle_shown = 0;
 
         if (c->planes_on) {
-            if (!c->modeset_done) {
-                /* Light the CRTC with the static black primary once; the tiles then ride
-                 * the overlay planes only.
-                 */
-                if (drmModeSetCrtc(c->drm_fd, c->crtc_id, c->prim_fb, 0, 0,
-                                   &c->conn_id, 1, &c->mode)) {
-                    perror("ml-pipeline: drmModeSetCrtc(primary)");
-                    ditem_release(&it);
-                    continue;
-                }
-                c->modeset_done = 1;
+            /* Light the CRTC with the static black primary once; the tiles then ride
+             * the overlay planes only.
+             */
+            if (drmModeSetCrtc(c->drm_fd, c->crtc_id, c->prim_fb, 0, 0,
+                               &c->conn_id, 1, &c->mode)) {
+                perror("ml-pipeline: drmModeSetCrtc(primary)");
+                ditem_release(&it);
+                continue;
             }
+            c->modeset_done = 1;
 
             if (plane_commit(c, &it)) {
                 perror("ml-pipeline: drmModeAtomicCommit");
                 ditem_release(&it);
             } else {
+                pthread_mutex_lock(&c->disp_lock);
                 c->pending_it = it;
                 c->pending_since = g_get_monotonic_time();
+                pthread_mutex_unlock(&c->disp_lock);
                 lat_mark_submit(c, it.pts);
             }
         } else {
             /* composite: scan out the pool buffer's FB; single: the frame's own imported FB. */
             guint32 fbid = c->single ? it.fb[0] : c->fb_id[it.cbi];
-            if (!c->modeset_done) {
-                if (drmModeSetCrtc(c->drm_fd, c->crtc_id, fbid, 0, 0,
-                                   &c->conn_id, 1, &c->mode)) {
-                    perror("ml-pipeline: drmModeSetCrtc");
-                    ditem_release(&it);
-                    continue;
-                }
-
-                c->modeset_done = 1;
-                c->front_it = it;   /* on screen now; SetCrtc gives no flip event */
-            } else if (drmModePageFlip(c->drm_fd, c->crtc_id, fbid,
-                                       DRM_MODE_PAGE_FLIP_EVENT, c)) {
-                perror("ml-pipeline: drmModePageFlip");
+            if (drmModeSetCrtc(c->drm_fd, c->crtc_id, fbid, 0, 0,
+                               &c->conn_id, 1, &c->mode)) {
+                perror("ml-pipeline: drmModeSetCrtc");
                 ditem_release(&it);
-            } else {
-                c->pending_it = it;
-                c->pending_since = g_get_monotonic_time();
-                lat_mark_submit(c, it.pts);
+                continue;
             }
+
+            c->modeset_done = 1;
+            c->front_it = it;   /* on screen now; SetCrtc gives no flip event */
         }
     }
 
@@ -376,6 +441,10 @@ void drm_disp_submit(struct ctx *c, const struct ditem *it, GstClockTime pts)
         ditem_release(&displaced);     /* never shown -> released (pool / decoder) */
     }
 
+    /* Submit right here when no flip is in flight; the wake remains for the first-frame
+     * modeset and the idle-splash logic, which stay on the display thread.
+     */
+    disp_try_submit(c);
     pipe_wake(c->wake_w);
 }
 

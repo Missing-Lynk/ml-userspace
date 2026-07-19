@@ -21,7 +21,8 @@
 static uint32_t g_last_seen_ms;   /* monotonic ms of the last air-liveness datagram; 0 = never/lost */
 static uint32_t g_pipeline_state; /* last MLM_T_STATE from ml-pipeline; defaults to MLM_STATE_IDLE (0) */
 static int      g_pipeline_seen;  /* a real MLM_T_STATE has arrived (else g_pipeline_state is the default) */
-static uint32_t g_pb_flags;       /* playback flags (MLM_STATE_F_PAUSED) from the last MLM_T_STATE */
+static uint32_t g_pb_flags;       /* state flags (MLM_STATE_F_*) from the last MLM_T_STATE */
+static uint32_t g_state_ms;       /* monotonic ms of the last MLM_T_STATE; freshness gate for the flags */
 static uint32_t g_pb_pos_ms;      /* playback position (ms) */
 static uint32_t g_pb_dur_ms;      /* playback duration (ms) */
 
@@ -115,6 +116,7 @@ void linkstate_poll(int fd)
             g_pipeline_state = st.state;
             g_pipeline_seen = 1;
             g_pb_flags = st.flags;
+            g_state_ms = now_ms();
             g_pb_pos_ms = st.pos_ms;
             g_pb_dur_ms = st.dur_ms;
         } else if (hdr.type == MLM_T_SCAN
@@ -175,6 +177,12 @@ int linkstate_playback_ended(void)
 int linkstate_playback_rendering(void)
 {
     return g_pipeline_state == MLM_STATE_PLAYBACK && (g_pb_flags & MLM_STATE_F_RENDERING) != 0;
+}
+
+int linkstate_video_live(void)
+{
+    return (g_pb_flags & MLM_STATE_F_VIDEO_LIVE) != 0
+        && g_state_ms != 0 && (uint32_t) (now_ms() - g_state_ms) < 2500;
 }
 
 int linkstate_airunit_connected(void)

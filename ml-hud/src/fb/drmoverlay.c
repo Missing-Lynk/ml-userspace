@@ -133,9 +133,22 @@ static void pack_rect(drm_overlay_t *d, const surface_t *s, int rx, int ry, int 
  * re-fetches the overlay buffer on a commit, so with no video pipeline flipping the CRTC the HUD
  * must drive its own refresh or its updates never reach the panel. The enable is logged once.
  */
+void drm_overlay_extern_refresh(drm_overlay_t *d, int on)
+{
+    d->extern_refresh = on;
+}
+
 void drm_overlay_enable(drm_overlay_t *d)
 {
     struct drm_mode_set_plane sp;
+
+    /* Video flips are latching the VO shadow state for us: a SETPLANE here is a blocking commit
+     * on the shared CRTC that stalls the next video flip a full vblank (DRM stall_checks).
+     */
+    if (d->plane_on && d->extern_refresh) {
+        return;
+    }
+
     memset(&sp, 0, sizeof sp);
     sp.plane_id = d->plane_id;
     sp.crtc_id = d->crtc_id;

@@ -470,8 +470,38 @@ static int run_file(struct ctx *c, const char *file, int plane, int drm_fd)
     return 0;
 }
 
+/* Death instrumentation: the pipeline has been observed dying silently (no log line, no
+ * kernel fault trace). Log fatal signals and plain exits so the log always shows HOW an
+ * instance ended. async-signal-safe: write(2) only.
+ */
+static void fatal_sig(int sig)
+{
+    char msg[64] = "ml-pipeline: FATAL signal 00\n";
+
+    msg[26] = (char)('0' + sig / 10);
+    msg[27] = (char)('0' + sig % 10);
+    write(2, msg, sizeof "ml-pipeline: FATAL signal 00\n" - 1);
+    _exit(128 + sig);
+}
+
+static void exit_note(void)
+{
+    static const char msg[] = "ml-pipeline: exit()\n";
+
+    write(2, msg, sizeof msg - 1);
+}
+
 int main(int argc, char **argv)
 {
+    static const int sigs[] = { SIGSEGV, SIGBUS, SIGABRT, SIGILL, SIGFPE, SIGTERM, SIGINT };
+
+    for (unsigned i = 0; i < sizeof sigs / sizeof sigs[0]; i++) {
+        struct sigaction sa = { .sa_handler = fatal_sig };
+
+        sigaction(sigs[i], &sa, NULL);
+    }
+
+    atexit(exit_note);
     setvbuf(stdout, NULL, _IOLBF, 0);   /* line-buffered: logs reach the service log promptly */
     gst_init(&argc, &argv);
     crc32_init();

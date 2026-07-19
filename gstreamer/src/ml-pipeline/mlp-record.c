@@ -694,7 +694,10 @@ void send_state(struct ctx *c)
         .s = { .state = mode,
                .flags = (c->pb_active && c->pb_paused ? MLM_STATE_F_PAUSED : 0)
                       | (c->pb_active && c->pb_ended ? MLM_STATE_F_ENDED : 0)
-                      | (c->pb_active && c->pb_rendering ? MLM_STATE_F_RENDERING : 0),
+                      | (c->pb_active && c->pb_rendering ? MLM_STATE_F_RENDERING : 0)
+                      | (c->flip_last_us != 0
+                         && g_get_monotonic_time() - c->flip_last_us < 500000
+                             ? MLM_STATE_F_VIDEO_LIVE : 0),
                .pos_ms = c->pb_active ? c->pb_pos_ms : 0,
                .dur_ms = c->pb_active ? c->pb_dur_ms : 0 },
     };

@@ -22,6 +22,9 @@ typedef struct {
     uint32_t      crtc_id, plane_id, fb_id;
     uint32_t      handle;     /* dumb-buffer GEM handle, freed in close (the fd is shared, so exit will not) */
     int           plane_on;   /* SETPLANE succeeded (CRTC was active) */
+    int           extern_refresh; /* another client's commits latch the VO shadow state (video is
+                                   * flipping): skip the per-present SETPLANE re-assert, which is a
+                                   * blocking commit that stalls the next video flip a full vblank */
 } drm_overlay_t;
 
 /**
@@ -40,6 +43,13 @@ void drm_overlay_present(drm_overlay_t *d, const surface_t *s, const rect_t *rec
  *         buffer directly (e.g. the LVGL display flush) call this to bind/scan out the plane.
  */
 void drm_overlay_enable(drm_overlay_t *d);
+
+/** @brief Tell the backend whether another client's display commits are latching the VO shadow state
+ *         (video flips live, from MLM_STATE_F_VIDEO_LIVE). While @p on and the plane is bound,
+ *         drm_overlay_enable skips its SETPLANE re-assert; the buffer pixels still reach the panel
+ *         through the video commits. The first bind always runs.
+ */
+void drm_overlay_extern_refresh(drm_overlay_t *d, int on);
 
 /** @brief Zero the whole buffer (fully transparent). Used to hand the surface between owners (menu
  *         vs BTFL OSD) so stale pixels do not linger.
