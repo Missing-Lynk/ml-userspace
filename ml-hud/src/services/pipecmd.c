@@ -50,3 +50,9 @@ void pipecmd_srt_text(const char *line)
 {
     mlm_ctrl_send(MLM_CMD_SRT_TEXT, 0, line);
 }
+
+/* DVR recording format, packed as the wire arg (height << 16 | fps). */
+void pipecmd_set_dvr_res(int height, int fps)
+{
+    mlm_ctrl_send(MLM_CMD_DVR_RES, ((uint32_t) height << 16) | (uint32_t) fps, NULL);
+}

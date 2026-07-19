@@ -11,6 +11,7 @@
 #include "buzzer.h"
 #include "i18n.h"
 #include "linkcmd.h"
+#include "pipecmd.h"
 #include "recordings.h"
 
 #include "lvgl.h"
@@ -101,7 +102,7 @@ static const char *const resolution_options[] = { "1080p 60fps", "1080p 30fps",
 
 static const gog_item_t g_dvr_items[] = {
     { ITEM_TOGGLE,   "dvr.autostart",   "autostart",  NULL,               0, 0, "" },
-    { ITEM_DROPDOWN, "dvr.resolution",  "resolution", resolution_options, 0, 0, "" },
+    { ITEM_DROPDOWN, "dvr.resolution",  "resolution", resolution_options, 0, 0, "dvr_res" },
     { ITEM_TOGGLE,   "dvr.record_osd",  "record_osd", NULL,               0, 0, "" },
     { ITEM_TOGGLE,   "dvr.save_srt",    "save_srt",   NULL,               0, 0, "" },
     { ITEM_ACTION,   "dvr.format",      NULL,         NULL,               0, 0, "format" },
@@ -475,6 +476,12 @@ static void apply_item(const gog_item_t *item, const char *value)
     } else if (strcmp(item->action, "power") == 0) {
         /* the level label ("100 mW"); linkcmd maps it to mW */
         linkcmd_set_power(value);
+    } else if (strcmp(item->action, "dvr_res") == 0) {
+        /* the option label ("720p 30fps"); the pipeline latches it for the next recording */
+        int height = 1080;
+        int fps = 60;
+        sscanf(value, "%dp %dfps", &height, &fps);
+        pipecmd_set_dvr_res(height, fps);
     } else if (strcmp(item->action, "bitrate") == 0) {
         /* the level label ("24 Mbps"); linkcmd maps it to Mbps. The air latches bitrate at
          * association, so the new value takes effect on the next session. */

@@ -113,6 +113,221 @@ static void srt_stop(struct ctx *c)
     c->srt_pend_set = FALSE;
 }
 
+/* DVR recording formats, keyed by MLM_CMD_DVR_RES height. Entry 0 is the native default: the
+ * composite itself, imported with no scale stage. Every other entry records through the
+ * ar_scaler; adding a resolution is adding a row (rec_hw_init sizes the dst pool for the
+ * largest scaled entry). Geometry constraints are in the struct rec_fmt comment (ml-pipeline.h).
+ */
+#define REC_HALIGN(h)   ((((h) + 15) / 16) * 16)
+#define REC_FMT(w, h)   { (w), (h), (w), (w) / 2, \
+                          (gsize)(w) * (h), (gsize)((w) / 2) * ((h) / 2), \
+                          (gsize)(w) * (h) + (gsize)((w) / 2) * ((h) / 2), \
+                          (gsize)(w) * (h) * 3 / 2, \
+                          (gsize)(w) * REC_HALIGN(h) * 3 / 2 }
+static const struct rec_fmt g_rec_fmts[] = {
+    REC_FMT(1920, 1080),
+    REC_FMT(1280, 720),
+};
+#define REC_NFMT        ((int) (sizeof(g_rec_fmts) / sizeof(g_rec_fmts[0])))
+#define REC_NATIVE      (&g_rec_fmts[0])
+
+/* The format row for @p height, or NULL if the table has no such format. */
+static const struct rec_fmt *rec_fmt_by_height(int height)
+{
+    for (int i = 0; i < REC_NFMT; i++) {
+        if (g_rec_fmts[i].h == height) {
+            return &g_rec_fmts[i];
+        }
+    }
+
+    return NULL;
+}
+
+/* HW downscale (scaled recording): one-time setup of the scaler fd + the scaled-dst dma-buf pool.
+ * Called from comp_pool_init at PIPELINE STARTUP, not at the first recording: the CMA heap runs
+ * steady-state ~0.3 MiB free once the composite pool / HUD overlay / DRM framebuffers are up, so
+ * a record-time allocation is guaranteed to fail (HW-observed: pool = 1 of 4, 0-byte fallback
+ * recording). At startup the rec pool claims its ~5.4 MiB first and the composite pool's adaptive
+ * grab sizes itself around it. Both persist for the process lifetime: the kernel caches dmabuf
+ * mappings per open scaler fd, and re-allocating per recording churns the heap into fragmentation.
+ * Returns FALSE (720p unavailable) when the ar_scaler module is not loaded (no CMA is spent then)
+ * or the heap yields fewer than 2 buffers.
+ */
+gboolean rec_hw_init(struct ctx *c)
+{
+    if (c->scaler_fd < 0) {
+        c->scaler_fd = open("/dev/arscaler", O_RDWR | O_CLOEXEC);
+        if (c->scaler_fd < 0) {
+            return FALSE;
+        }
+    }
+
+    if (!c->rec_free) {
+        /* One buffer size serves every scaled row: the largest scaled format's sizeimage. */
+        gsize bufsize = 0;
+        for (int i = 1; i < REC_NFMT; i++) {
+            if (g_rec_fmts[i].alloc > bufsize) {
+                bufsize = g_rec_fmts[i].alloc;
+            }
+        }
+
+        pthread_mutex_init(&c->rec_scale_lock, NULL);
+        pthread_cond_init(&c->rec_scale_cond, NULL);
+        c->rec_free = g_async_queue_new();
+        for (int i = 0; i < REC_POOL; i++) {
+            int fd = ml_heap_alloc(bufsize);
+
+            if (fd < 0) {
+                break;                  /* heap exhausted - use what we have */
+            }
+
+            c->rec_pool_fd[c->rec_pool_n] = fd;
+            g_async_queue_push(c->rec_free, GINT_TO_POINTER(c->rec_pool_n + 1));
+            c->rec_pool_n++;
+        }
+
+        fprintf(stderr, "ml-pipeline: DVR scale pool = %d x %d KiB\n",
+                c->rec_pool_n, (int) (bufsize / 1024));
+    }
+
+    return c->rec_pool_n >= 2;          /* one for the encoder + one to scale into, minimum */
+}
+
+/* A scaled dst buffer's finalize hook: return its pool slot once the encoder is done with it. */
+struct rec_ret { struct ctx *c; int idx; };
+static void rec_on_finalize(gpointer user, GstMiniObject *obj)
+{
+    struct rec_ret *h = user;
+
+    (void)obj;
+    g_async_queue_push(h->c->rec_free, GINT_TO_POINTER(h->idx + 1));
+    g_free(h);
+}
+
+/* Scale one composite into a pool dst (3-plane ar_scaler batch, COMP_* geometry in, the
+ * recording's rec_fmt geometry out), wrap the dst for the encoder's dmabuf import, and push it.
+ * Runs on the scale worker thread. Consumes the composite ref either way; the composite is
+ * pinned only for the ~6 ms scale, not the whole encode. No cache sync anywhere: the composite
+ * was flushed at slot_push and the dst is DMA-to-DMA (scaler write -> encoder read), never
+ * CPU-touched.
+ */
+static void rec_scale_one(struct ctx *c, GstBuffer *buf, GstClockTime pts)
+{
+    const struct rec_fmt *f = c->rec_fmt;
+    const guint32 soffs[3] = { 0, COMP_UOFF, COMP_VOFF };
+    const guint32 doffs[3] = { 0, (guint32) f->uoff, (guint32) f->voff };
+    const gsize dsizes[3] = { (gsize) f->lstride * f->h, f->usize, f->usize };
+    gsize voffs[GST_VIDEO_MAX_PLANES] = { 0, f->uoff, f->voff };
+    gint strd[GST_VIDEO_MAX_PLANES] = { f->lstride, f->cstride, f->cstride };
+    struct ar_scaler_dmabuf_batch batch;
+    struct rec_ret *h;
+    GstBuffer *rb;
+    int src_fd = gst_dmabuf_memory_get_fd(gst_buffer_peek_memory(buf, 0));
+    gpointer v = g_async_queue_try_pop(c->rec_free);
+
+    if (!v) {                           /* every dst pinned by the encoder: drop this frame */
+        c->rec_dropped++;
+        gst_buffer_unref(buf);
+        return;
+    }
+
+    int idx = GPOINTER_TO_INT(v) - 1;
+    int dst_fd = c->rec_pool_fd[idx];
+
+    memset(&batch, 0, sizeof batch);
+    batch.count = 3;
+    for (int p = 0; p < 3; p++) {
+        struct ar_scaler_dmabuf_op *op = &batch.ops[p];
+        guint32 sw = p ? COMP_W / 2 : COMP_W;
+        guint32 sh = p ? COMP_H / 2 : COMP_H;
+
+        op->src_fd = src_fd;
+        op->dst_fd = dst_fd;
+        op->src_off = soffs[p];
+        op->dst_off = doffs[p];
+        op->op.srcw = sw;
+        op->op.srch = sh;
+        op->op.srcstride = p ? COMP_CSTRIDE : COMP_LSTRIDE;
+        op->op.cropw = sw;
+        op->op.croph = sh;
+        op->op.dstw = (guint32) (p ? f->w / 2 : f->w);
+        op->op.dsth = (guint32) (p ? f->h / 2 : f->h);
+        op->op.dststride = (guint32) (p ? f->cstride : f->lstride);
+        op->op.channels = 1;
+    }
+
+    int rc = ioctl(c->scaler_fd, SCALER_IOC_BATCH_DMABUF, &batch);
+
+    gst_buffer_unref(buf);              /* composite slot returns to the pool now */
+    if (rc) {
+        if (!c->rec_scale_fail++) {
+            fprintf(stderr, "ml-pipeline: DVR scaler batch: %s (dropping frames)\n",
+                    strerror(errno));
+        }
+
+        g_async_queue_push(c->rec_free, GINT_TO_POINTER(idx + 1));
+        return;
+    }
+
+    rb = gst_buffer_new();
+    for (int p = 0; p < 3; p++) {
+        GstMemory *mem = gst_dmabuf_allocator_alloc(c->comp_alloc, dup(dst_fd), f->alloc);
+
+        gst_memory_resize(mem, doffs[p], dsizes[p]);
+        gst_buffer_append_memory(rb, mem);
+    }
+
+    gst_buffer_add_video_meta_full(rb, GST_VIDEO_FRAME_FLAG_NONE,
+                                   GST_VIDEO_FORMAT_I420, (guint) f->w, (guint) f->h, 3, voffs, strd);
+    h = g_malloc(sizeof *h);
+    h->c = c;
+    h->idx = idx;
+    gst_mini_object_weak_ref(GST_MINI_OBJECT(rb), rec_on_finalize, h);
+
+    GST_BUFFER_PTS(rb) = (pts != GST_CLOCK_TIME_NONE && pts >= c->rec_pts0) ? pts - c->rec_pts0 : 0;
+    c->rec_last_ms = GST_BUFFER_PTS(rb) / GST_MSECOND;
+    GST_BUFFER_DTS(rb) = GST_CLOCK_TIME_NONE;
+    if (gst_app_src_push_buffer(c->rec_src, rb) != GST_FLOW_OK) {   /* consumes the ref */
+        c->rec_dropped++;
+    } else {
+        c->rec_pushed++;
+    }
+}
+
+/* Scale worker: drains the 1-deep mailbox rec_push fills. Exists because rec_push runs under
+ * comp_lock on a decoder streaming thread, where a ~6 ms synchronous scale would stall the
+ * compositor; here the scale overlaps the next frame's compose (6 ms < the 16.7 ms frame period,
+ * so the mailbox never overflows in steady state).
+ */
+static void *rec_scale_worker(void *arg)
+{
+    struct ctx *c = arg;
+
+    for (;;) {
+        GstBuffer *buf;
+        GstClockTime pts;
+
+        pthread_mutex_lock(&c->rec_scale_lock);
+        while (c->rec_scale_run && !c->rec_scale_buf) {
+            pthread_cond_wait(&c->rec_scale_cond, &c->rec_scale_lock);
+        }
+
+        if (!c->rec_scale_run) {
+            pthread_mutex_unlock(&c->rec_scale_lock);
+            break;
+        }
+
+        buf = c->rec_scale_buf;
+        pts = c->rec_scale_pts;
+        c->rec_scale_buf = NULL;
+        pthread_mutex_unlock(&c->rec_scale_lock);
+
+        rec_scale_one(c, buf, pts);
+    }
+
+    return NULL;
+}
+
 /* Build and start the record bin. The encoder imports the composite dma-buf (output-io-mode=
  * dmabuf-import), so its input pool allocates NO CMA and there is no per-frame copy. H.264 to
  * match the vendor DVR and the scripts/dvr-frame.sh tooling.
@@ -123,24 +338,58 @@ int rec_start(struct ctx *c, const char *path)
     gchar *desc;
     GstElement *src;
     GstCaps *caps;
-    const char *res = getenv("ML_DVR_RES");   /* "720" -> downscale to 1280x720 (CPU videoscale) */
-    const char *fps = getenv("ML_DVR_FPS");   /* "30"  -> record at 30 fps */
+    const char *res = getenv("ML_DVR_RES");   /* env overrides the HUD-latched format (bench) */
+    const char *fps = getenv("ML_DVR_FPS");
     char rate[96] = "", scale[96] = "";
 
     if (c->rec_bin) {                   /* already recording */
         return 0;
     }
 
-    /* Optional levers. Framerate first (drop before scaling = less work). videorate on dmabuf
-     * passes kept frames through zero-copy; videoscale copies to system memory (no HW scaler
-     * wired), so 720p recording is CPU-bound - the base 1080p60 path stays zero-copy.
+    /* Recording format: the env levers win (bench), else the HUD's MLM_CMD_DVR_RES latch
+     * (dvr.resolution), else native. A height with no g_rec_fmts row snaps to native.
      */
-    if (fps && !strcmp(fps, "30")) {
+    const struct rec_fmt *fmt = rec_fmt_by_height(res ? atoi(res) : c->dvr_h);
+    if (fmt == NULL) {
+        fmt = REC_NATIVE;
+    }
+
+    c->rec_fps = fps ? atoi(fps) : (c->dvr_fps ? c->dvr_fps : RF_FPS);
+    if (c->rec_fps != 30) {
+        c->rec_fps = RF_FPS;
+    }
+
+    /* A scaled format prefers the ar_scaler (rec_scale_one: HW batch scale on a worker thread,
+     * encoder dmabuf-import preserved). ML_DVR_NO_HWSCALE=1 forces the CPU videoscale path
+     * (A/B bench).
+     */
+    c->rec_hwscale = fmt != REC_NATIVE && getenv("ML_DVR_NO_HWSCALE") == NULL && rec_hw_init(c);
+
+    /* A menu-requested scaled format without a working scaler records NATIVE instead of taking
+     * the CPU videoscale path: that path silently wedges the encoder on HW (bin starts, PIC_RUN
+     * entered, zero bytes ever written, no bus error - a 0-byte file with REC lit the whole
+     * flight). A native recording beats a broken scaled one. The videoscale path stays reachable
+     * only through the explicit env levers (ML_DVR_RES / ML_DVR_NO_HWSCALE) for bench work.
+     */
+    if (fmt != REC_NATIVE && !c->rec_hwscale && res == NULL && getenv("ML_DVR_NO_HWSCALE") == NULL) {
+        fprintf(stderr, "ml-pipeline: DVR %dp HW scale unavailable (scaler/pool); recording native %dp\n",
+                fmt->h, COMP_H);
+        fmt = REC_NATIVE;
+    }
+
+    c->rec_fmt = fmt;
+
+    /* CPU-path levers (env-only). Framerate first (drop before scaling = less work). videorate
+     * on dmabuf passes kept frames through zero-copy; videoscale copies to system memory, so CPU
+     * scaled recording is CPU-bound. The HW-scale path needs neither element: rec_push halves
+     * the rate pre-scale and the scaler emits the target size directly.
+     */
+    if (c->rec_fps == 30 && !c->rec_hwscale) {
         snprintf(rate, sizeof rate, "! videorate ! video/x-raw,framerate=30/1 ");
     }
 
-    if (res && !strcmp(res, "720")) {
-        snprintf(scale, sizeof scale, "! videoscale ! video/x-raw,width=1280,height=720 ");
+    if (fmt != REC_NATIVE && !c->rec_hwscale) {
+        snprintf(scale, sizeof scale, "! videoscale ! video/x-raw,width=%d,height=%d ", fmt->w, fmt->h);
     }
 
     /* Zero-copy dmabuf-import is the default: the encoder imports the composite buffers
@@ -148,15 +397,29 @@ int rec_start(struct ctx *c, const char *path)
      * COMP_ALLOC buffer sizing, the 3-plane wrap in rec_push, wave5 plane data_offset
      * support (kernel patch 0013), and the gst qbuf bytesused-offset fix
      * (gstreamer/patches/0001). ML_DVR_NO_IMPORT=1 falls back to copy mode (the encoder's
-     * own MMAP pool + per-frame memcpy); the 720p videoscale path always copies (scale
-     * output is system memory).
+     * own MMAP pool + per-frame memcpy); the CPU videoscale path always copies (scale
+     * output is system memory). The HW-scale path imports too - the scaled dst dma-bufs,
+     * wrapped in rec_scale_one - but rec_import stays FALSE (it gates rec_push's
+     * composite wrap).
      *
      * Import mode: a queued buffer pins a composite pool slot (display holds 4 of the ~10),
      * so the appsrc queue stays shallow and a lagging encoder drops frames instead of
-     * starving the display. Copy mode pins nothing; keep the deeper queue.
+     * starving the display. Copy mode pins nothing; keep the deeper queue. HW-scale mode
+     * pins REC pool slots: leave 2 outside the queue (one being scaled, one being pushed).
      */
-    c->rec_import = scale[0] == '\0' && getenv("ML_DVR_NO_IMPORT") == NULL;
-    c->rec_qmax = c->rec_import ? 3 : 6;
+    c->rec_import = !c->rec_hwscale && scale[0] == '\0' && getenv("ML_DVR_NO_IMPORT") == NULL;
+    if (c->rec_hwscale) {
+        c->rec_qmax = c->rec_pool_n - 2 < 3 ? c->rec_pool_n - 2 : 3;
+        if (c->rec_qmax < 1) {
+            c->rec_qmax = 1;
+        }
+    } else {
+        c->rec_qmax = c->rec_import ? 3 : 6;
+    }
+
+    int cap_w = c->rec_hwscale ? fmt->w : COMP_W;
+    int cap_h = c->rec_hwscale ? fmt->h : COMP_H;
+    int cap_fps = c->rec_hwscale ? c->rec_fps : RF_FPS;
 
     /* Feed the encoder the composite dmabufs themselves (output-io-mode=dmabuf-import): the
      * encoder QBUFs each buffer's fd instead of allocating an MMAP input pool and copying. That
@@ -170,7 +433,7 @@ int rec_start(struct ctx *c, const char *path)
     desc = g_strdup_printf(
         "appsrc name=recsrc is-live=true format=time do-timestamp=false "
         "max-buffers=%d leaky-type=downstream block=false "
-        "! video/x-raw,format=I420,width=%d,height=%d,framerate=60/1 "
+        "! video/x-raw,format=I420,width=%d,height=%d,framerate=%d/1 "
         "%s%s"
         "! v4l2h264enc %s "
 
@@ -179,8 +442,8 @@ int rec_start(struct ctx *c, const char *path)
          * catch. A clean stop (rec_stop EOS) still finalizes normally. Costs at most ~1 s of tail.
          */
         "! h264parse ! mp4mux fragment-duration=1000 ! filesink location=%s",
-        c->rec_qmax, COMP_W, COMP_H, rate, scale,
-        c->rec_import ? "output-io-mode=dmabuf-import" : "", path);
+        c->rec_qmax, cap_w, cap_h, cap_fps, rate, scale,
+        c->rec_import || c->rec_hwscale ? "output-io-mode=dmabuf-import" : "", path);
 
     c->rec_bin = gst_parse_launch(desc, &err);
     g_free(desc);
@@ -204,9 +467,9 @@ int rec_start(struct ctx *c, const char *path)
     c->rec_src = GST_APP_SRC(src);      /* keep this ref; released in rec_stop */
     caps = gst_caps_new_simple("video/x-raw",
                                "format", G_TYPE_STRING, "I420",
-                               "width", G_TYPE_INT, COMP_W,
-                               "height", G_TYPE_INT, COMP_H,
-                               "framerate", GST_TYPE_FRACTION, 60, 1, NULL);
+                               "width", G_TYPE_INT, cap_w,
+                               "height", G_TYPE_INT, cap_h,
+                               "framerate", GST_TYPE_FRACTION, cap_fps, 1, NULL);
     gst_app_src_set_caps(c->rec_src, caps);
     gst_caps_unref(caps);
     snprintf(c->rec_path, sizeof c->rec_path, "%s", path);
@@ -237,8 +500,23 @@ int rec_start(struct ctx *c, const char *path)
         return 1;
     }
 
+    if (c->rec_hwscale) {
+        c->rec_scale_buf = NULL;
+        c->rec_next_pts = 0;
+        c->rec_scale_run = 1;
+        if (pthread_create(&c->rec_scale_thr, NULL, rec_scale_worker, c)) {
+            fprintf(stderr, "ml-pipeline: DVR scale worker: %s\n", strerror(errno));
+            c->rec_scale_run = 0;
+            rec_stop(c);
+
+            return 1;
+        }
+    }
+
     c->rec_on = 1;
-    printf("ml-pipeline: DVR recording -> %s\n", path);
+    printf("ml-pipeline: DVR recording %dx%d@%d (%s) -> %s\n",
+           fmt->w, fmt->h, c->rec_fps,
+           c->rec_hwscale ? "HW scale" : c->rec_import ? "import" : "copy", path);
 
     return 0;
 }
@@ -251,6 +529,22 @@ void rec_stop(struct ctx *c)
     }
 
     c->rec_on = 0;
+
+    /* Stop the scale worker BEFORE touching rec_src (the worker pushes into it). A frame mid-
+     * scale finishes (join waits the ~6 ms); an undelivered mailbox frame is dropped.
+     */
+    if (c->rec_scale_run) {
+        pthread_mutex_lock(&c->rec_scale_lock);
+        c->rec_scale_run = 0;
+        pthread_cond_signal(&c->rec_scale_cond);
+        pthread_mutex_unlock(&c->rec_scale_lock);
+        pthread_join(c->rec_scale_thr, NULL);
+        if (c->rec_scale_buf) {
+            gst_buffer_unref(c->rec_scale_buf);
+            c->rec_scale_buf = NULL;
+        }
+    }
+
     srt_stop(c);
     {
         /* The watch comes off first: a bus refuses timed_pop while a watch is installed,
@@ -309,6 +603,37 @@ void rec_push(struct ctx *c, GstBuffer *buf, GstClockTime pts)
     if (!c->rec_epoch_set) {
         c->rec_pts0 = pts;
         c->rec_epoch_set = TRUE;
+    }
+
+    if (c->rec_hwscale) {
+        /* 30 fps: gate on PTS BEFORE the scale (halves the scaler work; no videorate needed).
+         * The 25 ms threshold (3/4 of the 33.3 ms period) accepts every other 16.7 ms frame
+         * and self-heals across upstream drops.
+         */
+        if (c->rec_fps == 30 && pts != GST_CLOCK_TIME_NONE) {
+            if (pts < c->rec_next_pts) {
+                return;
+            }
+
+            c->rec_next_pts = pts + (GST_SECOND * 3) / (4 * 30);
+        }
+
+        /* Hand the composite to the scale worker, newest-wins: this thread holds comp_lock and
+         * must not eat the ~6 ms scale. A still-occupied mailbox (worker behind) drops the
+         * older frame.
+         */
+        pthread_mutex_lock(&c->rec_scale_lock);
+        if (c->rec_scale_buf) {
+            gst_buffer_unref(c->rec_scale_buf);
+            c->rec_dropped++;
+        }
+
+        c->rec_scale_buf = gst_buffer_ref(buf);
+        c->rec_scale_pts = pts;
+        pthread_cond_signal(&c->rec_scale_cond);
+        pthread_mutex_unlock(&c->rec_scale_lock);
+
+        return;
     }
 
     if (c->rec_import) {
@@ -492,6 +817,18 @@ gboolean on_ctrl(gint fd, GIOCondition cond, gpointer u)
             /* one telemetry subtitle line from the HUD; text rides after the cmd like PLAY's path */
             if (path && *path) {
                 rec_srt_text(c, path);
+            }
+        } break;
+
+        case MLM_CMD_DVR_RES: {
+            /* Latch the recording format (arg = height << 16 | fps); applied at the next
+             * rec_start. Out-of-range values are ignored (the latch keeps its last good state).
+             */
+            unsigned hgt = cmd.arg >> 16;
+            unsigned rfps = cmd.arg & 0xffff;
+            if (rec_fmt_by_height((int) hgt) != NULL && (rfps == 30 || rfps == 60)) {
+                c->dvr_h = (int)hgt;
+                c->dvr_fps = (int)rfps;
             }
         } break;
 

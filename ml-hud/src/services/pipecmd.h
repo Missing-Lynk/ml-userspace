@@ -40,4 +40,10 @@ void pipecmd_show_nosignal(void);
  */
 void pipecmd_srt_text(const char *line);
 
+/**
+ * @brief Latch the DVR recording format in ml-pipeline (dvr.resolution). Applied at the NEXT
+ *  recording start; a running recording keeps its format. @p height 720 or 1080, @p fps 30 or 60.
+ */
+void pipecmd_set_dvr_res(int height, int fps);
+
 #endif /* HUD_PIPECMD_H */

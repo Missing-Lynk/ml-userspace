@@ -103,6 +103,13 @@ gboolean comp_pool_init(struct ctx *c)
             c->stage_map = NULL;
         }
     }
+
+    /* DVR 720p scaler-dst pool next (rec_hw_init; a no-op without /dev/arscaler): it must claim
+     * its ~5.4 MiB while there still is CMA to claim - steady state runs ~0.3 MiB free - and the
+     * composite grab below adapts to whatever remains, so the budget closes itself.
+     */
+    rec_hw_init(c);
+
     /* Cap the pool: the default heap is the SHARED mmz pool, and the composite allocates
      * before the two decoders claim their ~52 MiB of the same 108 MiB pool, so an uncapped
      * greedy grab would starve wave5. ML_COMP_MAX bounds it (ml-video-up sets 10 -> ~31 MiB,

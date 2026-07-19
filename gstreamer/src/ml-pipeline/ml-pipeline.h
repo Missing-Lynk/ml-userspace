@@ -53,6 +53,26 @@ struct ml_dmablit_req { gint32 dst_fd; guint32 n; struct ml_dmablit_copy copy[ML
 #define ML_DMABLIT_SUBMIT _IOW('D', 0x01, struct ml_dmablit_req)
 #define ML_DMABLIT_FLUSH  _IOW('D', 0x02, gint32)   /* explicit CPU-cache clean of a dmabuf */
 
+/* ar_scaler dmabuf UAPI (kernel/modules/ar_scaler.h) - inlined like the two ABIs above. A batch of
+ * fd-addressed crop/resize ops on /dev/arscaler: the kernel resolves fd + offset to phys (buffers
+ * must be physically contiguous), pins them for the op, and caches the mapping per open device fd -
+ * so the record path keeps ONE fd open across frames. DMA-to-DMA use (composite in, encoder import
+ * out) needs no CPU cache sync. Strides and offsets are byte counts, multiples of 16.
+ */
+struct ar_scaler_op {
+    guint32 srcphy;                     /* must be 0: kernel fills from src_fd + src_off */
+    guint32 srcw, srch, srcstride;
+    guint32 crop_x, crop_y, cropw, croph;
+    guint32 dstphy;                     /* must be 0: kernel fills from dst_fd + dst_off */
+    guint32 dstw, dsth, dststride;
+    guint32 channels;                   /* planes per op; the record path scales plane-per-op (1) */
+    guint32 control, interp, ctrl3c;
+};
+struct ar_scaler_dmabuf_op { gint32 src_fd, dst_fd; guint32 src_off, dst_off; struct ar_scaler_op op; };
+#define SCALER_DMABUF_BATCH_MAX 8
+struct ar_scaler_dmabuf_batch { guint32 count; guint32 reserved; struct ar_scaler_dmabuf_op ops[SCALER_DMABUF_BATCH_MAX]; };
+#define SCALER_IOC_BATCH_DMABUF _IOWR('Z', 4, struct ar_scaler_dmabuf_batch)
+
 #define RF_VIDEO_PORT   10001
 #define VPH_LEN         36              /* video_packet_header size */
 #define VPH_MAGIC       0x12345678u
@@ -85,6 +105,27 @@ struct ml_dmablit_req { gint32 dst_fd; guint32 n; struct ml_dmablit_copy copy[ML
  */
 #define COMP_HALIGN     (((COMP_H + 15) / 16) * 16)
 #define COMP_ALLOC      (COMP_LSTRIDE * COMP_HALIGN * 3 / 2)
+
+/* One DVR recording format (dvr.resolution): the encoder-facing I420 geometry, derived entirely
+ * from w/h with packed strides (lstride = w, cstride = w/2). alloc is the wave5 encoder's
+ * sizeimage (height rounded up to a multiple of 16). The format table is g_rec_fmts in
+ * mlp-record.c: entry 0 is the native composite geometry (imported zero-copy, no scale stage),
+ * every other entry is produced by the ar_scaler. w must be a multiple of 32 so both strides
+ * meet the scaler ABI (multiples of 16).
+ */
+struct rec_fmt {
+    int   w, h;                         /* frame size; h is the MLM_CMD_DVR_RES selector */
+    int   lstride, cstride;
+    gsize uoff, usize, voff, size, alloc;
+};
+#define REC_POOL        4               /* scaled-dst dma-buf pool: the encoder pins rec_qmax (2)
+                                         * + one being pushed + one being scaled. Allocated at
+                                         * PIPELINE STARTUP (comp_pool_init calls rec_hw_init
+                                         * before the composite grab): steady-state CmaFree is
+                                         * ~0.3 MiB, so a record-time allocation always fails -
+                                         * the pool must claim its slice while the composite pool
+                                         * can still adapt around it. Buffers are sized for the
+                                         * largest scaled format. */
 #define COMP_TILE_SIZE  (COMP_W * COMP_H * 3 / 2)   /* max packed I420 tile for the staging buffer */
 #define COMP_POOL       24              /* cap; comp_pool_init allocates as many as the heap yields.
                                          * Sizing: the display side retires one flip late (prev +
@@ -152,6 +193,33 @@ struct ctx {
     int rec_qmax;                       /* appsrc queue bound; low in import mode - every queued
                                          * buffer pins a composite pool slot */
     gboolean rec_import;                /* encoder in dmabuf-import mode (no videoscale) */
+
+    /* Downscaled DVR (plans/hw-downscaled-dvr-scaler.md): the HUD latches the recording format via
+     * MLM_CMD_DVR_RES; rec_start resolves it to a g_rec_fmts row. A scaled (non-native) format runs
+     * each composite through the ar_scaler on a dedicated worker thread - rec_push runs under
+     * comp_lock on a decoder streaming thread, where the ~6 ms synchronous scale ioctl would stall
+     * the compositor - through a 1-deep newest-only mailbox (scale 6 ms < frame 16.7 ms, so steady
+     * state never drops). The scaled dst is a pool dma-buf the encoder imports as usual; the
+     * composite buffer is pinned only for the scale, not the whole encode. Without a working
+     * scaler a menu-selected scaled format records native instead.
+     */
+    int dvr_h, dvr_fps;                 /* latched format; 0 = never set (defaults native/60) */
+    const struct rec_fmt *rec_fmt;      /* this recording's format (a g_rec_fmts row) */
+    gboolean rec_hwscale;               /* this recording scales via /dev/arscaler */
+    int rec_fps;                        /* this recording's frame rate (30 or 60) */
+    int scaler_fd;                      /* /dev/arscaler, opened once, kept (the kernel caches
+                                         * dmabuf mappings per open fd) */
+    int rec_pool_fd[REC_POOL];          /* scaled-dst dma-bufs (kept for process lifetime) */
+    int rec_pool_n;
+    GAsyncQueue *rec_free;              /* free rec_pool indices (+1, 0 == queue-empty) */
+    pthread_t rec_scale_thr;
+    volatile int rec_scale_run;
+    pthread_mutex_t rec_scale_lock;     /* guards the mailbox pair below */
+    pthread_cond_t rec_scale_cond;
+    GstBuffer *rec_scale_buf;           /* mailbox: composite awaiting scale (ref held), or NULL */
+    GstClockTime rec_scale_pts;
+    GstClockTime rec_next_pts;          /* 30 fps PTS gate (hwscale path drops pre-scale) */
+    guint64 rec_scale_fail;             /* scaler ioctl failures (frame dropped) */
 
     /* SRT telemetry sidecar (vendor DVR parity): the HUD sends one pre-formatted subtitle line
      * per second over ctrl.sock (MLM_CMD_SRT_TEXT) while recording; each line becomes one SRT
@@ -369,6 +437,7 @@ void drm_disp_shutdown(struct ctx *c);
 int drm_make_idle_fb(struct ctx *c);
 
 /* record */
+gboolean rec_hw_init(struct ctx *c);
 int rec_start(struct ctx *c, const char *path);
 void rec_stop(struct ctx *c);
 void rec_push(struct ctx *c, GstBuffer *buf, GstClockTime pts);

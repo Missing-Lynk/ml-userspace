@@ -170,6 +170,11 @@ enum mlm_cmd_type {
                             *  with the recording-relative time; ignored otherwise. The sender (the
                             *  HUD, off its telemetry cache) gates on the dvr.save_srt setting, so
                             *  no datagrams means no sidecar file. */
+    MLM_CMD_DVR_RES    = 10, /* DVR recording format: arg = (height << 16) | fps (720/1080, 30/60).
+                             *  Latched by ml-pipeline and applied at the NEXT recording start (a
+                             *  running recording keeps its format). The HUD sends it off the
+                             *  dvr.resolution setting: on change and again just before each
+                             *  record-start toggle, so a restarted pipeline reconverges. */
 };
 
 struct mlm_cmd {

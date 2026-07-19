@@ -148,6 +148,20 @@ static void on_periodic(void *ctx, const osd_header_t *header, const osd_periodi
     h->have_voltage = 1;
 }
 
+/* Push the dvr.resolution setting to the pipeline (MLM_CMD_DVR_RES latches it for the next
+ * recording start). Sent just before every record-start toggle - the datagrams are ordered on
+ * ctrl.sock, so even a freshly restarted pipeline has the format before the toggle arrives.
+ */
+static void send_dvr_format(hud_ctx_t *h)
+{
+    int height = 1080;
+    int fps = 60;
+
+    sscanf(settings_get_string_in(h->settings, "dvr", "resolution", "1080p 60fps"),
+           "%dp %dfps", &height, &fps);
+    pipecmd_set_dvr_res(height, fps);
+}
+
 /* Route a key edge to the menu. A key press also chirps the key tone unless it is disabled. When the
  * menu is closed only CENTER acts (it opens the menu); when open, keys navigate. BACK is timed: a
  * short press steps one layer back, a long press (handled in the loop) closes the menu.
@@ -171,6 +185,7 @@ static void on_button(void *ctx, hud_button_t button, hud_button_edge_t edge)
      */
     if (button == HUD_BTN_RECORD && edge == HUD_EDGE_DOWN) {
         if (linkstate_airunit_connected()) {
+            send_dvr_format(h);   /* a starting toggle records in the configured format */
             pipecmd_record_toggle();
             h->rec_is_auto = 0;   /* manual control: this recording is not auto-record's to stop */
         }
@@ -354,6 +369,7 @@ static void record_policy_tick(hud_ctx_t *h, int connected, int recording, int s
 
     if (autorecord && connected && linkstate_pipeline_seen() && state == MLM_STATE_IDLE
         && !h->rec_autostart_sent) {
+        send_dvr_format(h);        /* the auto-started recording uses the configured format */
         pipecmd_record_toggle();   /* idle-guarded: a toggle from idle starts recording */
         h->rec_autostart_sent = 1;
         h->rec_is_auto = 1;        /* auto-record owns this recording */
