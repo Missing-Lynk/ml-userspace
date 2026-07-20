@@ -521,6 +521,7 @@ int main(int argc, char **argv)
     struct ctx c = { .taddr = { .sun_family = AF_UNIX }, .dmablit_fd = -1, .stage_fd = -1,
                      .scaler_fd = -1 };
     lat_init(&c);
+    pace_init(&c);
     strncpy(c.taddr.sun_path, MLM_TELEMETRY_SOCK, sizeof c.taddr.sun_path - 1);
     c.tsock = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (c.tsock < 0) {

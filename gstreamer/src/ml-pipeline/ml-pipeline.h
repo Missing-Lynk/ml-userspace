@@ -291,6 +291,17 @@ struct ctx {
     gint64 pending_since;               /* monotonic us when pending_it's flip was submitted */
     gint64 flip_last_us;                /* monotonic us of the last flip event; send_state derives
                                          * MLM_STATE_F_VIDEO_LIVE from its freshness */
+
+    /* Display phase pacing (mlp-pace.c, ML_PACE=1): proportional servo pinning the
+     * submit-to-latch wait at ~3 ms via artosyn_vo's pclk_hz. pace_n/pace_min_us
+     * accumulate under disp_lock in the flip handler, drained by the 1 Hz tick.
+     */
+    int pace_on, pace_dbg;
+    int pace_fd;                        /* open sysfs pclk_hz */
+    long pace_base_hz, pace_cmd_hz;     /* boot rate; last commanded rate */
+    long pace_hold_hz;                  /* integral term: the servo's adapting base rate */
+    int pace_n;                         /* flips this interval */
+    gint64 pace_w[64];                  /* the interval's waits (percentile sensor); [PACE_NWAIT] */
     GstClockTime next_pts;
     int wake_r, wake_w;                 /* self-pipe to kick the display thread */
 
@@ -482,6 +493,10 @@ void *rf_rx(void *arg);
 gboolean rf_ready_tick(gpointer u);
 
 /* mlp-latstats.c: per-frame latency trace (ML_LATSTATS=1). All marks are no-ops when off. */
+/* mlp-pace.c */
+void pace_init(struct ctx *c);
+void pace_flip(struct ctx *c, gint64 wait_us);
+
 void lat_init(struct ctx *c);
 void lat_mark_rx(struct ctx *c, GstClockTime pts);
 void lat_mark_dec(struct ctx *c, int ch, GstClockTime pts, gint64 t_us);

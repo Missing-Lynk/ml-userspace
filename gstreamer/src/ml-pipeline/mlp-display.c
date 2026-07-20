@@ -148,6 +148,7 @@ static void drm_flip_handler(int fd, unsigned int seq, unsigned int tv_s,
     /* The event completes pending_it's flip: that frame is (about to be) latched. */
     if (!ditem_is_empty(&c->pending_it)) {
         lat_mark_flip(c, c->pending_it.pts);
+        pace_flip(c, c->flip_last_us - c->pending_since);
     }
 
     if (!ditem_is_empty(&c->prev_it)) {
