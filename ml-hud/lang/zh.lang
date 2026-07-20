@@ -19,6 +19,8 @@ goggles.brightness         = 亮度
 goggles.msp_osd            = MSP OSD 叠加
 goggles.show_system_osd    = 显示系统 OSD
 goggles.show_temperature   = 显示温度
+goggles.show_encoder_stats = 显示编码器状态
+goggles.show_link_throughput = 显示链路吞吐
 
 # 系统设置
 system.buzzer_volume       = 蜂鸣器音量
@@ -41,7 +43,6 @@ dvr.format_prompt = 格式化 SD 卡？
 air_unit.no_link = 未连接天空端
 air_unit.connected = 天空端已连接
 air_unit.power = 功率
-air_unit.bitrate = 码率
 air_unit.standby = 待机
 air_unit.temp_warn = 温度报警
 air_unit.camera = 摄像头

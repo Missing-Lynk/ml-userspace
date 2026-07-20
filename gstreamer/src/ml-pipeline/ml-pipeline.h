@@ -150,6 +150,8 @@ struct ctx {
     GstAppSink *asink[RF_NCHN];         /* decoded raw frames out of each decoder */
     gboolean started[RF_NCHN];          /* have we seen this tile's session-start IDR yet */
     gint64 last_fid;                    /* last FrameId pushed (for session-restart detect) */
+    volatile int sei_br_kbps[RF_NCHN];  /* latest per-tile encoder bitrate from the PREFIX_SEI (kbps) */
+    volatile int sei_qp[RF_NCHN];       /* latest per-tile encoder QP from the PREFIX_SEI */
     GstClockTime pts_epoch;             /* accumulated PTS base across sessions: a FrameId wrap
                                          * bumps the epoch so downstream PTS stays MONOTONIC and
                                          * the decoders just see one endless stream - no teardown,
@@ -415,7 +417,10 @@ struct ctx {
     } lat_ent[256];
     struct lat_acc {                    /* completed samples since the last 1 Hz flush (us) */
         gint32 rxflip[256], rxdec0[256], rxdec1[256], pairw[256], subflip[256];
-        int n;
+        int n;                          /* samples in rxflip/rxdec0/subflip */
+        int n2;                         /* samples in rxdec1/pairw (only frames whose tile 1 and
+                                         * pair marks were both seen before the flip; a frame
+                                         * latched with just tile-0 marks at startup lands in n) */
         gint32 fdt[256];                /* flip-to-flip intervals, completeness-independent */
         int nfdt;
         guint32 judder, repeat;         /* fdt outside +-20% nominal / > 1.5x nominal */
@@ -457,6 +462,7 @@ static inline void pipe_wake(int fd)
 void crc32_init(void);
 guint32 crc32_buf(const guint8 *p, int n);
 gboolean au_has_idr(const guint8 *es, int n);
+gboolean sei_parse_brqp(const guint8 *es, int n, int *br_kbps, int *qp);
 gboolean map_tile(GstSample *s, GstBuffer *buf, GstMapInfo *m, struct tileview *t);
 void emit_framestats(struct ctx *c, GstClockTime pts);
 

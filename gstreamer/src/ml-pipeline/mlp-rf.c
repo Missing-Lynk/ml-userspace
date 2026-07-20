@@ -484,6 +484,17 @@ void *rf_rx(void *arg)
 
         const guint8 *es = pkt + VPH_LEN;
 
+        /* Air encoder self-report (BR/QP) from this tile's PREFIX_SEI, for the HUD air group. Per
+         * tile: the SEI precedes the VCL NAL so the scan is bounded and cheap. Values persist until
+         * the next SEI, so a rare missing one holds the last reading rather than blanking. */
+        {
+            int br = 0, qp = 0;
+            if (sei_parse_brqp(es, stream_len, &br, &qp)) {
+                c->sei_br_kbps[chn] = br;
+                c->sei_qp[chn] = qp;
+            }
+        }
+
         if (c->last_fid >= 0 && (gint64)frame_id < c->last_fid - 8) {
             /* FrameId regression = new air session. Historical policy was a full decode
              * rebuild (rf_do_rebuild) because feeding WRAPPED PTS through desynced the
@@ -630,7 +641,8 @@ gboolean rf_ready_tick(gpointer u)
     }
 
     fprintf(stderr, "ml-pipeline: rx=%llu pushed=%llu drop=%llu q=%u/%uKiB samples=%llu/%llu "
-            "composed=%llu evict=%llu stale=%llu mapfail=%llu hold=%d blit=%llud/%lluc p0=%ums p1=%ums\n",
+            "composed=%llu evict=%llu stale=%llu mapfail=%llu hold=%d blit=%llud/%lluc p0=%ums p1=%ums "
+            "| sei br=%d/%d kbps qp=%d/%d\n",
             (unsigned long long)c->rx_pkts, (unsigned long long)c->rx_pushed,
             (unsigned long long)c->rx_dropped,
             c->src[0] ? (unsigned)(gst_app_src_get_current_level_bytes(c->src[0]) >> 10) : 0,
@@ -639,7 +651,8 @@ gboolean rf_ready_tick(gpointer u)
             (unsigned long long)c->composed, (unsigned long long)c->pair_evict,
             (unsigned long long)c->stale_drop, (unsigned long long)c->map_fail, c->t0_nhold,
             (unsigned long long)c->blit_dma, (unsigned long long)c->blit_cpu,
-            (unsigned)(c->out_pts[0] / GST_MSECOND), (unsigned)(c->out_pts[1] / GST_MSECOND));
+            (unsigned)(c->out_pts[0] / GST_MSECOND), (unsigned)(c->out_pts[1] / GST_MSECOND),
+            c->sei_br_kbps[0], c->sei_br_kbps[1], c->sei_qp[0], c->sei_qp[1]);
 
     if (c->n_prof[0] || c->n_prof[1]) {
         fprintf(stderr, "ml-pipeline: prof t0 map=%lluus blit=%lluus (n=%llu fd=%llu) | t1 map=%lluus blit=%lluus (n=%llu fd=%llu)\n",

@@ -34,6 +34,13 @@ static int g_channel = MLM_LINKINFO_NONE;
 static int g_snr_db = MLM_LINKINFO_NONE;
 static int g_distance_m = MLM_LINKINFO_NONE;
 static int g_standby;   /* air is in standby (MLM_LINKINFO_F_STANDBY): quad disarmed + standby armed */
+static int g_throughput_kbps;   /* measured PHY link throughput from MLM_T_LINKINFO; 0 = unknown / no link */
+
+/* Air encoder self-report from ml-pipeline's MLM_T_FRAMESTATS (SEI BR/QP). Fresh at ~60 Hz while
+ * video flows; g_framestats_ms gates staleness so the OSD blanks when the feed stops. */
+static int g_sei_br_kbps;
+static int g_sei_qp;
+static uint32_t g_framestats_ms;
 
 /* Last RF channel scan from ml-linkd's MLM_T_SCAN; g_scan_gen increments per scan (0 = none yet). */
 static struct mlm_scan g_scan;
@@ -109,6 +116,14 @@ void linkstate_poll(int fd)
             g_snr_db = info.snr_db;
             g_distance_m = info.distance_m;
             g_standby = (info.flags & MLM_LINKINFO_F_STANDBY) != 0;
+            g_throughput_kbps = (int) info.throughput_kbps;
+        } else if (hdr.type == MLM_T_FRAMESTATS
+                   && n >= (ssize_t) (sizeof hdr + sizeof(struct mlm_framestats))) {
+            struct mlm_framestats fs;   /* air encoder self-report (SEI BR/QP) from ml-pipeline */
+            memcpy(&fs, buf + sizeof hdr, sizeof fs);
+            g_sei_br_kbps = (int) fs.br_kbps;
+            g_sei_qp = (int) fs.qp;
+            g_framestats_ms = now_ms();
         } else if (hdr.type == MLM_T_STATE
                    && n >= (ssize_t) (sizeof hdr + sizeof(struct mlm_state))) {
             struct mlm_state st;   /* ml-pipeline's current mode (idle / recording / playback) */
@@ -208,6 +223,28 @@ int linkstate_distance_m(void)
 bool linkstate_is_standby(void)
 {
     return g_standby;
+}
+
+int linkstate_throughput_kbps(void)
+{
+    return g_throughput_kbps;
+}
+
+bool linkstate_sei_brqp(int *br_kbps, int *qp)
+{
+    if (g_framestats_ms == 0 || (uint32_t) (now_ms() - g_framestats_ms) >= 2500) {
+        return false;
+    }
+
+    if (br_kbps != NULL) {
+        *br_kbps = g_sei_br_kbps;
+    }
+
+    if (qp != NULL) {
+        *qp = g_sei_qp;
+    }
+
+    return true;
 }
 
 void linkstate_close(int fd)

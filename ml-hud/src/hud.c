@@ -82,7 +82,6 @@ typedef struct {
     int            nosignal_sent;      /* latch: the "stream lost" no-signal-splash command was already sent */
     int            standby_asserted;   /* latch: the air-unit standby state was pushed for this link-up */
     int            power_asserted;     /* latch: the air-unit TX power was pushed for this link-up */
-    int            bitrate_asserted;   /* latch: the air-unit bitrate was pushed for this link-up */
     int            channel_asserted;   /* latch: the saved RF channel was pushed for this link-up */
     int            camera_asserted;    /* latch: the saved camera/scale settings were pushed for this link-up */
     long           osd_frames;
@@ -398,9 +397,9 @@ static void record_policy_tick(hud_ctx_t *h, int connected, int recording, int s
 }
 
 /* Push the air-unit settings once per link-up; every latch clears on disconnect. The menu defaults
- * matter here: a user who never touches a row still needs standby armed and power/bitrate pushed.
- * ml-linkd re-applies standby and power on its own session restarts, and applies the bitrate via
- * SetLdCfg at association, so re-asserting on every link-up edge covers both. The channel, which
+ * matter here: a user who never touches a row still needs standby armed and power pushed.
+ * ml-linkd re-applies standby and power on its own session restarts, so re-asserting on every
+ * link-up edge covers both. The channel, which
  * ml-linkd does not persist (without this every boot lands on its bring-up default), defaults to 0
  * - the Normal-band bring-up channel - until the user picks one; ml-linkd ignores a channel outside
  * the current band's valid set, leaving its own first-valid choice in place.
@@ -411,7 +410,6 @@ static void assert_air_settings(hud_ctx_t *h, int connected)
         h->standby_asserted = 0;
         h->power_asserted = 0;
         h->channel_asserted = 0;
-        h->bitrate_asserted = 0;
         h->camera_asserted = 0;
         return;
     }
@@ -434,11 +432,6 @@ static void assert_air_settings(hud_ctx_t *h, int connected)
         }
 
         h->channel_asserted = 1;
-    }
-
-    if (!h->bitrate_asserted) {
-        linkcmd_set_bitrate(settings_get_string_in(h->settings, "air_unit", "bitrate", "24 Mbps"));
-        h->bitrate_asserted = 1;
     }
 
     if (!h->camera_asserted) {

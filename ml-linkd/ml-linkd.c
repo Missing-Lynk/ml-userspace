@@ -107,6 +107,13 @@
  * it has no call sites in the vendor stack and its u32 at +0 ticks at 1 kHz (a ms counter). */
 #define V1V1_OFF_DIST    0x08
 
+/* Get1V1Info +0x0c: measured PHY link throughput (rx_throughput), u32 LE kbps. This is link
+ * capacity, NOT the encoder bitrate (HW-confirmed: constant ~20.9 Mbps while the encoded rate and
+ * the netdev rate vary). The vendor OSD draws this same field as "Bitrate", dividing it by a
+ * hardcoded 6 in standby - we publish it raw. Reads 0 until a video link is up, so it rides the
+ * same raw>0 gate as SNR/distance. Offset HW-verified against a live 0x73 reply (be 51 = 20926). */
+#define V1V1_OFF_THROUGHPUT 0x0c
+
 /* Per-channel SNR sweep timings, from the vendor sweep (ar_lowdelay-full.txt:58393-58440). Per
  * channel it polls Get1V1Info every 10 ms until the reply's working channel matches (500 ms budget,
  * "timeout 500ms" in its own log), then settles 50 ms and takes one sample. A locked channel matches
@@ -190,6 +197,7 @@ static volatile long g_last_ack_ms;         /* last type3 ACK sent */
  * until a reply lands. */
 static volatile int g_snr_db = MLM_LINKINFO_NONE;
 static volatile int g_distance_m = MLM_LINKINFO_NONE;
+static volatile int g_throughput_kbps;      /* measured PHY link throughput (Get1V1Info +0x0c); 0 = no link */
 
 /* Raw Get1V1Info sampling for the channel sweep. g_snr_db deliberately holds the last GOOD value
  * (raw 0 replies do not overwrite it, so the OSD does not flicker), which makes it unusable for the
@@ -862,11 +870,20 @@ static void *reader(void *arg)
 
                         g_distance_m = dist < 0 ? 0 : (int)dist;
                     }
+
+                    /* measured PHY link throughput rides the same populated reply: u32 kbps at
+                     * +0x0c. Empty inter-poll replies keep the last good value, same as SNR. */
+                    if (plen >= V1V1_OFF_THROUGHPUT + 4) {
+                        g_throughput_kbps = (int)((uint32_t)payload[V1V1_OFF_THROUGHPUT]
+                                     | ((uint32_t)payload[V1V1_OFF_THROUGHPUT + 1] << 8)
+                                     | ((uint32_t)payload[V1V1_OFF_THROUGHPUT + 2] << 16)
+                                     | ((uint32_t)payload[V1V1_OFF_THROUGHPUT + 3] << 24));
+                    }
                 }
 
                 if (g_verbose) {
-                    printf(TAG " 1v1info snr_raw=%u snr_db=%d dist_m=%d\n", raw, g_snr_db,
-                           g_distance_m);
+                    printf(TAG " 1v1info snr_raw=%u snr_db=%d dist_m=%d thr_kbps=%d\n", raw, g_snr_db,
+                           g_distance_m, g_throughput_kbps);
                     fflush(stdout);
                 }
             } else if (buf[i + 5] == REPLY_CH && buf[i + 8] == GET_SCAN_RESULT) {
@@ -1274,9 +1291,10 @@ static void *udp_thread(void *arg)
                            mp_set_ld_cfg(cfg, dbm, (uint8_t) g_bitrate_mbps, g_standby_arm > 0,
                                          stamp_us),
                            MSG_DONTWAIT, (struct sockaddr *)&air_params, sizeof air_params);
+                    /* Power is the lever the air honours; the blob's bitrate_q is stored-but-ignored
+                     * on the air (HW-confirmed), so only power is worth noting. */
                     if (g_verbose) {
-                        fprintf(stderr, TAG " tx SetLdCfg (power=0x%02x bitrate=%d Mbps)\n",
-                                dbm, g_bitrate_mbps);
+                        fprintf(stderr, TAG " tx SetLdCfg (power=0x%02x)\n", dbm);
                     }
                 }
 
@@ -1584,6 +1602,12 @@ int main(int argc, char **argv)
                 .snr_db = g_air_lost ? MLM_LINKINFO_NONE : g_snr_db,
                 .distance_m = g_air_lost ? MLM_LINKINFO_NONE : g_distance_m,
                 .flags = (!g_air_lost && g_standby_state) ? MLM_LINKINFO_F_STANDBY : 0,
+                /* rx_throughput (Get1V1Info +0x0c) = measured PHY link throughput. We publish it RAW.
+                 * The vendor OSD shows this same field but divides it by a HARDCODED 6 in standby
+                 * (AR_MID_GET_REALTIME_SYS_INFO param_2[7] = uVar3 / 6, gated on the RcStatus standby
+                 * low byte) - a fixed display fudge, not a real measurement, so we deliberately do
+                 * NOT replicate it. Our number is the honest link throughput in both states. */
+                .throughput_kbps = g_air_lost ? 0 : (uint32_t)g_throughput_kbps,
             };
 
             mlm_pub(MLM_TELEMETRY_SOCK, MLM_T_LINKINFO, &info, sizeof info);
@@ -1591,8 +1615,9 @@ int main(int argc, char **argv)
 
         usleep(STEADY_STEP_US);
         if (++ticks % ALIVE_EVERY == 0) {
-            printf(TAG " alive hs=%d ready=%d acked=%d video=%d air_lost=%d\n",
-                   g_hs_done, g_ready, g_params_acked, g_video_confirmed, g_air_lost);
+            printf(TAG " alive hs=%d ready=%d acked=%d video=%d air_lost=%d thr_kbps=%d\n",
+                   g_hs_done, g_ready, g_params_acked, g_video_confirmed, g_air_lost,
+                   g_throughput_kbps);
             fflush(stdout);
         }
     }

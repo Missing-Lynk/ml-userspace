@@ -79,8 +79,10 @@ static const char *const band_options[]      = { "Race", "Normal", NULL };
 static const gog_item_t g_goggles_items[] = {
     { ITEM_STEPPER, "goggles.brightness",       "brightness",       brightness_options, 5, 0, "brightness" },
     { ITEM_STEPPER, "goggles.msp_osd",          "msp_osd",          msp_osd_options,    1, 0, "" },
-    { ITEM_TOGGLE,  "goggles.show_system_osd",  "show_system_osd",  NULL,               0, 1, "" },
-    { ITEM_TOGGLE,  "goggles.show_temperature", "show_temperature", NULL,               0, 1, "" },
+    { ITEM_TOGGLE,  "goggles.show_system_osd",      "show_system_osd",      NULL,           0, 1, "" },
+    { ITEM_TOGGLE,  "goggles.show_temperature",     "show_temperature",     NULL,           0, 1, "" },
+    { ITEM_TOGGLE,  "goggles.show_encoder_stats",   "show_encoder_stats",   NULL,           0, 0, "" },
+    { ITEM_TOGGLE,  "goggles.show_link_throughput", "show_link_throughput", NULL,           0, 0, "" },
 };
 #define GOGGLES_ITEM_COUNT ((int) (sizeof(g_goggles_items) / sizeof(g_goggles_items[0])))
 
@@ -112,7 +114,6 @@ static const gog_item_t g_dvr_items[] = {
 #define DVR_ITEM_COUNT ((int) (sizeof(g_dvr_items) / sizeof(g_dvr_items[0])))
 
 static const char *const power_options[]   = { "25 mW", "100 mW", "200 mW", NULL };
-static const char *const bitrate_options[] = { "8 Mbps", "16 Mbps", "24 Mbps", NULL };
 
 /* Overheat-banner threshold against the air's transmitted temperature; the vendor threshold is
  * 105. "Off" disables the banner (hud.c parses the label with atoi). */
@@ -122,7 +123,6 @@ static const char *const temp_warn_options[] = { "Off", "90°C", "95°C", "100°
 /* Air-unit settings; stored on the goggle and latched by the air unit at association (render_air_unit). */
 static const gog_item_t g_airunit_items[] = {
     { ITEM_STEPPER, "air_unit.power",     "power",       power_options,     1, 0, "power" },
-    { ITEM_STEPPER, "air_unit.bitrate",   "bitrate",     bitrate_options,   2, 0, "bitrate" },
     { ITEM_TOGGLE,  "air_unit.standby",   "standby",     NULL,              0, 1, "standby" },
     { ITEM_STEPPER, "air_unit.temp_warn", "temp_warn_c", temp_warn_options, 4, 0, "" },
     { ITEM_ACTION,  "air_unit.camera",    NULL,          NULL,              0, 0, "camera" },
@@ -569,10 +569,6 @@ static void apply_item(const gog_item_t *item, const char *value)
         int fps = 60;
         sscanf(value, "%dp %dfps", &height, &fps);
         pipecmd_set_dvr_res(height, fps);
-    } else if (strcmp(item->action, "bitrate") == 0) {
-        /* the level label ("24 Mbps"); linkcmd maps it to Mbps. The air latches bitrate at
-         * association, so the new value takes effect on the next session. */
-        linkcmd_set_bitrate(value);
     }
 }
 

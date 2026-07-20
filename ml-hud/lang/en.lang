@@ -19,6 +19,8 @@ goggles.brightness         = Brightness
 goggles.msp_osd            = MSP OSD Overlay
 goggles.show_system_osd    = Show System OSD
 goggles.show_temperature   = Show Temperature
+goggles.show_encoder_stats = Show Encoder Stats
+goggles.show_link_throughput = Show Link Throughput
 
 # System section
 system.buzzer_volume       = Buzzer Volume
@@ -41,7 +43,6 @@ dvr.format_prompt = Format the SD card?
 air_unit.no_link = No air unit connected
 air_unit.connected = Air unit connected
 air_unit.power = Power
-air_unit.bitrate = Bitrate
 air_unit.standby = Standby
 air_unit.temp_warn = Temperature Warning
 air_unit.camera = Camera

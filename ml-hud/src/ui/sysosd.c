@@ -17,6 +17,7 @@
 #define COLOR_WARN      lv_color_hex(0xE0633A)
 #define COLOR_REC       lv_color_hex(0xFF0000)   /* System OSD "REC" indicator (matches libre) */
 #define COLOR_PARTIAL   lv_color_hex(0xD99A2B)   /* orange: standby cue */
+#define COLOR_YELLOW    lv_color_hex(0xE8D53A)   /* downlink headroom gauge: link filling up */
 #define OSD_PAD_HOR     44
 #define OSD_FIELD_GAP   36
 #define OSD_FONT        (&lv_font_montserrat_28)
@@ -34,6 +35,9 @@
 #define OSD_MAX_TEMP     "88°C"
 #define OSD_MAX_AIRBAT   LV_SYMBOL_BATTERY_2 " 25.20V"   /* 6S full, %d.%02dV format */
 #define OSD_MAX_DISTANCE LV_SYMBOL_GPS " 8888 m"
+#define OSD_MAX_AIR_BR   "BR 88.8"         /* air encoder bitrate (SEI), own fixed field */
+#define OSD_MAX_AIR_QP   "QP 88"           /* air encoder QP (SEI), own fixed field */
+#define OSD_MAX_AIR_DL   "MAX 88.8"        /* air-unit RF-link throughput / capacity (Mbps) */
 
 /* Low-battery blink: half-period of the battery-icon blink while the alarm is active. */
 #define ALARM_TICK_MS   250
@@ -56,6 +60,9 @@ static lv_obj_t *g_lbl_standby;      /* power glyph at the left of the air group
 static lv_obj_t *g_lbl_quad_battery; /* air-unit pack (:10000 status frame) */
 static lv_obj_t *g_lbl_distance;     /* RF-ranging distance (services/linkstate) */
 static lv_obj_t *g_lbl_quad_temp;    /* air-unit temperature (:10000 @98); gated by Show Temperature */
+static lv_obj_t *g_lbl_air_br;       /* air encoder bitrate (Mbps) from the SEI (MLM_T_FRAMESTATS) */
+static lv_obj_t *g_lbl_air_qp;       /* air encoder QP from the SEI; own field so it never shifts BR */
+static lv_obj_t *g_lbl_air_dl;       /* air-unit RF-link throughput/capacity (chip Get1V1Info) */
 
 static int g_menu_open;
 static int g_force_hidden;            /* playback hides the whole bar, overriding the setting */
@@ -202,6 +209,23 @@ void sysosd_create(lv_obj_t *parent)
     g_group_right = make_group();
     g_lbl_standby = add_field(g_group_right, LV_SYMBOL_POWER, "", COLOR_PARTIAL);
     lv_obj_add_flag(g_lbl_standby, LV_OBJ_FLAG_HIDDEN);
+
+    /* Air encoder self-report (SEI BR/QP) and the air link throughput/capacity (chip Get1V1Info).
+     * Opt-in overlays, hidden until their toggle is on; leftmost of the right group so enabling one
+     * grows the bar leftward without shifting the steady distance/battery fields. */
+    g_lbl_air_br = add_field(g_group_right, NULL, "BR --.-", COLOR_TEXT_DIM);
+    lv_obj_set_width(g_lbl_air_br, field_width(OSD_MAX_AIR_BR));
+    lv_obj_set_style_text_align(g_lbl_air_br, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_add_flag(g_lbl_air_br, LV_OBJ_FLAG_HIDDEN);
+    g_lbl_air_qp = add_field(g_group_right, NULL, "QP --", COLOR_TEXT_DIM);
+    lv_obj_set_width(g_lbl_air_qp, field_width(OSD_MAX_AIR_QP));
+    lv_obj_set_style_text_align(g_lbl_air_qp, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_add_flag(g_lbl_air_qp, LV_OBJ_FLAG_HIDDEN);
+    g_lbl_air_dl = add_field(g_group_right, NULL, "MAX --.-", COLOR_TEXT_DIM);
+    lv_obj_set_width(g_lbl_air_dl, field_width(OSD_MAX_AIR_DL));
+    lv_obj_set_style_text_align(g_lbl_air_dl, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_add_flag(g_lbl_air_dl, LV_OBJ_FLAG_HIDDEN);
+
     g_lbl_quad_temp = add_field(g_group_right, NULL, "--°C", COLOR_TEXT_DIM);
     lv_obj_set_width(g_lbl_quad_temp, field_width(OSD_MAX_TEMP));
     lv_obj_set_style_text_align(g_lbl_quad_temp, LV_TEXT_ALIGN_RIGHT, 0);
@@ -366,6 +390,80 @@ static void update_air_fields(const air_telem_t *air, int show_temp)
     }
 }
 
+/* Colour the downlink rate by how close it runs to the link capacity (MAX = PHY throughput, chip
+ * Get1V1Info +0x0c). The air targets ~70% of goodput, so the calm band runs to ~78%; yellow/orange/
+ * red flag the shrinking margin - a red flash means the link dipped before the encoder backed off,
+ * i.e. breakup imminent. Neutral white when there is no capacity reading. */
+static lv_color_t downlink_color(float dl_mbps, int max_kbps)
+{
+    if (max_kbps <= 0 || dl_mbps <= 0.0f) {
+        return COLOR_TEXT;
+    }
+
+    int pct = (int) (dl_mbps * 1000.0f * 100.0f / (float) max_kbps + 0.5f);
+    if (pct < 45) {
+        return COLOR_TEXT;      /* low usage, ample headroom */
+    }
+
+    if (pct < 78) {
+        return COLOR_GREEN;     /* healthy - the ~70% steady-state target lives here */
+    }
+
+    if (pct < 88) {
+        return COLOR_YELLOW;
+    }
+
+    if (pct < 94) {
+        return COLOR_PARTIAL;   /* orange */
+    }
+
+    return COLOR_REC;           /* red: at capacity, breakup risk */
+}
+
+/* Air encoder self-report (SEI BR/QP from ml-pipeline) and the air link throughput / capacity (chip
+ * Get1V1Info via ml-linkd). Both are opt-in overlays: hidden unless their toggle is on. Values dim
+ * to placeholders when the feed is stale or the link is down. Rates are kbps -> Mbps, one decimal. */
+static void update_air_encoder_fields(int connected, int show_encoder, int show_throughput)
+{
+    if (show_encoder) {
+        int br_kbps = 0, qp = 0;
+        if (linkstate_sei_brqp(&br_kbps, &qp) && br_kbps > 0) {
+            int tenths = (br_kbps + 50) / 100;
+            lv_label_set_text_fmt(g_lbl_air_br, "BR %d.%d", tenths / 10, tenths % 10);
+            lv_label_set_text_fmt(g_lbl_air_qp, "QP %d", qp);
+            lv_obj_set_style_text_color(g_lbl_air_br, COLOR_TEXT, 0);
+            lv_obj_set_style_text_color(g_lbl_air_qp, COLOR_TEXT, 0);
+        } else {
+            lv_label_set_text(g_lbl_air_br, "BR --.-");
+            lv_label_set_text(g_lbl_air_qp, "QP --");
+            lv_obj_set_style_text_color(g_lbl_air_br, COLOR_TEXT_DIM, 0);
+            lv_obj_set_style_text_color(g_lbl_air_qp, COLOR_TEXT_DIM, 0);
+        }
+
+        lv_obj_remove_flag(g_lbl_air_br, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(g_lbl_air_qp, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(g_lbl_air_br, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(g_lbl_air_qp, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    if (show_throughput) {
+        int max_kbps = linkstate_throughput_kbps();
+        if (connected && max_kbps > 0) {
+            int tenths = (max_kbps + 50) / 100;
+            lv_label_set_text_fmt(g_lbl_air_dl, "MAX %d.%d", tenths / 10, tenths % 10);
+            lv_obj_set_style_text_color(g_lbl_air_dl, COLOR_TEXT, 0);
+        } else {
+            lv_label_set_text(g_lbl_air_dl, "MAX --.-");
+            lv_obj_set_style_text_color(g_lbl_air_dl, COLOR_TEXT_DIM, 0);
+        }
+
+        lv_obj_remove_flag(g_lbl_air_dl, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(g_lbl_air_dl, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
 void sysosd_update(const telemetry_t *telemetry, const air_telem_t *air, settings_t *settings)
 {
     if (g_osd == NULL) {
@@ -389,10 +487,13 @@ void sysosd_update(const telemetry_t *telemetry, const air_telem_t *air, setting
 
     int connected = linkstate_is_airunit_connected();
     int show_temp = settings_get_bool_in(settings, GOG_SECTION, "show_temperature", 1);
+    int show_encoder = settings_get_bool_in(settings, GOG_SECTION, "show_encoder_stats", 0);
+    int show_throughput = settings_get_bool_in(settings, GOG_SECTION, "show_link_throughput", 0);
 
     update_goggle_battery(telemetry, settings);
     update_link_fields(connected, settings);
     update_air_fields(air, show_temp);
+    update_air_encoder_fields(connected, show_encoder, show_throughput);
 
     if (telemetry->have_sdcard) {
         lv_label_set_text_fmt(g_lbl_sdcard, "%s %dG", LV_SYMBOL_SD_CARD, (int) (telemetry->sd_free_gb + 0.5f));
@@ -406,7 +507,10 @@ void sysosd_update(const telemetry_t *telemetry, const air_telem_t *air, setting
     if (telemetry->have_bitrate) {
         int tenths = (int) (telemetry->bitrate_mbps * 10.0f + 0.5f);
         lv_label_set_text_fmt(g_lbl_bitrate, "%s %d.%d Mbps", LV_SYMBOL_DOWNLOAD, tenths / 10, tenths % 10);
-        lv_obj_set_style_text_color(g_lbl_bitrate, COLOR_TEXT, 0);
+        /* colour by headroom against the link capacity (MAX): calm when there is margin, red near
+         * saturation. Uses MAX even when its overlay is off, so the gauge always works. */
+        lv_obj_set_style_text_color(g_lbl_bitrate,
+                                    downlink_color(telemetry->bitrate_mbps, linkstate_throughput_kbps()), 0);
     } else {
         lv_label_set_text_fmt(g_lbl_bitrate, "%s --.- Mbps", LV_SYMBOL_DOWNLOAD);
         lv_obj_set_style_text_color(g_lbl_bitrate, COLOR_TEXT_DIM, 0);

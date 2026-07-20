@@ -54,8 +54,13 @@ struct mlm_hdr {
 
 struct mlm_framestats {
     uint32_t frame_id;
-    uint32_t reserved;
-    uint64_t pts_ns; /* GStreamer buffer PTS (GST_CLOCK_TIME_NONE = ~0ull) */
+    uint32_t br_kbps; /* combined air-encoder bitrate, kbps (0 = no SEI yet). Was `reserved`. */
+    uint64_t pts_ns;  /* GStreamer buffer PTS (GST_CLOCK_TIME_NONE = ~0ull) */
+    uint32_t qp;      /* air-encoder QP, tile 0 (0 = no SEI yet) */
+    /* br_kbps/qp are SEI-derived (in-band H.265 PREFIX_SEI, NAL 39, ASCII "... BR <kbps> QP <n>"):
+     * br_kbps sums both tiles, qp is tile 0. br_kbps reuses the old `reserved` slot and qp is
+     * appended, so {frame_id, pts_ns} keep their offsets and a pre-SEI consumer reading only that
+     * prefix stays compatible. */
 } __attribute__((packed));
 
 struct mlm_ready {
@@ -97,6 +102,8 @@ struct mlm_linkinfo {
     int32_t  snr_db;       /* link SNR in dB (from Get1V1Info), or MLM_LINKINFO_NONE */
     int32_t  distance_m;   /* RF-ranging distance in metres, or MLM_LINKINFO_NONE (not ranging) */
     uint32_t flags;        /* MLM_LINKINFO_F_* validity/state bits */
+    uint32_t throughput_kbps; /* measured PHY link throughput / capacity (Get1V1Info +0x0c); NOT the
+                            * encoder bitrate. 0 = unknown / no video link. Appended, older readers ignore. */
 } __attribute__((packed));
 
 /* The air unit is currently in standby (its work-mode sync, :10000 SetStandyMode 0x12, reports

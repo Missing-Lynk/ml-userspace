@@ -43,6 +43,15 @@ int linkstate_channel(void);
 int linkstate_snr_db(void);
 int linkstate_distance_m(void);
 
+/** @brief Measured PHY link throughput / capacity (kbps) from ml-linkd's MLM_T_LINKINFO (Get1V1Info
+ *  +0x0c) - the link's carrying capacity, NOT the encoder bitrate. 0 = unknown / no video link. */
+int linkstate_throughput_kbps(void);
+
+/** @brief Air encoder self-report (SEI BR/QP) from ml-pipeline's MLM_T_FRAMESTATS. @return true if a
+ *  framestats record arrived within the freshness window (br_kbps/qp then written, may be NULL),
+ *  false when stale/never so the System OSD blanks the fields. br_kbps sums both tiles; qp is tile 0. */
+bool linkstate_sei_brqp(int *br_kbps, int *qp);
+
 /** @brief Whether the air unit is currently in standby (quad disarmed + standby armed), from
  *  ml-linkd's SetStandyMode readback. 0 when active or no link. */
 bool linkstate_is_standby(void);

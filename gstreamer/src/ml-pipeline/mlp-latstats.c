@@ -148,18 +148,27 @@ void lat_mark_flip(struct ctx *c, GstClockTime pts)
                 (long long)e->t_issue, (long long)e->t_submit, (long long)now);
     }
 
-    if (e->pts == pts && !e->done && e->t_rx && e->t_dec[0] && e->t_dec[1]
-        && e->t_pair && e->t_submit && c->lat_acc.n < LAT_ACC_N) {
+    /* rx2flip/dec0/sub2flip are recorded for every latched frame; dec1/pair only when both
+     * were seen before the flip (a frame latched with just tile-0 marks at startup is skipped
+     * for those), so they carry their own count.
+     */
+    if (e->pts == pts && !e->done && e->t_rx && e->t_dec[0]
+        && e->t_submit && c->lat_acc.n < LAT_ACC_N) {
         struct lat_acc *a = &c->lat_acc;
         gint64 d0 = e->t_dec[0] - e->t_rx;
-        gint64 d1 = e->t_dec[1] - e->t_rx;
 
         a->rxflip[a->n] = (gint32)(now - e->t_rx);
         a->rxdec0[a->n] = (gint32)d0;
-        a->rxdec1[a->n] = (gint32)d1;
-        a->pairw[a->n] = (gint32)(d0 > d1 ? d0 - d1 : d1 - d0);
         a->subflip[a->n] = (gint32)(now - e->t_submit);
         a->n++;
+        if (e->t_dec[1] && e->t_pair && a->n2 < LAT_ACC_N) {
+            gint64 d1 = e->t_dec[1] - e->t_rx;
+
+            a->rxdec1[a->n2] = (gint32)d1;
+            a->pairw[a->n2] = (gint32)(d0 > d1 ? d0 - d1 : d1 - d0);
+            a->n2++;
+        }
+
         e->done = TRUE;
     }
 
@@ -206,16 +215,16 @@ static gboolean lat_flush_tick(gpointer u)
 
     qsort(a.rxflip, a.n, sizeof a.rxflip[0], cmp_i32);
     qsort(a.rxdec0, a.n, sizeof a.rxdec0[0], cmp_i32);
-    qsort(a.rxdec1, a.n, sizeof a.rxdec1[0], cmp_i32);
-    qsort(a.pairw, a.n, sizeof a.pairw[0], cmp_i32);
+    qsort(a.rxdec1, a.n2, sizeof a.rxdec1[0], cmp_i32);
+    qsort(a.pairw, a.n2, sizeof a.pairw[0], cmp_i32);
     qsort(a.subflip, a.n, sizeof a.subflip[0], cmp_i32);
     qsort(a.fdt, a.nfdt, sizeof a.fdt[0], cmp_i32);
 
     fprintf(stderr, "ml-pipeline: lat n=%d rx2flip p50=%.1f p99=%.1f | rx2dec %.1f/%.1f "
             "pair %.1f sub2flip %.1f | fdt p50=%.1f p99=%.1f jud=%u rep=%u (ms)\n",
             a.n, pct(a.rxflip, a.n, 50), pct(a.rxflip, a.n, 99),
-            pct(a.rxdec0, a.n, 50), pct(a.rxdec1, a.n, 50),
-            pct(a.pairw, a.n, 50), pct(a.subflip, a.n, 50),
+            pct(a.rxdec0, a.n, 50), pct(a.rxdec1, a.n2, 50),
+            pct(a.pairw, a.n2, 50), pct(a.subflip, a.n, 50),
             pct(a.fdt, a.nfdt, 50), pct(a.fdt, a.nfdt, 99), a.judder, a.repeat);
 
     return G_SOURCE_CONTINUE;
