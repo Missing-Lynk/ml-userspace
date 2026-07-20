@@ -13,6 +13,7 @@ nav.playback = 回放
 channel.scanning = 扫描中...
 channel.scan_hint = 按中键扫描
 channel.no_link = 无频道
+channel.refresh = 刷新
 
 # 眼镜设置
 goggles.brightness         = 亮度

@@ -13,6 +13,7 @@ nav.playback = Playback
 channel.scanning = Scanning...
 channel.scan_hint = Press CENTER to scan
 channel.no_link = No channels
+channel.refresh = Refresh
 
 # Goggles section
 goggles.brightness         = Brightness

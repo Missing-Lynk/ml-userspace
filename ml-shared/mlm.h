@@ -116,7 +116,12 @@ struct mlm_linkinfo {
  * Standard/Race mode, and `valid_bmp` is the current mode's valid-channel mask (bit i = index i
  * valid). `snr_db` does NOT come from that reply, which carries no per-channel SNR: ml-linkd
  * measures it by visiting each valid channel and reading Get1V1Info there, so only valid channels
- * carry a value and out-of-mode entries carry MLM_SCAN_SIGNAL_NONE. */
+ * carry a value and out-of-mode entries carry MLM_SCAN_SIGNAL_NONE.
+ *
+ * ml-linkd also publishes a table-only seed (`measured` = 0, every channel's SNR unmeasured) at
+ * link-up and on a slow cadence, without sweeping, so the HUD can show the channel grid from the
+ * start; a full sweep republishes with `measured` = 1. The retune-and-measure sweep, which interrupts
+ * video, stays a one-shot on an explicit HUD request. */
 #define MLM_SCAN_MAX_CH     19
 #define MLM_SCAN_SIGNAL_NONE INT16_MIN     /* snr_db has no value (snr_raw <= 0) */
 
@@ -137,7 +142,8 @@ struct mlm_scan {
     uint32_t valid_bmp;  /* current mode's valid-channel bitmap (bit i set = index i selectable now) */
     uint8_t  count;      /* number of entries in chan[] */
     uint8_t  active_idx; /* table index the local RX is currently tuned to (for the active highlight) */
-    uint8_t  pad[2];
+    uint8_t  measured;   /* 1 = snr_* came from a completed sweep; 0 = table-only seed (SNRs unmeasured) */
+    uint8_t  pad[1];
     struct mlm_scan_chan chan[MLM_SCAN_MAX_CH];
 } __attribute__((packed));
 

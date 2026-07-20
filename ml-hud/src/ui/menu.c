@@ -1546,10 +1546,11 @@ void menu_open(void)
     g_section = SECTION_CHANNEL;   /* a fresh open always starts at the top section */
     menu_channel_reset();
 
-    /* The channel grid is the section a fresh open lands on, so opening the menu IS opening the
-     * channel screen: scan here too, not only on menu_center. Without this the grid renders from
-     * whatever the last scan left behind - stale readings presented as current. */
-    menu_channel_request_scan();
+    /* No scan is fired on open: the sweep retunes the RX across every channel and interrupts video,
+     * which can knock a flying pilot's link, so opening the menu must stay passive. A fresh open
+     * lands focus in the sidebar; the sweep runs only when the channel section is actively entered
+     * (menu_center) or the grid's Refresh button is pressed. The grid renders the last scan, or a
+     * "press CENTER to scan" hint when none has run yet. */
     render_content();
     enter_sidebar_zone();
     g_is_open = 1;

@@ -81,6 +81,7 @@
 #define POLL_LINK_EVERY  4                /* Get1V1Info every Nth STEADY tick (~6 Hz) */
 #define FF02_EVERY       7                /* ff02 every Nth STEADY tick (~3.4 Hz) */
 #define LINKINFO_EVERY   24               /* publish MLM_T_LINKINFO every Nth STEADY tick (~1 Hz) */
+#define SCAN_TABLE_EVERY 48               /* republish the seeded channel table every Nth tick (~2 s) */
 #define SEQ_START        0x15             /* initial poll sequence number */
 
 /* The baseband channel index we tune the local RX to at OPEN (SET_CHNIDX). Single source of truth:
@@ -530,6 +531,32 @@ static int first_valid_idx(uint32_t bmp)
     return -1;
 }
 
+/* Publish the cached channel table (measured = 0) so the HUD's channel grid shows every channel
+ * without a sweep. Carries whatever SNRs g_scan holds - after a sweep those are the measured readings
+ * - but never the measured=1 edge, which scan_sweep emits exactly once on completion so the HUD's
+ * "scanning" spinner clears only on a real sweep, not on one of these table publishes. A no-op until
+ * the table has been seeded once. Same STEADY thread as scan_sweep, so it never runs mid-sweep. */
+static void scan_table_publish(void)
+{
+    if (!g_scan_ready) {
+        return;
+    }
+
+    g_scan.active_idx = (uint8_t)g_cur_chnidx;
+    g_scan.measured = 0;
+    mlm_pub(MLM_TELEMETRY_SOCK, MLM_T_SCAN, &g_scan, sizeof g_scan);
+}
+
+/* Publish a completed sweep: active_idx = @p restore, measured = 1 for this one publish only (a
+ * one-shot edge, so the cadence's table publishes stay measured=0 and never clear the HUD spinner). */
+static void scan_publish_swept(int restore)
+{
+    g_scan.active_idx = (uint8_t)restore;
+    g_scan.measured = 1;
+    mlm_pub(MLM_TELEMETRY_SOCK, MLM_T_SCAN, &g_scan, sizeof g_scan);
+    g_scan.measured = 0;
+}
+
 /* Retune the RX onto the band if OPEN left it off it. OPEN_CHNIDX is a Race index, so a Normal-band
  * chip (chan_valid_bmp = 0x7, indices 0..2) comes up tuned outside its own valid set: the channel
  * grid then shows 3 tiles with the active one among none of them, and the OSD reports a channel the
@@ -538,6 +565,9 @@ static int first_valid_idx(uint32_t bmp)
  *
  * Runs once at the end of OPEN, before the air is associated: retuning here costs nothing, whereas
  * doing it later would drop a working link. Cheap - the raw GetScanResult does not sweep.
+ *
+ * Publishes the seeded table so the HUD's channel grid shows every channel from the start without a
+ * sweep; the STEADY cadence keeps it fresh for a HUD that starts later.
  */
 static void tune_into_band(uint8_t *frame, uint32_t *seq_link)
 {
@@ -558,25 +588,24 @@ static void tune_into_band(uint8_t *frame, uint32_t *seq_link)
         usleep(5000);
     }
 
-    if ((g_scan.valid_bmp >> g_cur_chnidx) & 1) {
-        return;   /* already on a channel this band allows */
+    /* Retune onto the band if OPEN left the RX off it. */
+    if (!((g_scan.valid_bmp >> g_cur_chnidx) & 1)) {
+        first = first_valid_idx(g_scan.valid_bmp);
+        if (first < 0) {
+            printf(TAG " band: valid_bmp=0x%08x has no channel, staying on ch%d\n",
+                   g_scan.valid_bmp, g_cur_chnidx);
+            fflush(stdout);
+        } else {
+            printf(TAG " band: ch%d is outside valid_bmp=0x%08x, retuning to ch%d\n",
+                   g_cur_chnidx, g_scan.valid_bmp, first);
+            fflush(stdout);
+            send_frame(frame, bb_select_channel(frame, (uint8_t)first, (*seq_link)++), "band-retune");
+            g_cur_chnidx = first;
+            usleep(OPEN_STEP_US);
+        }
     }
 
-    first = first_valid_idx(g_scan.valid_bmp);
-    if (first < 0) {
-        printf(TAG " band: valid_bmp=0x%08x has no channel, staying on ch%d\n",
-               g_scan.valid_bmp, g_cur_chnidx);
-        fflush(stdout);
-        return;
-    }
-
-    printf(TAG " band: ch%d is outside valid_bmp=0x%08x, retuning to ch%d\n",
-           g_cur_chnidx, g_scan.valid_bmp, first);
-    fflush(stdout);
-
-    send_frame(frame, bb_select_channel(frame, (uint8_t)first, (*seq_link)++), "band-retune");
-    g_cur_chnidx = first;
-    usleep(OPEN_STEP_US);
+    scan_table_publish();   /* active_idx reflects any retune just done */
 }
 
 /* Send one Get1V1Info and wait for its reply. @return 1 on a fresh reply (g_v1v1_raw / g_v1v1_chan
@@ -728,8 +757,7 @@ static void scan_sweep(uint8_t *frame, uint32_t *seq_link)
             g_scan.chan[order[k]].snr_raw = MLM_SCAN_RAW_NOLOCK;
         }
 
-        g_scan.active_idx = (uint8_t)restore;
-        mlm_pub(MLM_TELEMETRY_SOCK, MLM_T_SCAN, &g_scan, sizeof g_scan);
+        scan_publish_swept(restore);
         printf(TAG " scan: no air unit (hs=%d air_lost=%d), %d channels reported unmeasured\n",
                g_hs_done, g_air_lost, n);
         fflush(stdout);
@@ -779,8 +807,7 @@ static void scan_sweep(uint8_t *frame, uint32_t *seq_link)
 
     send_frame(frame, bb_set_mcs_mode(frame, MCS_MODE_AUTO, (*seq_link)++), "sweep-mcs-auto");
 
-    g_scan.active_idx = (uint8_t)restore;
-    mlm_pub(MLM_TELEMETRY_SOCK, MLM_T_SCAN, &g_scan, sizeof g_scan);
+    scan_publish_swept(restore);
     printf(TAG " scan: swept %d channels, active %d restored\n", n, restore);
     fflush(stdout);
 }
@@ -1611,6 +1638,11 @@ int main(int argc, char **argv)
             };
 
             mlm_pub(MLM_TELEMETRY_SOCK, MLM_T_LINKINFO, &info, sizeof info);
+        }
+
+        /* Keep the seeded channel table available to a HUD that started late (measured=0, no sweep). */
+        if (ticks % SCAN_TABLE_EVERY == 0) {
+            scan_table_publish();
         }
 
         usleep(STEADY_STEP_US);
