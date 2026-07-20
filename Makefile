@@ -16,6 +16,17 @@
 REPO  := $(abspath .)
 BUILD := $(REPO)/build
 
+# Device capability flags. The wrapper passes these from the device manifest (devices/<name>/device.mk);
+# when userspace/ is built standalone they default to the goggle. Forwarded to the ml-hud build as -D
+# defines so the device-agnostic UI code can gate per-device features (menu items a device lacks).
+DEV_HAS_DISPLAY  ?= 1
+DEV_HAS_CAMERA   ?= 0
+DEV_HAS_KEYPAD   ?= 1
+DEV_HAS_BUZZER   ?= 1
+DEV_HAS_LED      ?= 1
+DEV_HAS_DVR      ?= 1
+DEV_HAS_FC_LINK  ?= 0
+
 all: daemons gst gst-static hud font
 
 daemons:    $(BUILD)/ml-linkd $(BUILD)/ml-ledd $(BUILD)/ml-rf-bringup
@@ -47,7 +58,10 @@ gst-static:
 	./gstreamer/scripts/build-static.sh
 
 hud:
-	cmake -S ml-hud -B ml-hud/build -DCMAKE_TOOLCHAIN_FILE=$(REPO)/ml-hud/cmake/aarch64-static.cmake
+	cmake -S ml-hud -B ml-hud/build -DCMAKE_TOOLCHAIN_FILE=$(REPO)/ml-hud/cmake/aarch64-static.cmake \
+	  -DDEV_HAS_DISPLAY=$(DEV_HAS_DISPLAY) -DDEV_HAS_CAMERA=$(DEV_HAS_CAMERA) \
+	  -DDEV_HAS_KEYPAD=$(DEV_HAS_KEYPAD) -DDEV_HAS_BUZZER=$(DEV_HAS_BUZZER) \
+	  -DDEV_HAS_LED=$(DEV_HAS_LED) -DDEV_HAS_DVR=$(DEV_HAS_DVR) -DDEV_HAS_FC_LINK=$(DEV_HAS_FC_LINK)
 	cmake --build ml-hud/build -j$(shell nproc)
 
 font: assets/osd-fonts/font_BTFL_hd.png

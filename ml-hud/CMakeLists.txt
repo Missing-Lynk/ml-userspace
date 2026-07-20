@@ -11,6 +11,26 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 add_compile_options(-O2 -Wall -Wextra)
 
+# Device capabilities, the single source is the wrapper manifest (devices/<name>/device.mk), passed in
+# by userspace/Makefile as -DDEV_HAS_*. Defaults here = the goggle, so a standalone `cmake -S ml-hud`
+# is unchanged. Emitted as compile-time defines (DEV_HAS_DISPLAY etc.) so the UI code stays device-
+# agnostic and gates per-device features at build time (no runtime manifest dependency).
+set(DEV_HAS_DISPLAY 1 CACHE STRING "device has a built-in display")
+set(DEV_HAS_CAMERA  0 CACHE STRING "device has a camera (air unit)")
+set(DEV_HAS_KEYPAD  1 CACHE STRING "device has a keypad")
+set(DEV_HAS_BUZZER  1 CACHE STRING "device has a buzzer")
+set(DEV_HAS_LED     1 CACHE STRING "device has an LED")
+set(DEV_HAS_DVR     1 CACHE STRING "device has onboard SD DVR")
+set(DEV_HAS_FC_LINK 0 CACHE STRING "device has a flight-controller link")
+add_compile_definitions(
+    DEV_HAS_DISPLAY=${DEV_HAS_DISPLAY}
+    DEV_HAS_CAMERA=${DEV_HAS_CAMERA}
+    DEV_HAS_KEYPAD=${DEV_HAS_KEYPAD}
+    DEV_HAS_BUZZER=${DEV_HAS_BUZZER}
+    DEV_HAS_LED=${DEV_HAS_LED}
+    DEV_HAS_DVR=${DEV_HAS_DVR}
+    DEV_HAS_FC_LINK=${DEV_HAS_FC_LINK})
+
 include(FetchContent)
 
 # LVGL (MIT), the menu/UI toolkit: software-rendered widgets, no GPU. Configured by ml-hud/lv_conf.h.
