@@ -67,7 +67,7 @@ void btfl_burn_update(const unsigned char *canvas, int len)
 {
     static unsigned char patch[BURN_WMAX * BURN_HMAX * 4];
 
-    if (!msp_font_loaded()) {
+    if (!msp_font_is_loaded()) {
         return;
     }
 
