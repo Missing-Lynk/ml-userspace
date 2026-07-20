@@ -49,6 +49,13 @@ void btfl_osd_configure(int screen_w, int screen_h,
 void btfl_osd_invalidate(void);
 
 /**
+ * @brief Screen rectangle of grid cell (@p row, @p col) under the configured geometry. The same
+ *        mapping btfl_osd_update draws with, exported so the DVR burn renderer (btfl_burn) places
+ *        its cells exactly where the displayed ones are.
+ */
+rect_t btfl_osd_cell_rect(int row, int col);
+
+/**
  * @brief Decode @p canvas, diff against the last grid, and redraw only changed cells into @p dst.
  * @param rects     Filled with the changed cells' screen rectangles.
  * @param max_rects Capacity of @p rects.

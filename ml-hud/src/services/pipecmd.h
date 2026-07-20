@@ -46,4 +46,15 @@ void pipecmd_srt_text(const char *line);
  */
 void pipecmd_set_dvr_res(int height, int fps);
 
+/**
+ * @brief Send one rendered BTFL OSD cell for the DVR burn-in. @p rgba is the cell's w*h RGBA
+ *  patch (opaque glyph pixels, transparent background), or NULL to clear the cell pipeline-side.
+ *  The rect is the cell's luma-pixel rectangle in the 1080p composite. The caller (btfl_burn)
+ *  gates on the dvr.record_osd setting + recording state.
+ */
+void pipecmd_osd_cell(int row, int col, int x, int y, int w, int h, const unsigned char *rgba);
+
+/** @brief Clear every cached burn-in cell in ml-pipeline (burn gate opened or closed). */
+void pipecmd_osd_clear(void);
+
 #endif /* HUD_PIPECMD_H */

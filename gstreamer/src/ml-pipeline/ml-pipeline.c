@@ -282,6 +282,7 @@ static int run_rf(struct ctx *c, int plane, int drm_fd)
     c->drm_fd = drm_fd;
     c->dmablit_fd = -1;
     pthread_mutex_init(&c->comp_lock, NULL);
+    pthread_mutex_init(&c->osd_lock, NULL);
 
     c->lsock = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     c->laddr.sun_family = AF_UNIX;

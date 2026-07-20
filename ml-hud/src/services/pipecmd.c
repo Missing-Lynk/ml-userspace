@@ -56,3 +56,40 @@ void pipecmd_set_dvr_res(int height, int fps)
 {
     mlm_ctrl_send(MLM_CMD_DVR_RES, ((uint32_t) height << 16) | (uint32_t) fps, NULL);
 }
+
+/* One rendered burn-in cell: the mlm_osd_cell header + RGBA pixels ride after the mlm_cmd. */
+void pipecmd_osd_cell(int row, int col, int x, int y, int w, int h, const unsigned char *rgba)
+{
+    struct { struct mlm_osd_cell cell; unsigned char px[MLM_OSD_CELL_WMAX * MLM_OSD_CELL_HMAX * 4]; }
+        __attribute__((packed)) frame;
+    size_t len = sizeof frame.cell;
+
+    if (w <= 0 || h <= 0 || w > MLM_OSD_CELL_WMAX || h > MLM_OSD_CELL_HMAX) {
+        return;
+    }
+
+    frame.cell.row = (uint16_t) row;
+    frame.cell.col = (uint16_t) col;
+    frame.cell.x = (uint16_t) x;
+    frame.cell.y = (uint16_t) y;
+    frame.cell.w = (uint16_t) w;
+    frame.cell.h = (uint16_t) h;
+    if (rgba != NULL) {
+        size_t n = (size_t) w * h * 4;
+        memcpy(frame.px, rgba, n);
+        len += n;
+    }
+
+    mlm_ctrl_send_blob(MLM_CMD_OSD_CELL, 0, &frame, len);
+}
+
+/* Clear-all: a header-only cell frame with the MLM_OSD_CLEAR_ALL sentinel coordinates. */
+void pipecmd_osd_clear(void)
+{
+    struct mlm_osd_cell cell;
+
+    memset(&cell, 0, sizeof cell);
+    cell.row = MLM_OSD_CLEAR_ALL;
+    cell.col = MLM_OSD_CLEAR_ALL;
+    mlm_ctrl_send_blob(MLM_CMD_OSD_CELL, 0, &cell, sizeof cell);
+}
