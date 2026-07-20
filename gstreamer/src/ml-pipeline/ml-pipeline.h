@@ -197,7 +197,7 @@ struct ctx {
     GstClockTime cur_pts;               /* PTS of the last pushed composite (telemetry) */
     guint64 pair_evict;
 
-    /* DVR record branch (plans/gst-dvr.md, plans/wave5-encoder-fit.md): the completed composite
+    /* DVR record branch: the completed composite
      * dma-buf is imported ZERO-COPY into the wave5 H.264 encoder -> MP4. dmabuf-import allocates
      * no CMA for the encoder input and does no CPU copy (the ~60 MiB / 42 fps blockers both trace
      * to the copy path). Bounded + drop-on-overflow so a slow encoder never stalls the display.
@@ -214,7 +214,7 @@ struct ctx {
                                          * buffer pins a composite pool slot */
     gboolean rec_import;                /* encoder in dmabuf-import mode (no videoscale) */
 
-    /* Downscaled DVR (plans/done/hw-downscaled-dvr-scaler.md): the HUD latches the recording format via
+    /* Downscaled DVR: the HUD latches the recording format via
      * MLM_CMD_DVR_RES; rec_start resolves it to a g_rec_fmts row. A scaled (non-native) format runs
      * each composite through the ar_scaler on a dedicated worker thread - rec_push runs under
      * comp_lock on a decoder streaming thread, where the ~6 ms synchronous scale ioctl would stall
@@ -337,7 +337,7 @@ struct ctx {
     GstClockTime next_pts;
     int wake_r, wake_w;                 /* self-pipe to kick the display thread */
 
-    /* Plane-scanout mode (plans/gst-plane-scanout.md): tiles scan out directly on the DC's
+    /* Plane-scanout mode: tiles scan out directly on the DC's
      * video0/video1 overlay planes; both banks latch on ONE vsync (shared 0x1518 bit3 shadow
      * bracket), so the pair is tear-free by hardware. No composite pool, no blits. The HUD
      * shares bank 1 with video1 and cannot run in this mode. ML_COMPOSE=1 forces the old

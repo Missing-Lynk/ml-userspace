@@ -6,7 +6,13 @@
 /* A patch pixel is opaque at alpha >= 128 (the HUD's binary-alpha draw rule). */
 #define OSD_OPAQUE(a) ((a) >= 128)
 
-/* BT.601 limited-range RGB -> YUV, the composite's own encoding (wave5 I420). */
+/* BT.601 limited-range RGB -> YUV, the composite's own encoding (wave5 I420), in 8-bit fixed
+ * point: each coefficient is the standard studio-swing matrix entry scaled by 256 (Y row
+ * 0.257/0.504/0.098 -> 66/129/25, U row -0.148/-0.291/0.439 -> -38/-74/112, V row
+ * 0.439/-0.368/-0.071 -> 112/-94/-18), the +128 inside rounds the >>8 (divide by 256), and the
+ * outer offsets place the result on the limited scale: +16 = luma black level (Y in 16..235),
+ * +128 = chroma zero point (U/V in 16..240).
+ */
 static inline guint8 rgb_y(int r, int g, int b)
 {
     return (guint8) (16 + ((66 * r + 129 * g + 25 * b + 128) >> 8));
@@ -35,25 +41,25 @@ static void cell_free(struct ctx *c, struct osd_cell *cell)
     }
 }
 
-/* Append the opaque runs of one plane row as spans: @p op/@p val are the row's opacity and
- * pixel values (@p n samples), @p dst0 the composite offset of the row's first sample.
+/* Append the opaque runs of one plane row as spans: @p mask/@p vals are the row's opacity
+ * mask and pixel values (@p n samples), @p dst0 the composite offset of the row's first sample.
  */
-static void row_spans(GArray *spans, GByteArray *px, const guint8 *op, const guint8 *val,
+static void row_spans(GArray *spans, GByteArray *px, const guint8 *mask, const guint8 *vals,
                       int n, guint32 dst0)
 {
     for (int i = 0; i < n; ) {
-        if (!op[i]) {
+        if (!mask[i]) {
             i++;
             continue;
         }
 
         int i0 = i;
-        while (i < n && op[i]) {
+        while (i < n && mask[i]) {
             i++;
         }
 
         struct osd_span sp = { dst0 + (guint32) i0, px->len, (guint32) (i - i0) };
-        g_byte_array_append(px, val + i0, (guint) (i - i0));
+        g_byte_array_append(px, vals + i0, (guint) (i - i0));
         g_array_append_val(spans, sp);
     }
 }
@@ -101,15 +107,15 @@ void osd_burn_cell(struct ctx *c, const guint8 *frame, gssize len)
 
     const guint8 *rgba = frame + sizeof hdr;
 
-    /* Luma: per-pixel Y + opacity. */
-    guint8 ly[MLM_OSD_CELL_WMAX * MLM_OSD_CELL_HMAX];
-    guint8 lop[MLM_OSD_CELL_WMAX * MLM_OSD_CELL_HMAX];
+    /* Luma: per-pixel Y value + opacity mask. */
+    guint8 luma[MLM_OSD_CELL_WMAX * MLM_OSD_CELL_HMAX];
+    guint8 lmask[MLM_OSD_CELL_WMAX * MLM_OSD_CELL_HMAX];
 
     for (int i = 0; i < w * h; i++) {
         const guint8 *p = rgba + (gsize) i * 4;
 
-        lop[i] = OSD_OPAQUE(p[3]);
-        ly[i] = lop[i] ? rgb_y(p[0], p[1], p[2]) : 0;
+        lmask[i] = OSD_OPAQUE(p[3]);
+        luma[i] = lmask[i] ? rgb_y(p[0], p[1], p[2]) : 0;
     }
 
     /* Chroma: one sample per composite 2x2 luma block the patch touches (the patch rect may
@@ -123,36 +129,36 @@ void osd_burn_cell(struct ctx *c, const guint8 *frame, gssize len)
     int ch = (y + h - 1) / 2 - cy0 + 1;
     guint8 cu[(MLM_OSD_CELL_WMAX / 2 + 1) * (MLM_OSD_CELL_HMAX / 2 + 1)];
     guint8 cv[(MLM_OSD_CELL_WMAX / 2 + 1) * (MLM_OSD_CELL_HMAX / 2 + 1)];
-    guint8 cop[(MLM_OSD_CELL_WMAX / 2 + 1) * (MLM_OSD_CELL_HMAX / 2 + 1)];
+    guint8 cmask[(MLM_OSD_CELL_WMAX / 2 + 1) * (MLM_OSD_CELL_HMAX / 2 + 1)];
 
     for (int cy = 0; cy < ch; cy++) {
         for (int cx = 0; cx < cw; cx++) {
-            int tot = 0, opq = 0, su = 0, sv = 0;
+            int in_patch = 0, covered = 0, sum_u = 0, sum_v = 0;
 
             for (int dy = 0; dy < 2; dy++) {
                 for (int dx = 0; dx < 2; dx++) {
-                    int lx = (cx0 + cx) * 2 + dx - x;
-                    int lyr = (cy0 + cy) * 2 + dy - y;
+                    int px_x = (cx0 + cx) * 2 + dx - x;
+                    int px_y = (cy0 + cy) * 2 + dy - y;
 
-                    if (lx < 0 || lx >= w || lyr < 0 || lyr >= h) {
+                    if (px_x < 0 || px_x >= w || px_y < 0 || px_y >= h) {
                         continue;
                     }
 
-                    tot++;
-                    if (lop[lyr * w + lx]) {
-                        const guint8 *p = rgba + ((gsize) lyr * w + lx) * 4;
+                    in_patch++;
+                    if (lmask[px_y * w + px_x]) {
+                        const guint8 *p = rgba + ((gsize) px_y * w + px_x) * 4;
 
-                        opq++;
-                        su += rgb_u(p[0], p[1], p[2]);
-                        sv += rgb_v(p[0], p[1], p[2]);
+                        covered++;
+                        sum_u += rgb_u(p[0], p[1], p[2]);
+                        sum_v += rgb_v(p[0], p[1], p[2]);
                     }
                 }
             }
 
             int i = cy * cw + cx;
-            cop[i] = (tot > 0 && 2 * opq >= tot);
-            cu[i] = cop[i] ? (guint8) (su / opq) : 0;
-            cv[i] = cop[i] ? (guint8) (sv / opq) : 0;
+            cmask[i] = (in_patch > 0 && 2 * covered >= in_patch);
+            cu[i] = cmask[i] ? (guint8) (sum_u / covered) : 0;
+            cv[i] = cmask[i] ? (guint8) (sum_v / covered) : 0;
         }
     }
 
@@ -161,17 +167,17 @@ void osd_burn_cell(struct ctx *c, const guint8 *frame, gssize len)
     GByteArray *px = g_byte_array_new();
 
     for (int j = 0; j < h; j++) {
-        row_spans(spans, px, lop + (gsize) j * w, ly + (gsize) j * w, w,
+        row_spans(spans, px, lmask + (gsize) j * w, luma + (gsize) j * w, w,
                   (guint32) ((y + j) * COMP_LSTRIDE + x));
     }
 
     for (int cy = 0; cy < ch; cy++) {
-        row_spans(spans, px, cop + (gsize) cy * cw, cu + (gsize) cy * cw, cw,
+        row_spans(spans, px, cmask + (gsize) cy * cw, cu + (gsize) cy * cw, cw,
                   (guint32) (COMP_UOFF + (cy0 + cy) * COMP_CSTRIDE + cx0));
     }
 
     for (int cy = 0; cy < ch; cy++) {
-        row_spans(spans, px, cop + (gsize) cy * cw, cv + (gsize) cy * cw, cw,
+        row_spans(spans, px, cmask + (gsize) cy * cw, cv + (gsize) cy * cw, cw,
                   (guint32) (COMP_VOFF + (cy0 + cy) * COMP_CSTRIDE + cx0));
     }
 
