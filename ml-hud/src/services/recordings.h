@@ -5,10 +5,22 @@
 #ifndef HUD_RECORDINGS_H
 #define HUD_RECORDINGS_H
 
+#include <stdbool.h>
+
 typedef struct {
     char name[64];   /* file name, e.g. "Video008.mp4" */
     long size_mb;    /* size in MB */
 } recording_t;
+
+/**
+ * @brief Whether the SD-card mount can be read (its directory opens).
+ *
+ * Distinguishes "no card / not mounted" from "mounted but empty", so the Playback view can show a
+ * "No SD card" state rather than conflating it with "No recordings".
+ *
+ * @return true if the mount directory opened, false otherwise.
+ */
+bool recordings_sd_available(void);
 
 /**
  * @brief List the .mp4 recordings on the SD card, sorted newest-name first.

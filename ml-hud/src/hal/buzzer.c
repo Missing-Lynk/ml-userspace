@@ -2,7 +2,9 @@
 #include "buzzer.h"
 #include "board.h"
 
+#include <fcntl.h>
 #include <stdio.h>
+#include <unistd.h>
 
 /* Tone shape from the vendor DTS (pwm@1002000, ch0): a ~3.8 kHz carrier whose duty is the volume. */
 #define BUZZER_PERIOD_NS  260000L
@@ -64,4 +66,16 @@ void buzzer_enable(int on)
     }
 
     write_long(board_current()->buzzer_enable_path, on ? 1 : 0);
+}
+
+void buzzer_panic_off(void)
+{
+    int fd = open(board_current()->buzzer_enable_path, O_WRONLY);
+    if (fd < 0) {
+        return;
+    }
+
+    ssize_t written = write(fd, "0\n", 2);
+    (void) written;
+    close(fd);
 }

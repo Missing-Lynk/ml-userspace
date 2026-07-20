@@ -66,6 +66,7 @@ camera.reset = 恢复默认设置
 
 # 回放
 playback.empty = 无录像
+playback.no_sd = 无 SD 卡
 
 # 通用
 common.off = 关

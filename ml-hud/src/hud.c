@@ -14,6 +14,7 @@
 #include "fb/drmoverlay.h"
 #include "fb/surface.h"
 #include "hal/board.h"
+#include "hal/buzzer.h"
 #include "hal/input.h"
 #include "hal/telemetry.h"
 #include "hud_state.h"
@@ -53,6 +54,16 @@ static void on_sigint(int s)
 {
     (void) s;
     g_stop = 1;
+}
+
+/* A crash or abort (e.g. LVGL's out-of-memory assert) must never leave the buzzer PWM latched on:
+ * silence it with an async-signal-safe raw write, then re-raise to die with the default action.
+ */
+static void on_fatal(int s)
+{
+    buzzer_panic_off();
+    signal(s, SIG_DFL);
+    raise(s);
 }
 
 /* Milliseconds from the monotonic clock: the LVGL tick source and the long-press timer. */
@@ -766,6 +777,15 @@ int main(int argc, char **argv)
 
     signal(SIGINT, on_sigint);
     signal(SIGTERM, on_sigint);
+
+    /* Never leave the buzzer latched: on a graceful exit atexit silences it; on a crash/abort the
+     * fatal-signal handler does (before re-raising). */
+    atexit(buzzer_panic_off);
+    signal(SIGABRT, on_fatal);
+    signal(SIGSEGV, on_fatal);
+    signal(SIGBUS, on_fatal);
+    signal(SIGILL, on_fatal);
+    signal(SIGFPE, on_fatal);
 
     const osd_channel_cb_t cb = { on_osd, on_version, on_periodic };
 

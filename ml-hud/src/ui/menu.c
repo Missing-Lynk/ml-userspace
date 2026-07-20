@@ -763,11 +763,17 @@ static void playback_row_clicked(lv_event_t *event)
     }
 }
 
-/* The SD-card recordings list: one focusable row per clip (icon + name, size on the right). CENTER
- * plays the clip (player_start). An empty list shows a hint and keeps focus in the sidebar.
+/* The SD-card recordings list: one focusable row per clip (icon + name, length/size on the right).
+ * CENTER plays the clip (player_start). The list is bounded by MAX_RECORDINGS, so it fits LVGL's pool.
+ * An absent card or an empty list shows a hint and keeps focus in the sidebar.
  */
 static void render_playback(void)
 {
+    if (!recordings_sd_available()) {
+        render_centered_hint(T("playback.no_sd"));   /* no card / not mounted: keep focus in the sidebar */
+        return;
+    }
+
     static recording_t recordings[MAX_RECORDINGS];
     int count = recordings_list(recordings, MAX_RECORDINGS);
 

@@ -66,6 +66,7 @@ camera.reset = Reset to defaults
 
 # Playback
 playback.empty = No recordings
+playback.no_sd = No SD card
 
 # Generic
 common.off = Off

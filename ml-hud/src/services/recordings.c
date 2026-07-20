@@ -33,6 +33,17 @@ static int compare_name_desc(const void *a, const void *b)
     return strcmp(rb->name, ra->name);
 }
 
+bool recordings_sd_available(void)
+{
+    DIR *dir = opendir(board_current()->sdcard_mount);
+    if (dir == NULL) {
+        return false;
+    }
+
+    closedir(dir);
+    return true;
+}
+
 int recordings_list(recording_t *out, int max)
 {
     DIR *dir = opendir(board_current()->sdcard_mount);
@@ -249,8 +260,12 @@ unsigned recordings_duration_ms(const char *path)
     unsigned ms = 0;
     FILE *f = fopen(path, "rb");
     if (f != NULL) {
-        /* Walk top-level atoms, following each size header; mdat is skipped, never read. */
-        for (;;) {
+        /* Walk top-level atoms, following each size header; mdat is skipped, never read. `pos` is the
+         * absolute start of the current atom, always advanced forward by a size validated against the
+         * bytes remaining in the file: a truncated or garbage size (including a 64-bit extended size
+         * that would otherwise seek backward or past EOF) stops the walk instead of looping. */
+        off_t pos = 0;
+        while (pos <= info.st_size) {
             unsigned char hdr[16];
             if (fread(hdr, 1, 8, f) != 8) {
                 break;
@@ -267,7 +282,11 @@ unsigned recordings_duration_ms(const char *path)
             }
 
             if (size < (uint64_t) header_len) {
-                break;   /* malformed */
+                break;   /* malformed, size-0 ("to EOF"), or truncated */
+            }
+
+            if (size > (uint64_t) (info.st_size - pos)) {
+                break;   /* atom claims more than remains: truncated or garbage */
             }
 
             if (memcmp(hdr + 4, "moov", 4) == 0) {
@@ -275,7 +294,8 @@ unsigned recordings_duration_ms(const char *path)
                 break;
             }
 
-            if (fseeko(f, (off_t) (size - header_len), SEEK_CUR) != 0) {
+            pos += (off_t) size;   /* validated <= remaining, so always forward and in-bounds */
+            if (fseeko(f, pos, SEEK_SET) != 0) {
                 break;   /* skip this atom's body (e.g. the large mdat) */
             }
         }

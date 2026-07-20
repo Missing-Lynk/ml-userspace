@@ -17,4 +17,12 @@ int buzzer_volume(void);
 /** @brief Gate the tone on/off. Turning on is a no-op while the volume is 0. */
 void buzzer_enable(int on);
 
+/**
+ * @brief Force the tone off with a single raw sysfs write (open/write/close only).
+ *
+ * Async-signal-safe, unlike buzzer_enable (which uses stdio): safe to call from a fatal-signal
+ * handler or atexit so a crashing/aborting process never leaves the PWM latched on.
+ */
+void buzzer_panic_off(void);
+
 #endif /* HUD_BUZZER_H */
