@@ -39,6 +39,7 @@
 #define OSD_MAX_AIR_BR   "BR 88.8"         /* air encoder bitrate (SEI), own fixed field */
 #define OSD_MAX_AIR_QP   "QP 88"           /* air encoder QP (SEI), own fixed field */
 #define OSD_MAX_AIR_DL   "MAX 88.8"        /* air-unit RF-link throughput / capacity (Mbps) */
+#define OSD_MAX_ONTIME   "88:88"          /* air-unit on-time MM:SS (u32 us counter maxes at 71:34) */
 
 /* Low-battery blink: half-period of the battery-icon blink while the alarm is active. */
 #define ALARM_TICK_MS   250
@@ -64,6 +65,7 @@ static lv_obj_t *g_lbl_quad_temp;    /* air-unit temperature (:10000 @98); gated
 static lv_obj_t *g_lbl_air_br;       /* air encoder bitrate (Mbps) from the SEI (MLM_T_FRAMESTATS) */
 static lv_obj_t *g_lbl_air_qp;       /* air encoder QP from the SEI; own field so it never shifts BR */
 static lv_obj_t *g_lbl_air_dl;       /* air-unit RF-link throughput/capacity (chip Get1V1Info) */
+static lv_obj_t *g_lbl_ontime;       /* air-unit on-time MM:SS (:10000 header timestamp) */
 
 static int g_menu_open;
 static int g_force_hidden;            /* playback hides the whole bar, overriding the setting */
@@ -229,6 +231,10 @@ void sysosd_create(lv_obj_t *parent)
     lv_obj_set_width(g_lbl_air_dl, field_width(OSD_MAX_AIR_DL));
     lv_obj_set_style_text_align(g_lbl_air_dl, LV_TEXT_ALIGN_RIGHT, 0);
     lv_obj_add_flag(g_lbl_air_dl, LV_OBJ_FLAG_HIDDEN);
+    g_lbl_ontime = add_field(g_group_right, NULL, "--:--", COLOR_TEXT_DIM);
+    lv_obj_set_width(g_lbl_ontime, field_width(OSD_MAX_ONTIME));
+    lv_obj_set_style_text_align(g_lbl_ontime, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_add_flag(g_lbl_ontime, LV_OBJ_FLAG_HIDDEN);
 
     g_lbl_quad_temp = add_field(g_group_right, NULL, "--°C", COLOR_TEXT_DIM);
     lv_obj_set_width(g_lbl_quad_temp, field_width(OSD_MAX_TEMP));
@@ -421,6 +427,27 @@ static void update_air_fields(const air_telem_t *air, int show_temp)
     }
 }
 
+/* Air-unit on-time as MM:SS, off the :10000 header timestamp (us since air boot, relayed via
+ * air_telem_t). Opt-in overlay: hidden unless its toggle is on; dim dashes when the link is down.
+ */
+static void update_air_ontime(const air_telem_t *air, int show_ontime)
+{
+    if (!show_ontime) {
+        lv_obj_add_flag(g_lbl_ontime, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+
+    if (air->have_ontime) {
+        lv_label_set_text_fmt(g_lbl_ontime, "%02u:%02u", air->ontime_s / 60, air->ontime_s % 60);
+        lv_obj_set_style_text_color(g_lbl_ontime, COLOR_TEXT, 0);
+    } else {
+        lv_label_set_text(g_lbl_ontime, "--:--");
+        lv_obj_set_style_text_color(g_lbl_ontime, COLOR_TEXT_DIM, 0);
+    }
+
+    lv_obj_remove_flag(g_lbl_ontime, LV_OBJ_FLAG_HIDDEN);
+}
+
 /* Colour the downlink rate by how close it runs to the link capacity (MAX = PHY throughput, chip
  * Get1V1Info +0x0c). The air targets ~70% of goodput, so the calm band runs to ~78%; yellow/orange/
  * red flag the shrinking margin - a red flash means the link dipped before the encoder backed off,
@@ -520,11 +547,13 @@ void sysosd_update(const telemetry_t *telemetry, const air_telem_t *air, setting
     int show_temp = settings_get_bool_in(settings, GOG_SECTION, "show_temperature", 1);
     int show_encoder = settings_get_bool_in(settings, GOG_SECTION, "show_encoder_stats", 0);
     int show_throughput = settings_get_bool_in(settings, GOG_SECTION, "show_link_throughput", 0);
+    int show_ontime = settings_get_bool_in(settings, GOG_SECTION, "show_air_ontime", 0);
 
     update_goggle_battery(telemetry, settings);
     update_link_fields(connected, settings);
     update_air_fields(air, show_temp);
     update_air_encoder_fields(connected, show_encoder, show_throughput);
+    update_air_ontime(air, show_ontime);
 
     if (telemetry->have_sdcard) {
         lv_label_set_text_fmt(g_lbl_sdcard, "%s %dG", LV_SYMBOL_SD_CARD, (int) (telemetry->sd_free_gb + 0.5f));

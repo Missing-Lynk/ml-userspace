@@ -83,6 +83,7 @@ static const gog_item_t g_goggles_items[] = {
     { ITEM_TOGGLE,  "goggles.show_temperature",     "show_temperature",     NULL,           0, 1, "" },
     { ITEM_TOGGLE,  "goggles.show_encoder_stats",   "show_encoder_stats",   NULL,           0, 0, "" },
     { ITEM_TOGGLE,  "goggles.show_link_throughput", "show_link_throughput", NULL,           0, 0, "" },
+    { ITEM_TOGGLE,  "goggles.show_air_ontime",      "show_air_ontime",      NULL,           0, 0, "" },
 };
 #define GOGGLES_ITEM_COUNT ((int) (sizeof(g_goggles_items) / sizeof(g_goggles_items[0])))
 

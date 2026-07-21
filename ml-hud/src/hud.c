@@ -105,6 +105,8 @@ typedef struct {
     int            have_version;     /* saw a version frame (fw string + link metrics) */
     int            air_temp_c;       /* air-unit temperature (0x09 frame @98), whole deg C */
     int            have_air_temp;
+    uint32_t       air_ts_us;        /* last :10000 header timestamp (us since air boot) */
+    int            have_air_ontime;
     int            tempwarn_latched;  /* overheat banner state, with TEMPWARN_HYST_C hysteresis */
     int            tempwarn_shown;    /* last state pushed to the banner, for edge sync */
     uint32_t       tempwarn_next_ms;  /* next overheat chirp while latched */
@@ -160,7 +162,8 @@ static void on_osd(void *ctx, const unsigned char *canvas, int len)
 static void on_version(void *ctx, const osd_header_t *header, const osd_version_t *v)
 {
     hud_ctx_t *h = ctx;
-    (void) header;
+    h->air_ts_us = header->ts_us;
+    h->have_air_ontime = 1;
     h->last_voltage_mV = v->voltage_mV;
     h->have_voltage = 1;
     h->have_version = 1;
@@ -173,7 +176,8 @@ static void on_version(void *ctx, const osd_header_t *header, const osd_version_
 static void on_periodic(void *ctx, const osd_header_t *header, const osd_periodic_t *p)
 {
     hud_ctx_t *h = ctx;
-    (void) header;
+    h->air_ts_us = header->ts_us;
+    h->have_air_ontime = 1;
     h->last_voltage_mV = p->voltage_mV;
     h->have_voltage = 1;
 }
@@ -633,6 +637,8 @@ static void sysosd_tick(hud_ctx_t *h, uint32_t now)
         .voltage_mV = h->last_voltage_mV,
         .have_temp = air_up && h->have_air_temp,
         .temp_c = h->air_temp_c,
+        .have_ontime = air_up && h->have_air_ontime,
+        .ontime_s = h->air_ts_us / 1000000u,
     };
 
     sysosd_update(&telemetry, &air, h->settings);

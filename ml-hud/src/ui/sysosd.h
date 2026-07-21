@@ -26,6 +26,8 @@ typedef struct {
     int voltage_mV;     /* air-unit pack millivolts (0x09/0x11 frame @96) */
     int have_temp;      /* air-unit temperature reading valid */
     int temp_c;         /* air-unit temperature, whole degrees Celsius (0x09 frame @98) */
+    int have_ontime;    /* air-unit on-time reading valid */
+    unsigned ontime_s;  /* air-unit seconds since power-on (:10000 header timestamp) */
 } air_telem_t;
 
 /* Height of the bottom status strip. The menu reserves this same strip above itself, and the BTFL OSD

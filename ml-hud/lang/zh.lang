@@ -22,6 +22,7 @@ goggles.show_system_osd    = 显示系统 OSD
 goggles.show_temperature   = 显示温度
 goggles.show_encoder_stats = 显示编码器状态
 goggles.show_link_throughput = 显示链路吞吐
+goggles.show_air_ontime    = 显示天空端开机时长
 
 # 系统设置
 system.buzzer_volume       = 蜂鸣器音量
