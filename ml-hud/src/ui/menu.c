@@ -797,10 +797,10 @@ static void render_playback(void)
         unsigned ms = recordings_duration_ms(path);
         if (ms > 0) {
             unsigned s = ms / 1000;
-            snprintf(value, sizeof(value), "%u:%02u   %ld.%ld GB", s / 60, s % 60,
+            snprintf(value, sizeof(value), "%u:%02u   %ld.%ldGB", s / 60, s % 60,
                      gb_tenths / 10, gb_tenths % 10);
         } else {
-            snprintf(value, sizeof(value), "%ld.%ld GB", gb_tenths / 10, gb_tenths % 10);
+            snprintf(value, sizeof(value), "%ld.%ldGB", gb_tenths / 10, gb_tenths % 10);
         }
         lv_obj_t *value_label = lv_label_create(row);
         lv_obj_set_style_text_color(value_label, COLOR_TEXT_DIM, 0);   /* de-emphasise vs the name */

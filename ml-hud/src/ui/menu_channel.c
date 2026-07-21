@@ -87,7 +87,7 @@ static int tile_snr_bucket(int snr_raw)
  * (orange .. green). The two callers differ only in where the dB and its bucket come from. */
 static void paint_signal_db(lv_obj_t *label, int db, int bucket)
 {
-    lv_label_set_text_fmt(label, "%s %d dB", LV_SYMBOL_WIFI, db);
+    lv_label_set_text_fmt(label, "%s %ddB", LV_SYMBOL_WIFI, db);
     lv_obj_set_style_text_color(label,
                                lv_color_hsv_to_rgb((uint16_t)(bucket * 30), 80, 95), 0);
 }

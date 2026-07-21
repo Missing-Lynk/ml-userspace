@@ -71,7 +71,7 @@ static uint32_t mono_ms(void)
  * - treated as no movement. have_bitrate stays set while bytes moved within the hold window, so the
  * field reflects the real downlink rate even when the telemetry-liveness flag gaps. Until the first
  * nonzero delta the field stays unset, so a zero-flow interface reads as the placeholder rather than
- * "0.0 Mbps". */
+ * "0.0Mbps". */
 static void read_bitrate(const board_profile_t *board, telemetry_t *out)
 {
     static long long last_bytes = -1;
