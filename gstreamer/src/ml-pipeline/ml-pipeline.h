@@ -422,6 +422,13 @@ struct ctx {
     gboolean pb_paused;
     gboolean pb_ended;                  /* reached EOS: last frame held, awaiting replay or exit */
     gboolean pb_rendering;              /* first decoded frame has been submitted to the display */
+    gboolean pb_scale;                  /* playback upscales each decoded I420 frame to the panel
+                                         * geometry via /dev/arscaler into a composite pool buffer,
+                                         * then scans it out on the composite page-flip path - the VO
+                                         * overlay planes are 1:1 only (DRM_PLANE_NO_SCALING), so a
+                                         * sub-panel clip (e.g. a 720p DVR recording) cannot scan out
+                                         * on the primary CRTC directly. FALSE = native zero-copy
+                                         * single scanout (used when the scaler is unavailable). */
     GstElement *pb_pipe;                /* filesrc -> demux -> parse -> wave5 dec -> appsink */
     guint pb_timer;                     /* position-telemetry timeout id (0 = none) */
     guint pb_bus_watch;                 /* bus watch id on pb_pipe */

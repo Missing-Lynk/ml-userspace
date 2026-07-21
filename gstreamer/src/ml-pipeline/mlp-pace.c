@@ -66,6 +66,21 @@ static gboolean pace_tick(gpointer u)
 {
     struct ctx *c = u;
 
+    /* File playback flips at the clip's own rate (e.g. 30 fps), so the interval's waits do
+     * not measure the 60 Hz latch phase, and the flip count sits right at PACE_MIN_FLIPS -
+     * the servo then alternates between acting on garbage phase data and parking at the
+     * boot rate, commanding ~3 % pclk transitions that slew for ~a second mid-scanout. The
+     * DC's address latch does not survive that: the panel freezes on one frame while flips
+     * keep completing (HW-observed; pace off plays the same clip correctly). Hold the
+     * clock untouched for the whole playback; the servo resumes on return to live.
+     */
+    if (c->pb_active) {
+        pthread_mutex_lock(&c->disp_lock);
+        c->pace_n = 0;   /* discard the interval's samples */
+        pthread_mutex_unlock(&c->disp_lock);
+        return G_SOURCE_CONTINUE;
+    }
+
     gint64 w[PACE_NWAIT];
 
     pthread_mutex_lock(&c->disp_lock);

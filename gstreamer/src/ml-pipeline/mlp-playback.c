@@ -88,9 +88,82 @@ static gchar *pb_desc(const char *path)
         "! appsink name=sink", path, h265 ? "h265" : "h264", h265 ? "h265" : "h264");
 }
 
+/* Whether a clip decodes at the panel's native geometry, read from the MP4's avc1 sample entry. A
+ * native clip scans out zero-copy (single mode); only a sub-panel clip (e.g. a 720p DVR recording)
+ * needs the ar_scaler. Walks the top-level atoms to moov (front or after the mdat), reads the moov
+ * body, and finds the avc1 box's width/height (the 2-byte fields 28 bytes past the 'avc1' fourcc).
+ * Defaults to FALSE (scale) when the size cannot be determined: the scaler handles any size, so an
+ * unparsed clip still plays (a native one just takes the scaler's unity path instead of zero-copy).
+ */
+static gboolean clip_is_native_res(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) {
+        return FALSE;
+    }
+
+    gboolean native = FALSE;
+    for (;;) {
+        unsigned char hdr[16];
+        if (fread(hdr, 1, 8, f) != 8) {
+            break;
+        }
+
+        guint64 size = ((guint64) hdr[0] << 24) | ((guint64) hdr[1] << 16) |
+                       ((guint64) hdr[2] << 8) | hdr[3];
+        int header_len = 8;
+        if (size == 1) {
+            if (fread(hdr + 8, 1, 8, f) != 8) {
+                break;
+            }
+
+            size = 0;
+            for (int i = 0; i < 8; i++) {
+                size = (size << 8) | hdr[8 + i];
+            }
+
+            header_len = 16;
+        }
+
+        if (size < (guint64) header_len) {
+            break;
+        }
+
+        if (memcmp(hdr + 4, "moov", 4) == 0) {
+            guint64 body = size - header_len;
+            if (body > 8 * 1024 * 1024) {
+                body = 8 * 1024 * 1024;   /* a moov is small; cap the read regardless */
+            }
+
+            unsigned char *m = g_malloc(body);
+            if (fread(m, 1, body, f) == body) {
+                for (guint64 i = 0; i + 32 <= body; i++) {
+                    if (memcmp(m + i, "avc1", 4) == 0) {
+                        int w = (m[i + 28] << 8) | m[i + 29];
+                        int h = (m[i + 30] << 8) | m[i + 31];
+                        native = (w == COMP_W && h == COMP_H);
+                        break;
+                    }
+                }
+            }
+
+            g_free(m);
+            break;
+        }
+
+        if (fseeko(f, (off_t) (size - header_len), SEEK_CUR) != 0) {
+            break;
+        }
+    }
+
+    fclose(f);
+    return native;
+}
+
 /* Return to the live RF stream: restore the RF display mode and rebuild the decode graph. */
 static void resume_live(struct ctx *c)
 {
+    c->pb_scale = FALSE;   /* live uses the RF display path, never the playback scaler */
     c->single = FALSE;
     c->planes_on = c->rf_planes;
     if (drm_disp_init(c)) {
@@ -150,9 +223,26 @@ void playback_play(struct ctx *c, const char *path)
     c->pb_bus_watch = gst_bus_add_watch(bus, on_pb_bus, c);
     gst_object_unref(bus);
 
-    /* single-stream scanout on the primary: reuse the persistent display sink in single mode */
-    c->single = TRUE;
+    /* Display mode. A native-resolution clip scans out zero-copy (single mode), exactly as before -
+     * that path is proven and cheapest. A sub-panel clip (e.g. a 720p DVR recording) cannot scan its
+     * own FB out on the primary CRTC (the VO overlay planes are 1:1, DRM_PLANE_NO_SCALING), so with
+     * the ar_scaler present it is upscaled per frame into a composite pool buffer and rides the
+     * composite page-flip path (pb_scale). Without the scaler a sub-panel clip cannot display.
+     */
+    gboolean scale = !clip_is_native_res(path);
+    if (scale && c->scaler_fd < 0) {
+        c->scaler_fd = open("/dev/arscaler", O_RDWR | O_CLOEXEC);
+    }
+
     c->planes_on = FALSE;
+    if (scale && c->scaler_fd >= 0 && c->comp_n > 0) {
+        c->single = FALSE;   /* composite scanout: the scaled frame rides a comp pool buffer + FB */
+        c->pb_scale = TRUE;
+    } else {
+        c->single = TRUE;    /* native clip (or no scaler/pool): zero-copy single scanout */
+        c->pb_scale = FALSE;
+    }
+
     if (drm_disp_init(c)) {
         fprintf(stderr, "ml-pipeline: playback display init failed\n");
     }
@@ -166,7 +256,7 @@ void playback_play(struct ctx *c, const char *path)
     c->pb_dur_ms = 0;
     c->pb_timer = g_timeout_add(200, pb_pos_tick, c);
 
-    printf("ml-pipeline: playback -> %s\n", path);
+    printf("ml-pipeline: playback -> %s (%s)\n", path, c->pb_scale ? "scaled" : "native");
     send_state(c);
 }
 

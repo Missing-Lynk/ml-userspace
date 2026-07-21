@@ -367,6 +367,45 @@ static int run_rf(struct ctx *c, int plane, int drm_fd)
  * drm_disp mailbox (no composite pool, no kmssink). The sample is held in the ditem until the flip
  * retires it, keeping the decoder buffer alive while it is on screen. Zero-copy.
  */
+/* Upscale one decoded I420 frame to the composite (panel) geometry via the ar_scaler, DMA-to-DMA
+ * into dst_fd (a composite pool buffer). Three plane ops (Y, U, V), the record downscale pattern in
+ * reverse; the CMA heap no-ops dma_buf_sync and the scaler is device-to-device, so no cache sync is
+ * needed on either side. Returns TRUE on success. */
+static gboolean pb_scale_to_comp(struct ctx *c, const struct tileview *t, int dst_fd)
+{
+    const guint32 soff[3] = { (guint32) t->yoff, (guint32) t->uoff, (guint32) t->voff };
+    const guint32 sstr[3] = { (guint32) t->ys, (guint32) t->us, (guint32) t->vs };
+    const guint32 sw[3]   = { (guint32) t->w, (guint32) t->w / 2, (guint32) t->w / 2 };
+    const guint32 sh[3]   = { (guint32) t->h, (guint32) t->h / 2, (guint32) t->h / 2 };
+    const guint32 doff[3] = { 0, COMP_UOFF, COMP_VOFF };
+    const guint32 dstr[3] = { COMP_LSTRIDE, COMP_CSTRIDE, COMP_CSTRIDE };
+    const guint32 dw[3]   = { COMP_W, COMP_W / 2, COMP_W / 2 };
+    const guint32 dh[3]   = { COMP_H, COMP_H / 2, COMP_H / 2 };
+    struct ar_scaler_dmabuf_batch batch;
+
+    memset(&batch, 0, sizeof batch);
+    batch.count = 3;
+    for (int p = 0; p < 3; p++) {
+        struct ar_scaler_dmabuf_op *op = &batch.ops[p];
+
+        op->src_fd = t->fd;
+        op->dst_fd = dst_fd;
+        op->src_off = soff[p];
+        op->dst_off = doff[p];
+        op->op.srcw = sw[p];
+        op->op.srch = sh[p];
+        op->op.srcstride = sstr[p];
+        op->op.cropw = sw[p];
+        op->op.croph = sh[p];
+        op->op.dstw = dw[p];
+        op->op.dsth = dh[p];
+        op->op.dststride = dstr[p];
+        op->op.channels = 1;
+    }
+
+    return ioctl(c->scaler_fd, SCALER_IOC_BATCH_DMABUF, &batch) == 0;
+}
+
 GstFlowReturn on_file_sample(GstAppSink *sink, gpointer u)
 {
     struct ctx *c = u;
@@ -388,6 +427,36 @@ GstFlowReturn on_file_sample(GstAppSink *sink, gpointer u)
     gst_buffer_unmap(buf, &m);   /* only the fd + geometry are needed to build the scanout FB */
     if (fd < 0) {                /* not a single-dmabuf buffer -> cannot scan out zero-copy */
         gst_sample_unref(s);
+        return GST_FLOW_OK;
+    }
+
+    /* Scaled playback: the clip is not the panel's native size, so upscale each frame into a
+     * composite pool buffer and ride the composite page-flip path (fb_id[cbi] + retirement) rather
+     * than scanning the decoder frame's own sub-panel FB, which the CRTC rejects. */
+    if (c->pb_scale) {
+        GstClockTime pts = GST_BUFFER_PTS(buf);   /* capture before releasing the sample below */
+        int cbi;
+        GstBuffer *cb = comp_get(c, &cbi);
+        if (!cb) {                       /* pool momentarily drained: drop this frame */
+            gst_sample_unref(s);
+            return GST_FLOW_OK;
+        }
+
+        gboolean ok = pb_scale_to_comp(c, &t, c->comp_pool[cbi].fd);
+        gst_sample_unref(s);             /* the scaler has read the decoder buffer; release it */
+        if (!ok) {
+            gst_buffer_unref(cb);        /* finalize returns cbi to comp_free */
+            return GST_FLOW_OK;
+        }
+
+        /* No cache sync: the scaler wrote by DMA and the DC reads by DMA, the same
+         * device-to-device rationale as the record path's rec_scale_one. */
+        struct ditem it = { .cbi = cbi, .buf = cb };
+        drm_disp_submit(c, &it, pts);
+        if (c->pb_active && !c->pb_rendering) {
+            c->pb_rendering = TRUE;
+        }
+
         return GST_FLOW_OK;
     }
 

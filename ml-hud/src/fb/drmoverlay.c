@@ -135,6 +135,17 @@ static void pack_rect(drm_overlay_t *d, const surface_t *s, int rx, int ry, int 
  */
 void drm_overlay_extern_refresh(drm_overlay_t *d, int on)
 {
+    /* Video-live just dropped: the pipeline that was flipping may also have modeset the CRTC
+     * (the playback teardown/re-init does), which takes this plane off while plane_on still
+     * reads true - the enable's early-return would then never re-assert it and the HUD goes
+     * invisible. Force a re-assert now; with no video flipping, the SETPLANE stalls nothing.
+     */
+    if (d->extern_refresh && !on) {
+        d->extern_refresh = 0;
+        d->plane_on = 0;
+        drm_overlay_enable(d);
+    }
+
     d->extern_refresh = on;
 }
 
