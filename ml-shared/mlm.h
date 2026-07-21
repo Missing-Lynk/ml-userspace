@@ -80,11 +80,15 @@ enum mlm_link_state {
     MLM_LINK_PARAMS_ACKED    = 2, /* :10000 params handshake acked, video should start */
     MLM_LINK_TX_LOST         = 3, /* >5 s of :10000 silence from the TX unit */
     MLM_LINK_SESSION_RESTART = 4, /* air returned after a loss, re-handshaking */
+    MLM_LINK_BINDING         = 5, /* pair mode entered, polling for an air unit in bind mode */
+    MLM_LINK_BIND_OK         = 6, /* pair-lock done; aux = the peer's 4-byte AR8030 MAC */
+    MLM_LINK_BIND_FAIL       = 7, /* pair window timed out or the lock failed; pair mode exited */
 };
 
 struct mlm_link {
     uint32_t state; /* enum mlm_link_state */
-    uint32_t reserved;
+    uint32_t aux;   /* state-specific extra (BIND_OK: peer MAC, big-endian wire order); else 0.
+                     * Was `reserved`, always sent as 0 before the bind states existed. */
 } __attribute__((packed));
 
 /* MLM_T_LINKINFO payload (ml-linkd -> HUD on telemetry.sock). The local AR8030 baseband link
@@ -301,6 +305,13 @@ enum mlm_rfcmd_type {
                              * the air's VIN scale: aspect 0 = 16:9, 1 = 4:3; zoom_pct = zoom factor
                              * in percent, one of {100, 70} (the two HW-captured stock values).
                              * Applied live; a change blips the feed (geometry restart). */
+    MLM_RF_BIND         = 8, /* pair a new air unit: enter the chip's pair mode, poll for a peer
+                             * (the AU must be in ITS pair mode too), pair-lock the reported MAC.
+                             * arg = 0 dry-run (chip-runtime bind only, a power cycle reverts it),
+                             * arg = 1 also persist the peer into the staged config's candidate
+                             * list. LOCAL bb-socket sequence, refused while an air unit is alive
+                             * (:10000 telemetry fresh) so nothing can happen mid-flight; progress
+                             * comes back as MLM_T_LINK BINDING / BIND_OK / BIND_FAIL. */
 };
 
 /* MLM_RF_SET_CAMERA selectors, the air's SetCameraInfo union tags. Only the ones the stock Camera
