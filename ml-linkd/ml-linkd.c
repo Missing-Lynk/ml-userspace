@@ -875,7 +875,12 @@ static int bind_persist(const uint8_t mac[4])
         _exit(127);
     }
 
-    if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    pid_t w;
+    do {
+        w = waitpid(pid, &status, 0);
+    } while (w < 0 && errno == EINTR);
+
+    if (w != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         fprintf(stderr, TAG " bind: %s failed (peer %s bound at runtime only)\n",
                 PERSIST_TOOL, mac_str);
         return -1;
@@ -921,9 +926,14 @@ static void bind_run(uint8_t *frame, uint32_t *seq_link)
             usleep(2000);
         }
 
-        if (g_pair_seq != seq0 && g_pair_hit) {
-            hits++;
-            memcpy(mac, (const void *)g_pair_mac, sizeof mac);
+        if (g_pair_seq != seq0) {
+            /* pair with the RELEASE fence in the reader: once the new seq is visible, the matching
+             * g_pair_hit + g_pair_mac are too. */
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);
+            if (g_pair_hit) {
+                hits++;
+                memcpy(mac, g_pair_mac, sizeof mac);
+            }
         }
 
         usleep(BIND_POLL_US);
@@ -1065,6 +1075,10 @@ static void *reader(void *arg)
                  * matching hit/mac pair. */
                 g_pair_hit = payload[0] & 1;
                 memcpy(g_pair_mac, payload + 1, sizeof g_pair_mac);
+                /* publish g_pair_hit/g_pair_mac before the seq bump so a reader that observes the
+                 * new g_pair_seq is guaranteed to see the matching hit + MAC (aarch64 is weakly
+                 * ordered; the volatile seq alone does not order the plain g_pair_mac store). */
+                __atomic_thread_fence(__ATOMIC_RELEASE);
                 g_pair_seq++;
             } else if (buf[i + 5] == REPLY_CH && buf[i + 8] == GET_SCAN_RESULT) {
                 /* Seed the channel table for the sweep; --scan-probe also dumps the raw frame so the

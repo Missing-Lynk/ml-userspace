@@ -55,3 +55,10 @@ void linkcmd_select_channel(unsigned idx)
 {
     mlm_rfcmd_send(MLM_RF_SELECT_CHANNEL, idx);
 }
+
+void linkcmd_bind(void)
+{
+    /* arg 1 = persist the paired MAC into the config candidate list (survives a reboot); a dry-run
+     * (arg 0) is reachable only via the ml-rfcmd bench tool, not the button. */
+    mlm_rfcmd_send(MLM_RF_BIND, 1);
+}

@@ -56,6 +56,15 @@ bool linkstate_sei_brqp(int *br_kbps, int *qp);
  *  ml-linkd's SetStandyMode readback. 0 when active or no link. */
 bool linkstate_is_standby(void);
 
+/** @brief Whether a bind is in progress (ml-linkd's MLM_LINK_BINDING, until BIND_OK/BIND_FAIL).
+ *  Drives the System OSD "BIND" indicator and the in-progress buzzer cue. */
+bool linkstate_is_binding(void);
+
+/** @brief Latch a bind result edge (MLM_LINK_BIND_OK / BIND_FAIL). @return the result generation,
+ *  which increments once per completed bind (0 = none yet). A caller stores the last value it saw
+ *  and acts when it changes; @p ok (may be NULL) is written 1 on success, 0 on failure. */
+unsigned linkstate_bind_result(int *ok);
+
 struct mlm_scan;   /* ml-shared/mlm.h */
 
 /** @brief Copy the latest RF channel scan (ml-linkd's MLM_T_SCAN) into @p out. @return the scan

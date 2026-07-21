@@ -50,6 +50,10 @@ void sysosd_set_menu_open(int open);
 /** @brief Show or hide the red "REC" indicator (driven by ml-pipeline's reported state). */
 void sysosd_set_recording(int recording);
 
+/** @brief Show or hide the orange "BIND" indicator (driven by ml-linkd's bind state). Shares the
+ *  REC slot and takes precedence over it while a bind is in progress. */
+void sysosd_set_binding(int binding);
+
 /** @brief Show or hide the whole System OSD bar (playback hides it, leaving only the transport bar). */
 void sysosd_set_visible(int visible);
 

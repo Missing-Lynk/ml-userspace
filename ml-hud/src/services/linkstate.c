@@ -46,6 +46,12 @@ static uint32_t g_framestats_ms;
 static struct mlm_scan g_scan;
 static unsigned g_scan_gen;
 
+/* Bind progress from ml-linkd's MLM_T_LINK. g_binding is set between BINDING and BIND_OK/FAIL;
+ * g_bind_gen increments once per completed bind so the HUD can fire the result cue exactly once. */
+static int g_binding;
+static unsigned g_bind_gen;
+static int g_bind_ok;
+
 static uint32_t now_ms(void)
 {
     struct timespec t;
@@ -107,6 +113,12 @@ void linkstate_poll(int fd)
                 g_last_seen_ms = 0;   /* explicit loss: down at once, before the staleness timeout */
             } else if (link.state == MLM_LINK_PARAMS_ACKED || link.state == MLM_LINK_SESSION_RESTART) {
                 g_last_seen_ms = now_ms();
+            } else if (link.state == MLM_LINK_BINDING) {
+                g_binding = 1;
+            } else if (link.state == MLM_LINK_BIND_OK || link.state == MLM_LINK_BIND_FAIL) {
+                g_binding = 0;
+                g_bind_ok = (link.state == MLM_LINK_BIND_OK);
+                g_bind_gen++;
             }
         } else if (hdr.type == MLM_T_LINKINFO
                    && n >= (ssize_t) (sizeof hdr + sizeof(struct mlm_linkinfo))) {
@@ -223,6 +235,20 @@ int linkstate_distance_m(void)
 bool linkstate_is_standby(void)
 {
     return g_standby;
+}
+
+bool linkstate_is_binding(void)
+{
+    return g_binding != 0;
+}
+
+unsigned linkstate_bind_result(int *ok)
+{
+    if (ok != NULL) {
+        *ok = g_bind_ok;
+    }
+
+    return g_bind_gen;
 }
 
 int linkstate_throughput_kbps(void)

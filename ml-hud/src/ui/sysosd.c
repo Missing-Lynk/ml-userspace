@@ -16,6 +16,7 @@
 #define COLOR_TEXT_DIM  lv_color_hex(0x7A8497)   /* placeholder / no-link value */
 #define COLOR_WARN      lv_color_hex(0xE0633A)
 #define COLOR_REC       lv_color_hex(0xFF0000)   /* System OSD "REC" indicator (matches libre) */
+#define COLOR_BIND      lv_color_hex(0xD99A2B)   /* orange: "BIND" indicator (shares the REC slot) */
 #define COLOR_PARTIAL   lv_color_hex(0xD99A2B)   /* orange: standby cue */
 #define COLOR_YELLOW    lv_color_hex(0xE8D53A)   /* downlink headroom gauge: link filling up */
 #define OSD_PAD_HOR     44
@@ -192,9 +193,12 @@ void sysosd_create(lv_obj_t *parent)
 
     /* REC sits mid-group, so it keeps its slot when idle (opacity toggled, not hidden): hiding it
      * would shift the temperature field each time recording starts/stops. */
+    /* One slot shared by REC (recording) and BIND (binding a new air unit); they are mutually
+     * exclusive in practice (binding runs only while disconnected, recording only while connected).
+     * Sized to the wider "BIND" so neither clips and the fields after it never shift. */
     g_lbl_rec = add_field(g_group_left, NULL, "REC", COLOR_REC);
-    lv_obj_set_width(g_lbl_rec, field_width("REC"));
-    lv_obj_set_style_opa(g_lbl_rec, LV_OPA_TRANSP, 0);   /* visible only while recording */
+    lv_obj_set_width(g_lbl_rec, field_width("BIND"));
+    lv_obj_set_style_opa(g_lbl_rec, LV_OPA_TRANSP, 0);   /* visible only while recording/binding */
     g_lbl_temp = add_field(g_group_left, NULL, "--°C", COLOR_TEXT);
     lv_obj_set_width(g_lbl_temp, field_width(OSD_MAX_TEMP));
     lv_obj_add_flag(g_lbl_temp, LV_OBJ_FLAG_HIDDEN);   /* shown only when enabled and a reading exists */
@@ -248,14 +252,41 @@ void sysosd_set_menu_open(int open)
     }
 }
 
-void sysosd_set_recording(int recording)
+/* REC and BIND share g_lbl_rec. Binding wins the slot when both are somehow set (a bind only runs
+ * while disconnected, so recording cannot really be active then). Opacity, not hide: the field keeps
+ * its slot so the fields after it never shift. */
+static int g_recording;
+static int g_binding;
+
+static void rec_slot_refresh(void)
 {
     if (g_lbl_rec == NULL) {
         return;
     }
 
-    /* Opacity, not hide: the field keeps its slot so the fields after it never shift. */
-    lv_obj_set_style_opa(g_lbl_rec, recording ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+    if (g_binding) {
+        lv_label_set_text(g_lbl_rec, "BIND");
+        lv_obj_set_style_text_color(g_lbl_rec, COLOR_BIND, 0);
+        lv_obj_set_style_opa(g_lbl_rec, LV_OPA_COVER, 0);
+    } else if (g_recording) {
+        lv_label_set_text(g_lbl_rec, "REC");
+        lv_obj_set_style_text_color(g_lbl_rec, COLOR_REC, 0);
+        lv_obj_set_style_opa(g_lbl_rec, LV_OPA_COVER, 0);
+    } else {
+        lv_obj_set_style_opa(g_lbl_rec, LV_OPA_TRANSP, 0);
+    }
+}
+
+void sysosd_set_recording(int recording)
+{
+    g_recording = recording;
+    rec_slot_refresh();
+}
+
+void sysosd_set_binding(int binding)
+{
+    g_binding = binding;
+    rec_slot_refresh();
 }
 
 void sysosd_set_visible(int visible)

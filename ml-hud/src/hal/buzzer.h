@@ -18,6 +18,16 @@ int buzzer_volume(void);
 void buzzer_enable(int on);
 
 /**
+ * @brief Set the tone pitch from @p freq_hz, with a volume-proportional duty (50% at max volume,
+ * the loudest ratio, matching the boot chime). For melodies; gate it with buzzer_enable. A pitch
+ * far below the ~3.8 kHz piezo resonance is much quieter. No-op at @p freq_hz <= 0.
+ */
+void buzzer_pitch(int freq_hz);
+
+/** @brief Restore the default ~3.8 kHz beep period and volume duty after a melody. */
+void buzzer_reset_pitch(void);
+
+/**
  * @brief Force the tone off with a single raw sysfs write (open/write/close only).
  *
  * Async-signal-safe, unlike buzzer_enable (which uses stdio): safe to call from a fatal-signal

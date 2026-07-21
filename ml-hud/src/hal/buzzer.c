@@ -68,6 +68,32 @@ void buzzer_enable(int on)
     write_long(board_current()->buzzer_enable_path, on ? 1 : 0);
 }
 
+void buzzer_pitch(int freq_hz)
+{
+    long period;
+
+    if (freq_hz <= 0) {
+        return;
+    }
+
+    ensure_exported();
+    period = 1000000000L / freq_hz;
+
+    /* Write duty 0 before the period so the core never sees duty > period across the change; then a
+     * volume-proportional duty, period/2 (50%, loudest) at max volume. */
+    write_long(board_current()->buzzer_duty_path, 0);
+    write_long(board_current()->buzzer_period_path, period);
+    write_long(board_current()->buzzer_duty_path, period * g_volume / (2 * BUZZER_MAX_VOLUME));
+}
+
+void buzzer_reset_pitch(void)
+{
+    ensure_exported();
+    write_long(board_current()->buzzer_duty_path, 0);
+    write_long(board_current()->buzzer_period_path, BUZZER_PERIOD_NS);
+    write_long(board_current()->buzzer_duty_path, (long) g_volume * BUZZER_DUTY_STEP);
+}
+
 void buzzer_panic_off(void)
 {
     int fd = open(board_current()->buzzer_enable_path, O_WRONLY);

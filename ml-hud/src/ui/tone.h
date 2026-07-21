@@ -10,10 +10,17 @@
 
 #include <stdint.h>
 
-/** @brief Start a short beep at the current buzzer volume. No-op while the volume is 0. */
+/** @brief Start a short beep at the current buzzer volume. No-op while the volume is 0 or a melody
+ * is playing (the melody owns the buzzer until it finishes). */
 void tone_beep(uint32_t now_ms);
 
-/** @brief End the current beep once its duration elapses. Call every loop iteration. */
+/** @brief Play the bind-success melody (the rising power-on chime). No-op while the volume is 0. */
+void tone_success(uint32_t now_ms);
+
+/** @brief Play the bind-failure cue (a distinct descending pair). No-op while the volume is 0. */
+void tone_fail(uint32_t now_ms);
+
+/** @brief Advance the current beep or melody. Call every loop iteration. */
 void tone_tick(uint32_t now_ms);
 
 #endif /* HUD_UI_TONE_H */

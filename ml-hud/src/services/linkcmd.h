@@ -42,4 +42,10 @@ void linkcmd_request_scan(void);
  *  channel back from linkstate_channel(), do not assume it took. */
 void linkcmd_select_channel(unsigned idx);
 
+/** @brief Start binding a new air unit: ml-linkd runs the pair sequence and persists the peer. The
+ *  caller must gate this on no air unit being connected (ml-linkd refuses otherwise, so nothing
+ *  happens mid-flight). Progress arrives back as MLM_T_LINK BINDING/BIND_OK/BIND_FAIL
+ *  (linkstate_is_binding / linkstate_bind_result). */
+void linkcmd_bind(void);
+
 #endif /* HUD_LINKCMD_H */

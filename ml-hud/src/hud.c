@@ -44,6 +44,7 @@
 #define ALARM_PERIOD_MS 2000   /* low-voltage alarm chirp interval while active */
 #define SYSOSD_PERIOD_MS 1000  /* System OSD telemetry refresh interval */
 #define SRT_PERIOD_MS   1000   /* DVR subtitle-sidecar line interval while recording */
+#define BIND_CHIRP_MS   600    /* buzzer chirp interval through the bind pair window */
 
 #define TEMPWARN_HYST_C    5    /* the banner latches off this many deg C below the threshold */
 #define TEMPWARN_CHIRP_MS  2000 /* overheat chirp interval while the banner is latched */
@@ -221,6 +222,19 @@ static void on_button(void *ctx, hud_button_t button, hud_button_edge_t edge)
         return;
     }
 
+    /* Bind a new air unit. Only while no air unit is connected, so a press can never re-pair mid-
+     * flight (ml-linkd enforces the same gate).
+     * Works with the menu open or closed, like record. ml-linkd reports progress back over the
+     * link seam, which drives the System OSD "BIND" indicator and the buzzer cues
+     * (bind_ui_tick). */
+    if (button == HUD_BTN_BIND && edge == HUD_EDGE_DOWN) {
+        if (!linkstate_is_airunit_connected() && !linkstate_is_binding()) {
+            linkcmd_bind();
+        }
+
+        return;
+    }
+
     if (!menu_is_open()) {
         if (button == HUD_BTN_CENTER && edge == HUD_EDGE_DOWN) {
             menu_open();
@@ -299,6 +313,51 @@ static void alarm_tick(hud_ctx_t *h, uint32_t now)
     float threshold = (float) atof(settings_get_string_in(h->settings, "goggle", "min_cell_voltage", "3.4V"));
     if (per_cell < threshold) {
         tone_beep(now_ms());
+    }
+}
+
+/* Bind UI: mirror ml-linkd's bind state onto the System OSD "BIND" indicator and the buzzer. While
+ * binding, chirp on a slow cadence (the vendor beeps through the pair window); on completion, play
+ * the success melody (the power-on chime) or a distinct failure cue, exactly once per bind. The
+ * in-progress chirp respects key_tones_off; the result melody always plays (buzzer-volume gated), as
+ * it is the answer to a deliberate action, not a key tone. */
+static void bind_ui_tick(hud_ctx_t *h, uint32_t now)
+{
+    static int inited;
+    static unsigned last_gen;
+    static uint32_t next_chirp_ms;
+    int binding = linkstate_is_binding();
+    int ok = 0;
+    unsigned gen;
+
+    if (!inited) {
+        last_gen = linkstate_bind_result(NULL);   /* ignore any result that predates the HUD */
+        inited = 1;
+    }
+
+    if (h->drm != NULL) {
+        sysosd_set_binding(binding);
+    }
+
+    if (binding) {
+        if ((int32_t) (now - next_chirp_ms) >= 0) {
+            next_chirp_ms = now + BIND_CHIRP_MS;
+            if (!settings_get_bool_in(h->settings, "goggle", "key_tones_off", 0)) {
+                tone_beep(now);
+            }
+        }
+    } else {
+        next_chirp_ms = now;   /* re-arm so the next bind's first chirp is immediate */
+    }
+
+    gen = linkstate_bind_result(&ok);
+    if (gen != last_gen) {
+        last_gen = gen;
+        if (ok) {
+            tone_success(now);
+        } else {
+            tone_fail(now);
+        }
     }
 }
 
@@ -835,7 +894,8 @@ int main(int argc, char **argv)
         }
 
         uint32_t now = now_ms();
-        tone_tick(now);   /* end any finished key-tone beep */
+        bind_ui_tick(&h, now);   /* BIND indicator + bind buzzer cues off ml-linkd's state */
+        tone_tick(now);   /* advance the current beep or melody */
         alarm_tick(&h, now);
         srt_tick(&h, recording, connected, now);
         burn_tick(&h, recording);
