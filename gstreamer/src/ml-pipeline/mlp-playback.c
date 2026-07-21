@@ -66,43 +66,55 @@ static gboolean on_pb_bus(GstBus *bus, GstMessage *msg, gpointer u)
     return TRUE;
 }
 
-/* Compose the decode graph for a clip: MP4 (DVR H.264) is demuxed by qtdemux; a raw Annex-B
- * elementary stream is parsed directly. The wave5 decoder exports dmabuf so on_file_sample can
- * scan each frame out zero-copy on the primary CRTC.
+/* Compose the decode graph for a clip: MP4 is demuxed by qtdemux; a raw Annex-B elementary
+ * stream is parsed directly. mp4_h265 selects the MP4 branch's codec (from clip_mp4_probe); a
+ * raw stream's codec comes from its extension. The wave5 decoder exports dmabuf so
+ * on_file_sample can scan each frame out zero-copy on the primary CRTC.
  */
-static gchar *pb_desc(const char *path)
+static gchar *pb_desc(const char *path, gboolean mp4_h265)
 {
     const char *dot = strrchr(path, '.');
     gboolean mp4 = dot && (!strcasecmp(dot, ".mp4") || !strcasecmp(dot, ".mov"));
-    gboolean h265 = dot && (!strcasecmp(dot, ".h265") || !strcasecmp(dot, ".hevc"));
+    gboolean h265 = mp4 ? mp4_h265
+        : dot && (!strcasecmp(dot, ".h265") || !strcasecmp(dot, ".hevc"));
+    const char *codec = h265 ? "h265" : "h264";
 
     if (mp4) {
-        /* DVR recordings are H.264 in MP4; qtdemux's dynamic pad links to h264parse via parse. */
+        /* qtdemux's dynamic pad links to the matching parser via parse. */
         return g_strdup_printf(
-            "filesrc location=\"%s\" ! qtdemux ! h264parse ! v4l2h264dec capture-io-mode=dmabuf "
-            "name=dec ! appsink name=sink", path);
+            "filesrc location=\"%s\" ! qtdemux ! %sparse ! v4l2%sdec capture-io-mode=dmabuf "
+            "name=dec ! appsink name=sink", path, codec, codec);
     }
 
     return g_strdup_printf(
         "filesrc location=\"%s\" ! %sparse ! v4l2%sdec capture-io-mode=dmabuf name=dec "
-        "! appsink name=sink", path, h265 ? "h265" : "h264", h265 ? "h265" : "h264");
+        "! appsink name=sink", path, codec, codec);
 }
 
-/* Whether a clip decodes at the panel's native geometry, read from the MP4's avc1 sample entry. A
- * native clip scans out zero-copy (single mode); only a sub-panel clip (e.g. a 720p DVR recording)
- * needs the ar_scaler. Walks the top-level atoms to moov (front or after the mdat), reads the moov
- * body, and finds the avc1 box's width/height (the 2-byte fields 28 bytes past the 'avc1' fourcc).
- * Defaults to FALSE (scale) when the size cannot be determined: the scaler handles any size, so an
- * unparsed clip still plays (a native one just takes the scaler's unity path instead of zero-copy).
+/* What clip_mp4_probe reads out of an MP4's video sample entry. */
+struct clip_mp4_info {
+    gboolean h265;      /* sample entry is hvc1/hev1 (HEVC), not avc1 (H.264) */
+    gboolean native;    /* clip geometry equals the panel's (zero-copy scanout) */
+};
+
+/* Probe an MP4 clip's video sample entry for codec and geometry. A native-geometry clip scans out
+ * zero-copy (single mode); only a sub-panel clip (e.g. a 720p DVR recording) needs the ar_scaler.
+ * Walks the top-level atoms to moov (front or after the mdat), reads the moov body, and finds the
+ * avc1/hvc1/hev1 box; avc1 and hvc1/hev1 share the visual sample entry layout, so width/height are
+ * the 2-byte fields 28 bytes past the fourcc either way. Defaults to h265=FALSE, native=FALSE when
+ * nothing can be determined: the scaler handles any size, so an unparsed clip still plays (a
+ * native one just takes the scaler's unity path instead of zero-copy).
  */
-static gboolean clip_is_native_res(const char *path)
+static void clip_mp4_probe(const char *path, struct clip_mp4_info *info)
 {
+    info->h265 = FALSE;
+    info->native = FALSE;
+
     FILE *f = fopen(path, "rb");
     if (f == NULL) {
-        return FALSE;
+        return;
     }
 
-    gboolean native = FALSE;
     for (;;) {
         unsigned char hdr[16];
         if (fread(hdr, 1, 8, f) != 8) {
@@ -138,10 +150,14 @@ static gboolean clip_is_native_res(const char *path)
             unsigned char *m = g_malloc(body);
             if (fread(m, 1, body, f) == body) {
                 for (guint64 i = 0; i + 32 <= body; i++) {
-                    if (memcmp(m + i, "avc1", 4) == 0) {
+                    gboolean avc = memcmp(m + i, "avc1", 4) == 0;
+                    gboolean hevc = memcmp(m + i, "hvc1", 4) == 0 ||
+                                    memcmp(m + i, "hev1", 4) == 0;
+                    if (avc || hevc) {
                         int w = (m[i + 28] << 8) | m[i + 29];
                         int h = (m[i + 30] << 8) | m[i + 31];
-                        native = (w == COMP_W && h == COMP_H);
+                        info->h265 = hevc;
+                        info->native = (w == COMP_W && h == COMP_H);
                         break;
                     }
                 }
@@ -157,7 +173,6 @@ static gboolean clip_is_native_res(const char *path)
     }
 
     fclose(f);
-    return native;
 }
 
 /* Return to the live RF stream: restore the RF display mode and rebuild the decode graph. */
@@ -184,7 +199,10 @@ void playback_play(struct ctx *c, const char *path)
         rf_decode_stop(c);
     }
 
-    gchar *desc = pb_desc(path);
+    struct clip_mp4_info info;
+    clip_mp4_probe(path, &info);
+
+    gchar *desc = pb_desc(path, info.h265);
     c->pb_pipe = gst_parse_launch(desc, &err);
     g_free(desc);
     if (!c->pb_pipe) {
@@ -229,7 +247,7 @@ void playback_play(struct ctx *c, const char *path)
      * the ar_scaler present it is upscaled per frame into a composite pool buffer and rides the
      * composite page-flip path (pb_scale). Without the scaler a sub-panel clip cannot display.
      */
-    gboolean scale = !clip_is_native_res(path);
+    gboolean scale = !info.native;
     if (scale && c->scaler_fd < 0) {
         c->scaler_fd = open("/dev/arscaler", O_RDWR | O_CLOEXEC);
     }

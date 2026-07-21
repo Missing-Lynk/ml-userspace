@@ -329,8 +329,8 @@ static void *rec_scale_worker(void *arg)
 }
 
 /* Build and start the record bin. The encoder imports the composite dma-buf (output-io-mode=
- * dmabuf-import), so its input pool allocates NO CMA and there is no per-frame copy. H.264 to
- * match the vendor DVR and the scripts/dvr-frame.sh tooling.
+ * dmabuf-import), so its input pool allocates NO CMA and there is no per-frame copy. H.265
+ * (Wave521C HEVC) by default; ML_DVR_CODEC=h264 selects H.264, matching the vendor DVR.
  */
 int rec_start(struct ctx *c, const char *path)
 {
@@ -340,7 +340,12 @@ int rec_start(struct ctx *c, const char *path)
     GstCaps *caps;
     const char *res = getenv("ML_DVR_RES");   /* env overrides the HUD-latched format (bench) */
     const char *fps = getenv("ML_DVR_FPS");
+    const char *codec = getenv("ML_DVR_CODEC");
     char rate[96] = "", scale[96] = "";
+
+    /* ML_DVR_CODEC=h264 (or avc) records H.264; anything else (or unset) records HEVC. */
+    const char *cname = codec && (strcasecmp(codec, "h264") == 0 || strcasecmp(codec, "avc") == 0)
+        ? "h264" : "h265";
 
     if (c->rec_bin) {                   /* already recording */
         return 0;
@@ -435,15 +440,15 @@ int rec_start(struct ctx *c, const char *path)
         "max-buffers=%d leaky-type=downstream block=false "
         "! video/x-raw,format=I420,width=%d,height=%d,framerate=%d/1 "
         "%s%s"
-        "! v4l2h264enc %s "
+        "! v4l2%senc %s "
 
         /* Fragmented MP4 (moof/mdat every 1 s): the file on disk is playable up to the last
          * complete fragment even if the process is SIGKILLed (OOM) - which no signal handler can
          * catch. A clean stop (rec_stop EOS) still finalizes normally. Costs at most ~1 s of tail.
          */
-        "! h264parse ! mp4mux fragment-duration=1000 ! filesink location=%s",
-        c->rec_qmax, cap_w, cap_h, cap_fps, rate, scale,
-        c->rec_import || c->rec_hwscale ? "output-io-mode=dmabuf-import" : "", path);
+        "! %sparse ! mp4mux fragment-duration=1000 ! filesink location=%s",
+        c->rec_qmax, cap_w, cap_h, cap_fps, rate, scale, cname,
+        c->rec_import || c->rec_hwscale ? "output-io-mode=dmabuf-import" : "", cname, path);
 
     c->rec_bin = gst_parse_launch(desc, &err);
     g_free(desc);
@@ -514,8 +519,8 @@ int rec_start(struct ctx *c, const char *path)
     }
 
     c->rec_on = 1;
-    printf("ml-pipeline: DVR recording %dx%d@%d (%s) -> %s\n",
-           fmt->w, fmt->h, c->rec_fps,
+    printf("ml-pipeline: DVR recording %dx%d@%d %s (%s) -> %s\n",
+           fmt->w, fmt->h, c->rec_fps, cname,
            c->rec_hwscale ? "HW scale" : c->rec_import ? "import" : "copy", path);
 
     return 0;

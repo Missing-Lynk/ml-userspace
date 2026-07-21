@@ -111,7 +111,7 @@ gboolean comp_pool_init(struct ctx *c)
     rec_hw_init(c);
 
     /* Cap the pool: the default heap is the SHARED mmz pool, and the composite allocates
-     * before the two decoders claim their ~52 MiB of the same 108 MiB pool, so an uncapped
+     * before the two decoders claim their ~52 MiB of the same MMZ pool, so an uncapped
      * greedy grab would starve wave5. ML_COMP_MAX bounds it (ml-video-up sets 10 -> ~31 MiB,
      * leaving room for wave5 + DVR encoder). Default COMP_POOL for the standalone/CMA case.
      */

@@ -6,7 +6,7 @@ This applies only in the sole-owner case (the vendor `ar_lowdelay` is not runnin
 
 ## Two ways to get a physical buffer
 
-The codecs DMA to and from physical addresses; userspace never mmaps codec registers, only the DMA buffers. Two allocators exist, both backed by the same MMZ carveout (the anonymous zone at phys 0x29400000 + 0x06C00000, 108 MiB).
+The codecs DMA to and from physical addresses; userspace never mmaps codec registers, only the DMA buffers. Two allocators exist, both backed by the same MMZ carveout (the anonymous zone; geometry from the DTS mmz reserved-memory node).
 
 Direct MMZ (simplest for a harness): one call returns both the physical base and a CPU pointer.
 
