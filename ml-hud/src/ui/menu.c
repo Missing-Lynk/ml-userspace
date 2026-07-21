@@ -555,7 +555,7 @@ static void apply_item(const gog_item_t *item, const char *value)
         buzzer_set_volume(atoi(value));
 
         /* confirm the new volume with a beep */
-        tone_beep(lv_tick_get());
+        tone_beep();
     } else if (strcmp(item->action, "language") == 0) {
         set_language(value);
     } else if (strcmp(item->action, "standby") == 0) {

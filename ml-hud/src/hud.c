@@ -208,7 +208,7 @@ static void on_button(void *ctx, hud_button_t button, hud_button_edge_t edge)
     }
 
     if (edge == HUD_EDGE_DOWN && !settings_get_bool_in(h->settings, "goggle", "key_tones_off", 0)) {
-        tone_beep(now_ms());
+        tone_beep();
     }
 
     /* Record works whether or not the menu is open (you record while flying), so it is handled before
@@ -316,7 +316,7 @@ static void alarm_tick(hud_ctx_t *h, uint32_t now)
     float per_cell = telemetry.pack_volts / telemetry.cell_count;
     float threshold = (float) atof(settings_get_string_in(h->settings, "goggle", "min_cell_voltage", "3.4V"));
     if (per_cell < threshold) {
-        tone_beep(now_ms());
+        tone_beep();
     }
 }
 
@@ -347,7 +347,7 @@ static void bind_ui_tick(hud_ctx_t *h, uint32_t now)
         if ((int32_t) (now - next_chirp_ms) >= 0) {
             next_chirp_ms = now + BIND_CHIRP_MS;
             if (!settings_get_bool_in(h->settings, "goggle", "key_tones_off", 0)) {
-                tone_beep(now);
+                tone_beep();
             }
         }
     } else {
@@ -358,9 +358,9 @@ static void bind_ui_tick(hud_ctx_t *h, uint32_t now)
     if (gen != last_gen) {
         last_gen = gen;
         if (ok) {
-            tone_success(now);
+            tone_success();
         } else {
-            tone_fail(now);
+            tone_fail();
         }
     }
 }
@@ -614,7 +614,7 @@ static void tempwarn_tick(hud_ctx_t *h, int connected, uint32_t now)
 
     if (h->tempwarn_latched && (int32_t) (now - h->tempwarn_next_ms) >= 0) {
         h->tempwarn_next_ms = now + TEMPWARN_CHIRP_MS;
-        tone_beep(now);
+        tone_beep();
     }
 }
 
@@ -852,6 +852,8 @@ int main(int argc, char **argv)
     signal(SIGILL, on_fatal);
     signal(SIGFPE, on_fatal);
 
+    tone_init();
+
     const osd_channel_cb_t cb = { on_osd, on_version, on_periodic };
 
     /* ml-linkd routes the 0x09/0x11 status frames to telemetry.sock (linkstate's socket), not
@@ -901,7 +903,6 @@ int main(int argc, char **argv)
 
         uint32_t now = now_ms();
         bind_ui_tick(&h, now);   /* BIND indicator + bind buzzer cues off ml-linkd's state */
-        tone_tick(now);   /* advance the current beep or melody */
         alarm_tick(&h, now);
         srt_tick(&h, recording, connected, now);
         burn_tick(&h, recording);
@@ -928,6 +929,7 @@ int main(int argc, char **argv)
     osd_channel_close(fd);
     linkstate_close(link_fd);
     input_close(input_fd);
+    tone_shutdown();
 
     fprintf(stderr, "hud: %ld OSD frame(s) received, %ld rendered\n", h.osd_frames, h.rendered);
     if (h.have_voltage) {

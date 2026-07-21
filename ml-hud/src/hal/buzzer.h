@@ -3,7 +3,8 @@
  * @brief Goggle buzzer over its PWM: duty sets the volume, enable gates the tone.
  *
  * The volume is the PWM duty cycle and a "beep" is the enable line pulsed on then
- * off (see ui/tone). Volume 0 is silent: enable is then a no-op.
+ * off (see ui/tone). Volume 0 is silent: enable is then a no-op. All calls are thread-safe: an
+ * internal lock serializes the volume state and the multi-write sysfs sequences.
  */
 #ifndef HUD_BUZZER_H
 #define HUD_BUZZER_H
@@ -31,7 +32,9 @@ void buzzer_reset_pitch(void);
  * @brief Force the tone off with a single raw sysfs write (open/write/close only).
  *
  * Async-signal-safe, unlike buzzer_enable (which uses stdio): safe to call from a fatal-signal
- * handler or atexit so a crashing/aborting process never leaves the PWM latched on.
+ * handler or atexit so a crashing/aborting process never leaves the PWM latched on. Also latches
+ * a panic flag that makes every later buzzer_enable(1) a no-op, so a still-running tone thread
+ * cannot re-enable the PWM after this write.
  */
 void buzzer_panic_off(void);
 

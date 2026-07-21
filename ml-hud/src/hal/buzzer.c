@@ -3,6 +3,8 @@
 #include "board.h"
 
 #include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <unistd.h>
 
@@ -11,8 +13,17 @@
 #define BUZZER_DUTY_STEP  13000L    /* duty = 13000 * volume ns (volume 1..10) */
 #define BUZZER_MAX_VOLUME 10
 
-static int g_volume;    /* 0 = silent */
-static int g_exported;  /* the PWM channel has been exported + its period set */
+/* Callers span two threads (the tone thread and the main/LVGL thread via the volume setting), so
+ * g_lock serializes the volume state and every multi-write sysfs sequence. g_panic is set by
+ * buzzer_panic_off (signal context, so no lock) and permanently refuses further enables, keeping
+ * the crash path the last writer of the enable file.
+ */
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile sig_atomic_t g_panic;
+
+/* g_volume 0 = silent; g_exported = the PWM channel has been exported + its period set. */
+static int g_volume;
+static int g_exported;
 
 static void write_long(const char *path, long value)
 {
@@ -49,23 +60,33 @@ void buzzer_set_volume(int volume)
         volume = BUZZER_MAX_VOLUME;
     }
 
+    pthread_mutex_lock(&g_lock);
     g_volume = volume;
     ensure_exported();
     write_long(board_current()->buzzer_duty_path, (long) volume * BUZZER_DUTY_STEP);
+    pthread_mutex_unlock(&g_lock);
 }
 
 int buzzer_volume(void)
 {
-    return g_volume;
+    int volume;
+
+    pthread_mutex_lock(&g_lock);
+    volume = g_volume;
+    pthread_mutex_unlock(&g_lock);
+    return volume;
 }
 
 void buzzer_enable(int on)
 {
-    if (on && g_volume <= 0) {
+    pthread_mutex_lock(&g_lock);
+    if (on && (g_volume <= 0 || g_panic)) {
+        pthread_mutex_unlock(&g_lock);
         return;
     }
 
     write_long(board_current()->buzzer_enable_path, on ? 1 : 0);
+    pthread_mutex_unlock(&g_lock);
 }
 
 void buzzer_pitch(int freq_hz)
@@ -76,27 +97,39 @@ void buzzer_pitch(int freq_hz)
         return;
     }
 
+    pthread_mutex_lock(&g_lock);
     ensure_exported();
     period = 1000000000L / freq_hz;
 
     /* Write duty 0 before the period so the core never sees duty > period across the change; then a
-     * volume-proportional duty, period/2 (50%, loudest) at max volume. */
+     * volume-proportional duty, period/2 (50%, loudest) at max volume.
+     */
     write_long(board_current()->buzzer_duty_path, 0);
     write_long(board_current()->buzzer_period_path, period);
     write_long(board_current()->buzzer_duty_path, period * g_volume / (2 * BUZZER_MAX_VOLUME));
+    pthread_mutex_unlock(&g_lock);
 }
 
 void buzzer_reset_pitch(void)
 {
+    pthread_mutex_lock(&g_lock);
     ensure_exported();
     write_long(board_current()->buzzer_duty_path, 0);
     write_long(board_current()->buzzer_period_path, BUZZER_PERIOD_NS);
     write_long(board_current()->buzzer_duty_path, (long) g_volume * BUZZER_DUTY_STEP);
+    pthread_mutex_unlock(&g_lock);
 }
 
 void buzzer_panic_off(void)
 {
-    int fd = open(board_current()->buzzer_enable_path, O_WRONLY);
+    int fd;
+
+    /* Refuse all future enables first, so a concurrently running tone thread cannot re-latch the
+     * PWM after the off write below. No locking: this runs in fatal-signal context.
+     */
+    g_panic = 1;
+
+    fd = open(board_current()->buzzer_enable_path, O_WRONLY);
     if (fd < 0) {
         return;
     }

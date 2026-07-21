@@ -99,7 +99,9 @@ add_executable(hud
     src/ui/tempwarn.c)
 target_include_directories(hud PRIVATE
     src src/osd src/fb src/channel src/settings src/services src/hal src/ui)
-target_link_libraries(hud PRIVATE lvgl lodepng cjson)
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+target_link_libraries(hud PRIVATE lvgl lodepng cjson Threads::Threads)
 
 # Dev tooling: the OSD-channel replay (captured corpus playback onto the mlm seams, ml-linkd drop-in).
 add_executable(osd-replay tools/osd-replay.c)
