@@ -45,6 +45,11 @@
 #define SYSOSD_PERIOD_MS 1000  /* System OSD telemetry refresh interval */
 #define SRT_PERIOD_MS   1000   /* DVR subtitle-sidecar line interval while recording */
 #define BIND_CHIRP_MS   600    /* buzzer chirp interval through the bind pair window */
+#define BIND_HOLD_MS    800    /* hold BIND this long to start pairing; the adc-keys ladder puts bind
+                                  on the lowest voltage rung, so a simultaneous press of two other
+                                  buttons briefly collapses the divider into the bind band and the
+                                  driver emits a spurious bind code. Requiring a steady hold rejects
+                                  that transient while a deliberate press still pairs. */
 
 #define TEMPWARN_HYST_C    5    /* the banner latches off this many deg C below the threshold */
 #define TEMPWARN_CHIRP_MS  2000 /* overheat chirp interval while the banner is latched */
@@ -85,6 +90,9 @@ typedef struct {
     int            back_held;        /* BACK is currently down */
     int            back_fired;       /* the long-press close already fired for this hold */
     uint32_t       back_down_ms;     /* when BACK went down */
+    int            bind_held;        /* the bind rung is currently down */
+    int            bind_fired;       /* the confirmed bind already dispatched for this hold */
+    uint32_t       bind_down_ms;     /* when the bind rung went down */
     uint32_t       alarm_next_ms;    /* next low-voltage alarm check */
     uint32_t       sysosd_next_ms;   /* next System OSD telemetry refresh */
     uint32_t       srt_next_ms;      /* next DVR subtitle line (while recording, save_srt on) */
@@ -228,14 +236,19 @@ static void on_button(void *ctx, hud_button_t button, hud_button_edge_t edge)
         return;
     }
 
-    /* Bind a new air unit. Only while no air unit is connected, so a press can never re-pair mid-
-     * flight (ml-linkd enforces the same gate).
-     * Works with the menu open or closed, like record. ml-linkd reports progress back over the
-     * link seam, which drives the System OSD "BIND" indicator and the buzzer cues
-     * (bind_ui_tick). */
-    if (button == HUD_BTN_BIND && edge == HUD_EDGE_DOWN) {
-        if (!linkstate_is_airunit_connected() && !linkstate_is_binding()) {
-            linkcmd_bind();
+    /* Bind a new air unit. The bind rung must be held BIND_HOLD_MS before pairing starts (bind_arm_tick
+     * confirms it), so a spurious bind code from an adc-keys chord transient is rejected. Only while no
+     * air unit is connected, so a press can never re-pair mid-flight (ml-linkd enforces the same gate);
+     * that gate is re-checked at fire time. Works with the menu open or closed, like record. ml-linkd
+     * reports progress back over the link seam, which drives the System OSD "BIND" indicator and the
+     * buzzer cues (bind_ui_tick). */
+    if (button == HUD_BTN_BIND) {
+        if (edge == HUD_EDGE_DOWN) {
+            h->bind_held = 1;
+            h->bind_fired = 0;
+            h->bind_down_ms = now_ms();
+        } else if (edge == HUD_EDGE_UP) {
+            h->bind_held = 0;   /* released before BIND_HOLD_MS: a chord transient, ignored */
         }
 
         return;
@@ -681,6 +694,24 @@ static void back_longpress_tick(hud_ctx_t *h)
     }
 }
 
+/* Start pairing once the bind rung has been held BIND_HOLD_MS, rejecting the brief spurious bind code
+ * an adc-keys chord transient produces. Fires once per hold; the no-air-unit gate is re-checked here
+ * (a bind can never re-pair mid-flight). A confirmation chirp signals the hold registered, ahead of
+ * ml-linkd's own pair-window cues (bind_ui_tick). */
+static void bind_arm_tick(hud_ctx_t *h, uint32_t now)
+{
+    if (!h->bind_held || h->bind_fired || (int32_t) (now - h->bind_down_ms) < BIND_HOLD_MS) {
+        return;
+    }
+
+    h->bind_fired = 1;
+    if (!linkstate_is_airunit_connected() && !linkstate_is_binding()) {
+        tone_beep();
+        linkcmd_bind();
+        fprintf(stderr, "hud: bind requested (held)\n");
+    }
+}
+
 /* Sync the BTFL gate to the menu on any open/close edge, however it was triggered. */
 static void menu_state_sync(hud_ctx_t *h)
 {
@@ -929,6 +960,7 @@ int main(int argc, char **argv)
 
         uint32_t now = now_ms();
         bind_ui_tick(&h, now);   /* BIND indicator + bind buzzer cues off ml-linkd's state */
+        bind_arm_tick(&h, now);  /* confirm a held bind press; rejects adc-keys chord transients */
         alarm_tick(&h, now);
         srt_tick(&h, recording, connected, now);
         burn_tick(&h, recording);
