@@ -75,6 +75,11 @@ static const char *const band_options[]      = { "Race", "Normal", NULL };
 #define BAND_MARKER_DIR  "/usrdata/missinglynk"
 #define BAND_MARKER_PATH BAND_MARKER_DIR "/rf-band"
 
+/* The per-band saved channel ml-video reads at boot and passes to ml-linkd as ML_OPEN_CHNIDX, so the
+ * link opens on the saved channel instead of the band's first valid one. Same volume as the band
+ * marker: it must outlive the reboot a band change applies. */
+#define CHAN_MARKER_PATH BAND_MARKER_DIR "/rf-channel"
+
 /* The Goggles section: display and on-screen-display settings only. */
 static const gog_item_t g_goggles_items[] = {
     { ITEM_STEPPER, "goggles.brightness",       "brightness",       brightness_options, 5, 0, "brightness" },
@@ -1408,6 +1413,28 @@ static void open_confirm(const char *prompt, const char *confirm_label, void (*f
  * The reset boots whatever slot the GPT marks active, which is the point: it is stock slot A while
  * slot B is only RAM-booted, so this returns to B only once B is the flashed active slot.
  */
+/* Point the rf-channel marker at @p idx, the channel ml-video passes to ml-linkd as ML_OPEN_CHNIDX.
+ * idx < 0 removes the marker, so ml-linkd opens on the band's first valid channel. Best-effort: a
+ * failed write just falls back to that same first-valid open. */
+static void channel_marker_write(int idx)
+{
+    mkdir(BAND_MARKER_DIR, 0755);
+
+    if (idx < 0) {
+        unlink(CHAN_MARKER_PATH);
+        return;
+    }
+
+    FILE *f = fopen(CHAN_MARKER_PATH, "w");
+    if (f == NULL) {
+        fprintf(stderr, "menu: cannot write %s: %s\n", CHAN_MARKER_PATH, strerror(errno));
+        return;
+    }
+
+    fprintf(f, "%d", idx);
+    fclose(f);
+}
+
 static void band_confirm_apply(void)
 {
     const char *band = (g_band_pending != NULL && strcmp(g_band_pending, "Normal") == 0)
@@ -1431,6 +1458,12 @@ static void band_confirm_apply(void)
 
     settings_set_string_in(g_settings, GOG_SECTION, "band", g_band_pending);
     g_band_pending = NULL;
+
+    /* The saved channel is per band and the two bands' index ranges are disjoint, so repoint the
+     * rf-channel marker at the new band's saved channel (settings_channel_key now reflects the band
+     * just written above), or clear it so ml-linkd opens on the new band's first valid channel. */
+    channel_marker_write(settings_get_int_in(g_settings, GOG_SECTION,
+                                             settings_channel_key(g_settings), -1));
     sync();
 
     system("/usr/local/bin/wdt-reset");
@@ -1503,7 +1536,11 @@ static const player_host_t g_player_host = {
 static lv_style_t *host_style_item(void)         { return &g_style_item; }
 static lv_style_t *host_style_item_focused(void) { return &g_style_item_focused; }
 static bool         host_is_in_sidebar(void)         { return g_zone == 0; }
-static void        host_persist_channel(int idx) { settings_set_int_in(g_settings, GOG_SECTION, "channel", idx); }
+static void        host_persist_channel(int idx)
+{
+    settings_set_int_in(g_settings, GOG_SECTION, settings_channel_key(g_settings), idx);
+    channel_marker_write(idx);
+}
 
 static const menu_channel_host_t g_channel_host = {
     .content            = host_content,

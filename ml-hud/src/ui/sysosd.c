@@ -421,13 +421,13 @@ static void update_goggle_battery(const telemetry_t *telemetry, settings_t *sett
  * otherwise) so a pilot can always read off their channel. */
 static void update_link_fields(int connected, settings_t *settings)
 {
-    /* Before ml-linkd's first report, fall back to the saved channel (the value the HUD asserts on
-     * every link-up; default 0, the Normal-band bring-up channel), so the field is right from the
-     * first paint instead of flashing "CH --" and reflowing the bar. The content-sized label then
-     * only changes on an actual channel switch. */
+    /* Before ml-linkd's first report, fall back to the per-band saved channel (the value the link
+     * opens on), so the field is right from the first paint instead of flashing "CH --" and
+     * reflowing the bar. When no channel is saved for the band it is -1 and the placeholder shows
+     * until ml-linkd reports its first-valid choice. */
     int channel = linkstate_channel();
     if (channel == MLM_LINKINFO_NONE) {
-        channel = settings_get_int_in(settings, GOG_SECTION, "channel", 0);
+        channel = settings_get_int_in(settings, GOG_SECTION, settings_channel_key(settings), -1);
     }
 
     if (channel >= 0) {

@@ -256,6 +256,16 @@ const char *settings_get_string_in(settings_t *settings, const char *section, co
     return fallback;
 }
 
+const char *settings_channel_key(settings_t *settings)
+{
+    const char *band = settings_get_string_in(settings, "goggle", "band", "Race");
+    if (strcmp(band, "Normal") == 0) {
+        return "channel_normal";
+    }
+
+    return "channel_race";
+}
+
 int settings_get_int_in(settings_t *settings, const char *section, const char *key, int fallback)
 {
     cJSON *object = section_get(settings, section);

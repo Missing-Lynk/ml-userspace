@@ -50,4 +50,9 @@ int settings_set_bool_in(settings_t *settings, const char *section, const char *
  * sweep, a multi-key reset): set each key with this, then persist the batch with one settings_save. */
 int settings_set_int_in_nosave(settings_t *settings, const char *section, const char *key, int value);
 
+/* The per-band saved-channel key in the "goggle" section: "channel_normal" or "channel_race",
+ * selected by the current "goggle"/"band" value ("Normal" vs anything else). The two RF bands have
+ * disjoint channel index ranges, so each band remembers its own channel. */
+const char *settings_channel_key(settings_t *settings);
+
 #endif /* HUD_SETTINGS_H */

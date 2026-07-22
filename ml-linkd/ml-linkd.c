@@ -89,8 +89,9 @@
 #define SCAN_TABLE_EVERY 48               /* republish the seeded channel table every Nth tick (~2 s) */
 #define SEQ_START        0x15             /* initial poll sequence number */
 
-/* The baseband channel index we tune the local RX to at OPEN (SET_CHNIDX). Single source of truth:
- * used both in OPEN_SEQ and when publishing the channel for the HUD's System OSD. */
+/* The baseband channel index the RX is seeded to at OPEN (SET_CHNIDX), before the chip's band is
+ * known. tune_into_band then replaces it with the saved channel (ML_OPEN_CHNIDX) when that is valid
+ * for the band, else the band's first valid channel. Also the initial value of g_cur_chnidx. */
 #define OPEN_CHNIDX      5
 
 /* Baseband GET reply field offsets. Replies arrive on the request channel BB_GET (0x01), port =
@@ -269,6 +270,12 @@ static uint8_t g_pair_mac[4];               /* last reply's slot-0 MAC, wire ord
 static volatile int g_pending_chnidx = -1;  /* HUD-requested channel table index (0..18), -1 = none */
 static volatile int g_cur_chnidx = OPEN_CHNIDX; /* channel the local RX is tuned to; tracks SelectChn for the OSD */
 static volatile int g_pending_scan;         /* HUD requested a one-shot scan (MLM_RF_SCAN); STEADY fires it */
+
+/* The channel index to open on, from ML_OPEN_CHNIDX (ml-video passes it from the per-band rf-channel
+ * marker the HUD writes). -1 = none saved; tune_into_band then opens on the band's first valid
+ * channel. Validated against the chip's valid_bmp before use, so a channel saved under the other
+ * band is ignored rather than tuning the RX off-band. */
+static int g_open_chnidx = -1;
 
 /* Camera/scale state the HUD has commanded (MLM_RF_SET_CAMERA / MLM_RF_SET_SCALE). Owned entirely
  * by udp_thread: the commands arrive on link.sock and the :10000 datagrams leave on params_sock,
@@ -599,11 +606,32 @@ static void scan_publish_swept(int restore)
  * Publishes the seeded table so the HUD's channel grid shows every channel from the start without a
  * sweep; the STEADY cadence keeps it fresh for a HUD that starts later.
  */
+/* Parse ML_OPEN_CHNIDX (the saved open channel ml-video read from the rf-channel marker). Returns the
+ * index, or -1 when it is unset, empty, or malformed so the open falls back to the band's first valid
+ * channel. */
+static int read_open_chnidx(void)
+{
+    const char *value = getenv("ML_OPEN_CHNIDX");
+    char *end;
+    long idx;
+
+    if (value == NULL || *value == '\0') {
+        return -1;
+    }
+
+    idx = strtol(value, &end, 10);
+    if (*end != '\0' || idx < 0 || idx >= MLM_SCAN_MAX_CH) {
+        return -1;
+    }
+
+    return (int)idx;
+}
+
 static void tune_into_band(uint8_t *frame, uint32_t *seq_link)
 {
     uint8_t poll[19];
     long t0;
-    int first;
+    int target;
 
     g_scan_ready = 0;
     bb_get(poll, GET_SCAN_RESULT, (*seq_link)++);
@@ -618,24 +646,36 @@ static void tune_into_band(uint8_t *frame, uint32_t *seq_link)
         usleep(5000);
     }
 
-    /* Retune onto the band if OPEN left the RX off it. */
-    if (!((g_scan.valid_bmp >> g_cur_chnidx) & 1)) {
-        first = first_valid_idx(g_scan.valid_bmp);
-        if (first < 0) {
-            printf(TAG " band: valid_bmp=0x%08x has no channel, staying on ch%d\n",
-                   g_scan.valid_bmp, g_cur_chnidx);
-            fflush(stdout);
+    /* Open on the saved channel when it is valid for this band, else the band's first valid channel.
+     * OPEN_CHNIDX only seeded the RX before the band was known (it is not validated there); this is
+     * where the real channel is chosen, now that valid_bmp has been read from the chip. */
+    if (g_open_chnidx >= 0 && ((g_scan.valid_bmp >> g_open_chnidx) & 1)) {
+        target = g_open_chnidx;
+    } else {
+        target = first_valid_idx(g_scan.valid_bmp);
+    }
+
+    if (target < 0) {
+        printf(TAG " band: valid_bmp=0x%08x has no channel, staying on ch%d\n",
+               g_scan.valid_bmp, g_cur_chnidx);
+        fflush(stdout);
+    } else {
+        if (g_open_chnidx >= 0 && target != g_open_chnidx) {
+            printf(TAG " band: saved ch%d outside valid_bmp=0x%08x, opening on first valid ch%d\n",
+                   g_open_chnidx, g_scan.valid_bmp, target);
         } else {
-            printf(TAG " band: ch%d is outside valid_bmp=0x%08x, retuning to ch%d\n",
-                   g_cur_chnidx, g_scan.valid_bmp, first);
-            fflush(stdout);
-            send_frame(frame, bb_select_channel(frame, (uint8_t)first, (*seq_link)++), "band-retune");
-            g_cur_chnidx = first;
+            printf(TAG " band: opening on ch%d (valid_bmp=0x%08x)\n", target, g_scan.valid_bmp);
+        }
+        fflush(stdout);
+
+        if (target != g_cur_chnidx) {
+            send_frame(frame, bb_select_channel(frame, (uint8_t)target, (*seq_link)++), "band-tune");
+            g_cur_chnidx = target;
             usleep(OPEN_STEP_US);
         }
     }
 
-    scan_table_publish();   /* active_idx reflects any retune just done */
+    scan_table_publish();   /* active_idx reflects the channel just chosen */
 }
 
 /* Send one Get1V1Info and wait for its reply. @return 1 on a fresh reply (g_v1v1_raw / g_v1v1_chan
@@ -1695,6 +1735,8 @@ int main(int argc, char **argv)
             return 2;
         }
     }
+    g_open_chnidx = read_open_chnidx();
+
     /* no SA_RESTART: a signal must interrupt the blocking device read (EINTR) so shutdown
      * cannot hang in the reader thread; glibc signal() would install the handler restarting */
     memset(&sa, 0, sizeof sa);

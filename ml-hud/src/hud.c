@@ -543,10 +543,11 @@ static void record_policy_tick(hud_ctx_t *h, int connected, int recording, int s
 /* Push the air-unit settings once per link-up; every latch clears on disconnect. The menu defaults
  * matter here: a user who never touches a row still needs standby armed and power pushed.
  * ml-linkd re-applies standby and power on its own session restarts, so re-asserting on every
- * link-up edge covers both. The channel, which
- * ml-linkd does not persist (without this every boot lands on its bring-up default), defaults to 0
- * - the Normal-band bring-up channel - until the user picks one; ml-linkd ignores a channel outside
- * the current band's valid set, leaving its own first-valid choice in place.
+ * link-up edge covers both. ml-linkd opens on the saved channel itself (via the rf-channel marker),
+ * so this channel re-assert is mostly redundant; it still covers a channel changed while linked.
+ * The saved channel is per band (settings_channel_key).
+ * When none is saved the field is -1 and nothing is pushed, leaving ml-linkd's own first-valid
+ * choice in place.
  */
 static void assert_air_settings(hud_ctx_t *h, int connected)
 {
@@ -570,7 +571,7 @@ static void assert_air_settings(hud_ctx_t *h, int connected)
     }
 
     if (!h->channel_asserted) {
-        int channel = settings_get_int_in(h->settings, "goggle", "channel", 0);
+        int channel = settings_get_int_in(h->settings, "goggle", settings_channel_key(h->settings), -1);
         if (channel >= 0) {
             linkcmd_select_channel((unsigned) channel);
         }
