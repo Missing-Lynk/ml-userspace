@@ -1,6 +1,7 @@
 /** @file recordings.c @brief Implementation; see recordings.h */
 #include "recordings.h"
 #include "board.h"
+#include "telemetry.h"
 
 #include <dirent.h>
 #include <stdbool.h>
@@ -35,13 +36,9 @@ static int compare_name_desc(const void *a, const void *b)
 
 bool recordings_sd_available(void)
 {
-    DIR *dir = opendir(board_current()->sdcard_mount);
-    if (dir == NULL) {
-        return false;
-    }
-
-    closedir(dir);
-    return true;
+    /* A mounted card, not just a present mount directory: the mount point exists on the read-only
+     * rootfs even with no card, so opendir alone would wrongly report the card as available. */
+    return sdcard_is_mounted() != 0;
 }
 
 int recordings_list(recording_t *out, int max)

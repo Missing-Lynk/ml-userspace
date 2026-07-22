@@ -216,10 +216,11 @@ static void on_button(void *ctx, hud_button_t button, hud_button_edge_t edge)
      * the menu-open gate below. The pipeline is the source of truth: this just sends a toggle, and the
      * REC indicator follows the pipeline's reported state (see linkstate/sysosd). Recording only makes
      * sense with a live feed, so the toggle is ignored with no stream (there is nothing to capture, and
-     * a running recording is auto-stopped on stream loss by the main loop).
+     * a running recording is auto-stopped on stream loss by the main loop). It also needs a mounted SD
+     * card to write to, so a press with no card does nothing rather than starting a doomed recording.
      */
     if (button == HUD_BTN_RECORD && edge == HUD_EDGE_DOWN) {
-        if (linkstate_is_airunit_connected()) {
+        if (linkstate_is_airunit_connected() && sdcard_is_mounted()) {
             send_dvr_format(h);   /* a starting toggle records in the configured format */
             pipecmd_record_toggle();
             h->rec_is_auto = 0;   /* manual control: this recording is not auto-record's to stop */
@@ -505,7 +506,7 @@ static void record_policy_tick(hud_ctx_t *h, int connected, int recording, int s
     }
 
     if (autorecord && connected && linkstate_has_pipeline_state() && state == MLM_STATE_IDLE
-        && !h->rec_autostart_sent) {
+        && !h->rec_autostart_sent && sdcard_is_mounted()) {
         send_dvr_format(h);        /* the auto-started recording uses the configured format */
         pipecmd_record_toggle();   /* idle-guarded: a toggle from idle starts recording */
         h->rec_autostart_sent = 1;

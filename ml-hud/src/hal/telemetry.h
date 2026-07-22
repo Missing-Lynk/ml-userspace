@@ -27,4 +27,13 @@ typedef struct {
  */
 void telemetry_read(telemetry_t *out);
 
+/**
+ * @brief True when a filesystem is actually mounted at the board's SD mount point.
+ *
+ * statvfs alone cannot tell an empty mount directory (which resolves to the read-only rootfs) from a
+ * mounted card, so both the OSD free-space field and the record-start gate key off this explicit
+ * /proc/mounts lookup instead.
+ */
+int sdcard_is_mounted(void);
+
 #endif /* HUD_TELEMETRY_H */

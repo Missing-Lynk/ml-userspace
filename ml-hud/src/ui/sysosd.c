@@ -271,7 +271,7 @@ void sysosd_create(lv_obj_t *parent)
      * placeholder otherwise (like the RF fields). */
     g_fld_bitrate = add_icon_field(g_group_left, LV_SYMBOL_DOWNLOAD, "--.-Mbps", COLOR_TEXT_DIM,
                                    OSD_MAX_BITRATE);
-    g_fld_sdcard = add_icon_field(g_group_left, LV_SYMBOL_SD_CARD, "--", COLOR_TEXT, OSD_MAX_SDCARD);
+    g_fld_sdcard = add_icon_field(g_group_left, LV_SYMBOL_SD_CARD, "--G", COLOR_TEXT_DIM, OSD_MAX_SDCARD);
 
     /* REC sits mid-group, so it keeps its slot when idle (opacity toggled, not hidden): hiding it
      * would shift the temperature field each time recording starts/stops. */
@@ -615,9 +615,10 @@ void sysosd_update(const telemetry_t *telemetry, const air_telem_t *air, setting
     update_air_ontime(air, show_ontime);
 
     if (telemetry->have_sdcard) {
-        lv_label_set_text_fmt(g_fld_sdcard.value, "%dG", (int) (telemetry->sd_free_gb + 0.5f));
+        field_set(&g_fld_sdcard, COLOR_TEXT, "%dG", (int) (telemetry->sd_free_gb + 0.5f));
     } else {
-        lv_label_set_text(g_fld_sdcard.value, "--");
+        /* No card mounted: a dim "--G" placeholder, distinct from a real "0G" (a mounted, full card). */
+        field_set(&g_fld_sdcard, COLOR_TEXT_DIM, "--G");
     }
 
     /* Incoming-video bitrate: driven by the actual sdio0 byte flow (telemetry.c smooths it and holds

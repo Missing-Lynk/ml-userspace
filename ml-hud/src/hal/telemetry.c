@@ -4,6 +4,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <time.h>
@@ -11,6 +12,35 @@
 #include <sys/statvfs.h>
 
 static int g_cell_count;   /* latched after the first valid reading */
+
+int sdcard_is_mounted(void)
+{
+    const char *mount_point = board_current()->sdcard_mount;
+
+    FILE *mounts = fopen("/proc/mounts", "r");
+    if (mounts == NULL) {
+        return 0;
+    }
+
+    char line[512];
+    int mounted = 0;
+    while (fgets(line, sizeof(line), mounts) != NULL) {
+        char device[256];
+        char point[256];
+
+        /* Each line is "device mountpoint fstype opts dump pass"; the mount point is the 2nd field.
+         * A real card is a /dev/ block device: when no card is present the mount point instead holds a
+         * read-only tmpfs placeholder (source "tmpfs"), which must not count as a card. */
+        if (sscanf(line, "%255s %255s", device, point) == 2 && strcmp(point, mount_point) == 0
+            && strncmp(device, "/dev/", 5) == 0) {
+            mounted = 1;
+            break;
+        }
+    }
+
+    fclose(mounts);
+    return mounted;
+}
 
 static int read_int_file(const char *path)
 {
@@ -174,7 +204,7 @@ void telemetry_read(telemetry_t *out)
     }
 
     struct statvfs filesystem;
-    if (statvfs(board->sdcard_mount, &filesystem) == 0) {
+    if (sdcard_is_mounted() && statvfs(board->sdcard_mount, &filesystem) == 0) {
         out->have_sdcard = 1;
         out->sd_free_gb = (float)((double)filesystem.f_bavail * (double)filesystem.f_frsize / 1e9);
     }
