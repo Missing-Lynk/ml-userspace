@@ -38,6 +38,7 @@ dvr.autostart = 自动开始录制
 dvr.resolution = 分辨率
 dvr.record_osd = 录制 OSD
 dvr.save_srt = 保存 SRT
+dvr.rtsp_stream = RTSP 推流
 dvr.format = 格式化 SD 卡
 dvr.format_prompt = 格式化 SD 卡？
 

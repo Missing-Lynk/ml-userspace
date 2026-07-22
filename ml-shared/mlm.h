@@ -207,6 +207,14 @@ enum mlm_cmd_type {
                              *  encoder. A header with no pixel payload clears that cell; row =
                              *  col = MLM_OSD_CLEAR_ALL clears the whole cache. The sender (the
                              *  HUD) gates on the dvr.record_osd setting + recording state. */
+    MLM_CMD_RTSP       = 12, /* enable/disable the RTSP restream: arg = 1 on, 0 off. Idempotent
+                             *  set (not a toggle), so the HUD re-asserts the dvr.rtsp_stream
+                             *  setting freely and a restarted pipeline reconverges. While on,
+                             *  ml-pipeline serves the DVR encoder's elementary stream at
+                             *  rtsp://<goggle>:554/venc8/stream (the vendor path, so the stock
+                             *  companion app's default URL works); with no recording active it
+                             *  runs the encoder with no file branch. The pipeline reports the
+                             *  enabled state back via MLM_STATE_F_RTSP. */
 };
 
 struct mlm_cmd {
@@ -266,6 +274,12 @@ struct mlm_state {
                                     *  is fresh the HUD suppresses its own per-present plane re-assert
                                     *  (a blocking SETPLANE commit that stalls the next video flip a
                                     *  full vblank in DRM's stall_checks). */
+#define MLM_STATE_F_RTSP   0x10 /* the RTSP restream is UP: enabled (MLM_CMD_RTSP) AND its encoder
+                                *  running. Reports actual state, not intent: the HUD re-asserts
+                                *  the dvr.rtsp_stream setting whenever this diverges from it,
+                                *  which retries a failed or torn-down encoder start (and covers
+                                *  a pipeline restart). Expected to read off during playback (the
+                                *  encoder yields the codec pool to the playback decoder). */
 
 /* MLM_T_RFCMD payload (HUD -> ml-linkd on link.sock). ml-linkd owns /dev/artosyn_sdio and the
  * :10000 message channel, so the HUD never touches the air directly: it sends intent, and ml-linkd

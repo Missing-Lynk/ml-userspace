@@ -47,6 +47,15 @@ void pipecmd_srt_text(const char *line);
 void pipecmd_set_dvr_res(int height, int fps);
 
 /**
+ * @brief Enable/disable the RTSP restream (dvr.rtsp_stream). Idempotent set: the pipeline ignores
+ *  a value it already has, so the HUD re-asserts freely (on change and via the reconcile tick,
+ *  which catches a restarted pipeline). While on with no recording active the pipeline runs the
+ *  DVR encoder file-less; the actual up-state (enabled AND encoder running) reports back as
+ *  MLM_STATE_F_RTSP, so re-asserting on divergence also retries pipeline-side failures.
+ */
+void pipecmd_set_rtsp(int on);
+
+/**
  * @brief Send one rendered BTFL OSD cell for the DVR burn-in. @p rgba is the cell's w*h RGBA
  *  patch (opaque glyph pixels, transparent background), or NULL to clear the cell pipeline-side.
  *  The rect is the cell's luma-pixel rectangle in the 1080p composite. The caller (btfl_burn)

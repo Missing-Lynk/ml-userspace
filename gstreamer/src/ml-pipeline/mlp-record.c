@@ -1,5 +1,27 @@
-/* ml-pipeline record: DVR branch (zero-copy composite -> H.264 MP4) + HUD ctrl seam. */
+/* ml-pipeline record: DVR branch (zero-copy composite -> encoder -> MP4/RTSP tee) + HUD ctrl seam. */
 #include "ml-pipeline.h"
+
+/* The tee's restream branch: hand every encoded AU to mlp-rtsp (a cheap scan-and-drop while the
+ * restream is off, so the branch lives in the bin permanently and an RTSP toggle never rebuilds
+ * a running recording).
+ */
+static GstFlowReturn enc_sample_cb(GstAppSink *sink, gpointer u)
+{
+    struct ctx *c = u;
+    GstSample *s = gst_app_sink_pull_sample(sink);
+
+    if (s) {
+        GstBuffer *b = gst_sample_get_buffer(s);
+
+        if (b) {
+            rtsp_push(c, b);
+        }
+
+        gst_sample_unref(s);
+    }
+
+    return GST_FLOW_OK;
+}
 
 /* Record-bin bus watch: errors on this bus previously vanished (nothing read it), so a failed
  * encoder recorded a 0-byte file with no trace. Log the error and tear the recording down from
@@ -331,6 +353,9 @@ static void *rec_scale_worker(void *arg)
 /* Build and start the record bin. The encoder imports the composite dma-buf (output-io-mode=
  * dmabuf-import), so its input pool allocates NO CMA and there is no per-frame copy. H.265
  * (Wave521C HEVC) by default; ML_DVR_CODEC=h264 selects H.264, matching the vendor DVR.
+ * The encoded stream fans out through a tee: the MP4 file branch (only when @p path is set) and
+ * the always-present RTSP restream branch (enc_sample_cb -> mlp-rtsp). path == NULL runs the
+ * encoder for the restream alone - same format, OSD burn-in and import path, no file.
  */
 int rec_start(struct ctx *c, const char *path)
 {
@@ -435,20 +460,41 @@ int rec_start(struct ctx *c, const char *path)
      * The videoscale (720p) path copies to system memory, so import cannot be forced there; it
      * keeps the encoder's own pool.
      */
+    /* Bounded GOP: the RTSP restream joins (and resumes after a record toggle's bin rebuild) at
+     * an IRAP, so the encoder must emit one periodically; ~1 s also bounds playback seek
+     * granularity. ML_DVR_GOP overrides; 0 omits the control (driver default).
+     */
+    char gop_control[64] = "";
+    int gop_size = getenv("ML_DVR_GOP") ? atoi(getenv("ML_DVR_GOP")) : 60;
+    if (gop_size > 0) {
+        snprintf(gop_control, sizeof gop_control,
+                 "extra-controls=\"c,video_gop_size=%d\" ", gop_size);
+    }
+
+    /* Fragmented MP4 (moof/mdat every 1 s): the file on disk is playable up to the last
+     * complete fragment even if the process is SIGKILLed (OOM) - which no signal handler can
+     * catch. A clean stop (rec_stop EOS) still finalizes normally. Costs at most ~1 s of tail.
+     * Each tee branch carries its own parse: mp4mux negotiates packetized hvc1/avc1 there while
+     * the restream branch stays byte-stream for the RTP payloader.
+     */
+    char file_branch[512] = "";
+    if (path != NULL) {
+        snprintf(file_branch, sizeof file_branch,
+                 "enct. ! queue ! %sparse ! mp4mux fragment-duration=1000 ! filesink location=%s ",
+                 cname, path);
+    }
+
     desc = g_strdup_printf(
         "appsrc name=recsrc is-live=true format=time do-timestamp=false "
         "max-buffers=%d leaky-type=downstream block=false "
         "! video/x-raw,format=I420,width=%d,height=%d,framerate=%d/1 "
         "%s%s"
-        "! v4l2%senc %s "
-
-        /* Fragmented MP4 (moof/mdat every 1 s): the file on disk is playable up to the last
-         * complete fragment even if the process is SIGKILLed (OOM) - which no signal handler can
-         * catch. A clean stop (rec_stop EOS) still finalizes normally. Costs at most ~1 s of tail.
-         */
-        "! %sparse ! mp4mux fragment-duration=1000 ! filesink location=%s",
-        c->rec_qmax, cap_w, cap_h, cap_fps, rate, scale, cname,
-        c->rec_import || c->rec_hwscale ? "output-io-mode=dmabuf-import" : "", cname, path);
+        "! v4l2%senc %s%s "
+        "! tee name=enct "
+        "%s"
+        "enct. ! queue max-size-buffers=4 leaky=downstream ! appsink name=rtspsink sync=false",
+        c->rec_qmax, cap_w, cap_h, cap_fps, rate, scale, cname, gop_control,
+        c->rec_import || c->rec_hwscale ? "output-io-mode=dmabuf-import" : "", file_branch);
 
     c->rec_bin = gst_parse_launch(desc, &err);
     g_free(desc);
@@ -468,6 +514,14 @@ int rec_start(struct ctx *c, const char *path)
         gst_object_unref(b);
     }
 
+    {
+        GstElement *as = gst_bin_get_by_name(GST_BIN(c->rec_bin), "rtspsink");
+        GstAppSinkCallbacks cbs = { .new_sample = enc_sample_cb };
+
+        gst_app_sink_set_callbacks(GST_APP_SINK(as), &cbs, c, NULL);
+        gst_object_unref(as);
+    }
+
     src = gst_bin_get_by_name(GST_BIN(c->rec_bin), "recsrc");
     c->rec_src = GST_APP_SRC(src);      /* keep this ref; released in rec_stop */
     caps = gst_caps_new_simple("video/x-raw",
@@ -477,14 +531,14 @@ int rec_start(struct ctx *c, const char *path)
                                "framerate", GST_TYPE_FRACTION, cap_fps, 1, NULL);
     gst_app_src_set_caps(c->rec_src, caps);
     gst_caps_unref(caps);
-    snprintf(c->rec_path, sizeof c->rec_path, "%s", path);
+    snprintf(c->rec_path, sizeof c->rec_path, "%s", path != NULL ? path : "");
 
     /* SRT sidecar path: the recording path with its extension swapped to .srt (the vendor's
      * VideoNNN.mp4 -> VideoNNN.srt convention). Any stale sidecar at that path is removed so a
      * re-recorded pinned path (ML_DVR) never keeps an old file's cues; the new file itself is
      * only created if subtitle lines actually arrive (rec_srt_text).
      */
-    {
+    if (path != NULL) {
         const char *dot = strrchr(path, '.');
         int stem = dot ? (int)(dot - path) : (int)strlen(path);
         snprintf(c->srt_path, sizeof c->srt_path, "%.*s.srt", stem, path);
@@ -518,10 +572,13 @@ int rec_start(struct ctx *c, const char *path)
         }
     }
 
-    c->rec_on = 1;
-    printf("ml-pipeline: DVR recording %dx%d@%d %s (%s) -> %s\n",
+    c->enc_on = TRUE;
+    c->rec_on = path != NULL;
+    printf("ml-pipeline: DVR %s %dx%d@%d %s (%s) -> %s\n",
+           path != NULL ? "recording" : "encoder (RTSP only)",
            fmt->w, fmt->h, c->rec_fps, cname,
-           c->rec_hwscale ? "HW scale" : c->rec_import ? "import" : "copy", path);
+           c->rec_hwscale ? "HW scale" : c->rec_import ? "import" : "copy",
+           path != NULL ? path : "no file");
 
     return 0;
 }
@@ -534,6 +591,7 @@ void rec_stop(struct ctx *c)
     }
 
     c->rec_on = 0;
+    c->enc_on = FALSE;
 
     /* Stop the scale worker BEFORE touching rec_src (the worker pushes into it). A frame mid-
      * scale finishes (join waits the ~6 ms); an undelivered mailbox frame is dropped.
@@ -581,9 +639,17 @@ void rec_stop(struct ctx *c)
 
     gst_object_unref(c->rec_bin);
     c->rec_bin = NULL;
-    osd_burn_clear(c);   /* the burn cells were this recording's OSD state; the HUD re-sends */
+    if (!c->rtsp_on) {
+        /* the burn cells were this session's OSD state; the HUD re-sends. With the restream
+         * still on the cache survives the toggle-transition rebuild (rec_toggle restarts the
+         * bin file-less at once and the cells are bin-independent pipeline state).
+         */
+        osd_burn_clear(c);
+    }
+
     printf("ml-pipeline: DVR stopped -> %s (pushed=%llu dropped=%llu)\n",
-           c->rec_path, (unsigned long long)c->rec_pushed, (unsigned long long)c->rec_dropped);
+           c->rec_path[0] != '\0' ? c->rec_path : "no file",
+           (unsigned long long)c->rec_pushed, (unsigned long long)c->rec_dropped);
 }
 
 /* Feed one completed composite to the encoder, zero-copy. Shares the pool GstBuffer (a ref holds
@@ -597,7 +663,7 @@ void rec_push(struct ctx *c, GstBuffer *buf, GstClockTime pts)
 {
     GstBuffer *rb;
 
-    if (!c->rec_on || !c->rec_src) {
+    if (!c->enc_on || !c->rec_src) {
         return;
     }
 
@@ -701,6 +767,7 @@ void send_state(struct ctx *c)
                .flags = (c->pb_active && c->pb_paused ? MLM_STATE_F_PAUSED : 0)
                       | (c->pb_active && c->pb_ended ? MLM_STATE_F_ENDED : 0)
                       | (c->pb_active && c->pb_rendering ? MLM_STATE_F_RENDERING : 0)
+                      | (c->rtsp_on && c->enc_on ? MLM_STATE_F_RTSP : 0)
                       | (c->flip_last_us != 0
                          && g_get_monotonic_time() - c->flip_last_us < 500000
                              ? MLM_STATE_F_VIDEO_LIVE : 0),
@@ -745,6 +812,12 @@ static void rec_toggle(struct ctx *c)
         rec_stop(c);
     } else {
         char path[300];
+
+        if (c->enc_on) {
+            /* stream-only bin: rebuild with the file branch */
+            rec_stop(c);
+        }
+
         /* ML_DVR pins an explicit path (test/bench); otherwise auto-number onto the SD. */
         if (getenv("ML_DVR")) {
             rec_start(c, getenv("ML_DVR"));
@@ -754,7 +827,18 @@ static void rec_toggle(struct ctx *c)
         }
     }
 
-    send_state(c);   /* report the new mode immediately, not just on the next tick */
+    /* The restream outlives the recording in either direction: whether a recording just
+     * stopped or a record start failed, give it its file-less encoder back. Connected
+     * clients see a short AU gap and resume at the next IRAP. A failure here self-heals:
+     * MLM_STATE_F_RTSP reports the encoder truth, so the HUD re-asserts and rtsp_set
+     * retries.
+     */
+    if (!c->enc_on && c->rtsp_on && !c->pb_active) {
+        rec_start(c, NULL);
+    }
+
+    /* report the new mode immediately, not just on the next tick */
+    send_state(c);
 }
 
 /* Re-assert the current mode once a second so a restarted HUD reconverges without a state change. */
@@ -846,6 +930,12 @@ gboolean on_ctrl(gint fd, GIOCondition cond, gpointer u)
                 c->dvr_h = (int)hgt;
                 c->dvr_fps = (int)rfps;
             }
+        } break;
+
+        case MLM_CMD_RTSP: {
+            /* idempotent restream enable/disable; may spin the encoder up (file-less) or down */
+            rtsp_set(c, cmd.arg != 0);
+            send_state(c);
         } break;
 
         case MLM_CMD_SHOW_IDLE: {

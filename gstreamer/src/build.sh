@@ -22,14 +22,14 @@ mkdir -p "$OUT"
 docker run --rm --platform linux/arm64 \
   -v "$REPO":/w -w /w/gstreamer/src \
   alpine:3.24 sh -euc '
-    apk add -q build-base pkgconf gstreamer-dev gst-plugins-base-dev libdrm-dev linux-headers
+    apk add -q build-base pkgconf gstreamer-dev gst-plugins-base-dev gst-rtsp-server-dev libdrm-dev linux-headers
     O=/w/gstreamer/build/bin
     gcc -O2 -Wall -static -o "$O/ml-drmfd"  ml-drmfd/ml-drmfd.c
     gcc -O2 -Wall -static -o "$O/ml-mdump"  ml-mdump/ml-mdump.c
     gcc -O2 -Wall -static -o "$O/ml-rec"    ml-rec/ml-rec.c
     gcc -O2 -Wall -static -o "$O/ml-hud"    ml-hud/ml-hud.c -I. -lm
     gcc -O2 -Wall -o "$O/ml-pipeline" ml-pipeline/*.c \
-        $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0 gstreamer-allocators-1.0 libdrm) -lpthread
+        $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0 gstreamer-allocators-1.0 gstreamer-rtsp-server-1.0 libdrm) -lpthread
     gcc -O2 -Wall -static -o "$O/ml-splash" ml-splash/ml-splash.c
     ls -la "$O"
   '

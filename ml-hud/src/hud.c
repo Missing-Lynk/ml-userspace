@@ -89,6 +89,7 @@ typedef struct {
     uint32_t       sysosd_next_ms;   /* next System OSD telemetry refresh */
     uint32_t       srt_next_ms;      /* next DVR subtitle line (while recording, save_srt on) */
     int            burn_active;      /* DVR OSD burn-in gate is open (recording + dvr.record_osd) */
+    uint32_t       rtsp_assert_ms;   /* rtsp_tick rate limit: next allowed re-assert (ms) */
     uint32_t       rec_seen_ms;      /* when RECORDING was first observed (FlightTime base); 0 = not recording */
     int            rec_autostop_sent;  /* latch: the "stream lost" record-stop toggle was already sent */
     int            rec_autostart_sent; /* latch: the "stream up" auto-record start toggle was already sent */
@@ -436,6 +437,28 @@ static void srt_tick(hud_ctx_t *h, int recording, int connected, uint32_t now)
     }
 }
 
+/* RTSP restream reconcile: the dvr.rtsp_stream setting is the intent, MLM_STATE_F_RTSP is the
+ * pipeline's truth. While they diverge (setting changed with the pipeline down, or the pipeline
+ * restarted and lost the latch) re-assert the setting, rate-limited to 1/s; the command is an
+ * idempotent set, so re-sending an already-held value is a no-op pipeline-side. Waits for a real
+ * MLM_T_STATE, like auto-record: the IDLE default must not be "reconciled" against.
+ */
+static void rtsp_tick(hud_ctx_t *h, uint32_t now)
+{
+    int want = settings_get_bool_in(h->settings, "dvr", "rtsp_stream", 0) != 0;
+
+    if (!linkstate_has_pipeline_state() || linkstate_is_rtsp_on() == want) {
+        return;
+    }
+
+    if (h->rtsp_assert_ms != 0 && (int32_t) (now - h->rtsp_assert_ms) < 0) {
+        return;
+    }
+
+    pipecmd_set_rtsp(want);
+    h->rtsp_assert_ms = now + 1000;
+}
+
 /* DVR OSD burn-in gate: open while recording with dvr.record_osd on. On the rising edge the
  * pipeline's cell cache is cleared and the burn grid invalidated, so the next canvas re-sends
  * every occupied cell and the two sides restart in sync (also covers a setting toggled on
@@ -445,7 +468,9 @@ static void srt_tick(hud_ctx_t *h, int recording, int connected, uint32_t now)
  */
 static void burn_tick(hud_ctx_t *h, int recording)
 {
-    int active = recording && settings_get_bool_in(h->settings, "dvr", "record_osd", 0);
+    /* the RTSP restream is the recording's twin (same encoder feed), so record_osd covers it too */
+    int active = (recording || linkstate_is_rtsp_on())
+              && settings_get_bool_in(h->settings, "dvr", "record_osd", 0);
 
     if (active != h->burn_active) {
         pipecmd_osd_clear();
@@ -906,6 +931,7 @@ int main(int argc, char **argv)
         alarm_tick(&h, now);
         srt_tick(&h, recording, connected, now);
         burn_tick(&h, recording);
+        rtsp_tick(&h, now);
         sysosd_tick(&h, now);
         tempwarn_tick(&h, connected, now);
         back_longpress_tick(&h);

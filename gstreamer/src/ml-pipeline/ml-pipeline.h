@@ -203,9 +203,13 @@ struct ctx {
      * to the copy path). Bounded + drop-on-overflow so a slow encoder never stalls the display.
      * Composite mode only: plane scanout has no composite buffer to encode.
      */
-    GstElement *rec_bin;                /* appsrc -> v4l2h264enc(dmabuf-import) -> mp4mux -> filesink */
+    GstElement *rec_bin;                /* appsrc -> v4l2 enc(dmabuf-import) -> tee -> mp4mux/rtsp */
     GstAppSrc *rec_src;
-    volatile int rec_on;
+    volatile int rec_on;                /* the file branch is live (a recording is being written) */
+    gboolean enc_on;                    /* the encoder bin is running (recording, RTSP, or both);
+                                         * gates the composite feed (slot_push) and rec_push */
+    volatile int rtsp_on;               /* the RTSP restream is enabled (MLM_CMD_RTSP); with no
+                                         * recording the bin runs with no file branch */
     char rec_path[256];
     GstClockTime rec_pts0;              /* first recorded PTS, rebased to 0 for a clean MP4 */
     gboolean rec_epoch_set;
@@ -523,6 +527,10 @@ int drm_make_idle_fb(struct ctx *c);
 void osd_burn_cell(struct ctx *c, const guint8 *frame, gssize len);
 void osd_burn_clear(struct ctx *c);
 void osd_burn_apply(struct ctx *c, guint8 *map);
+
+/* rtsp (mlp-rtsp.c): gst-rtsp-server restream of the DVR encoder's elementary stream */
+void rtsp_set(struct ctx *c, gboolean on);
+void rtsp_push(struct ctx *c, GstBuffer *au);
 
 /* record */
 gboolean rec_hw_init(struct ctx *c);

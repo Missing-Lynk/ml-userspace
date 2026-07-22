@@ -110,6 +110,7 @@ static const gog_item_t g_dvr_items[] = {
     { ITEM_DROPDOWN, "dvr.resolution",  "resolution", resolution_options, 0, 0, "dvr_res" },
     { ITEM_TOGGLE,   "dvr.record_osd",  "record_osd", NULL,               0, 0, "" },
     { ITEM_TOGGLE,   "dvr.save_srt",    "save_srt",   NULL,               0, 0, "" },
+    { ITEM_TOGGLE,   "dvr.rtsp_stream", "rtsp_stream", NULL,              0, 0, "rtsp" },
     { ITEM_ACTION,   "dvr.format",      NULL,         NULL,               0, 0, "format" },
 };
 #define DVR_ITEM_COUNT ((int) (sizeof(g_dvr_items) / sizeof(g_dvr_items[0])))
@@ -564,6 +565,9 @@ static void apply_item(const gog_item_t *item, const char *value)
     } else if (strcmp(item->action, "power") == 0) {
         /* the level label ("100 mW"); linkcmd maps it to mW */
         linkcmd_set_power(value);
+    } else if (strcmp(item->action, "rtsp") == 0) {
+        /* the pipeline brings the restream (and, if needed, a file-less encoder) up or down */
+        pipecmd_set_rtsp(strcmp(value, "on") == 0);
     } else if (strcmp(item->action, "dvr_res") == 0) {
         /* the option label ("720p 30fps"); the pipeline latches it for the next recording */
         int height = 1080;

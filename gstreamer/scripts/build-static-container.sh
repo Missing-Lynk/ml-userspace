@@ -11,9 +11,11 @@ set -eux
 PREFIX=/w/gstreamer/build/gst-static
 OUT=/w/gstreamer/build/static
 
+# util-linux-static: gst-rtsp-server links gio-2.0, whose static closure needs libmount/libblkid.
 apk add -q build-base meson ninja pkgconf git flex bison \
     glib-dev glib-static zlib-dev zlib-static pcre2-static \
     libffi-dev gettext-dev libdrm-dev libgudev-dev orc-dev orc \
+    util-linux-static \
     linux-headers bash xz curl
 
 # libdrm is the only static .a we need that Alpine does not package, so build it from source into
@@ -26,6 +28,18 @@ if [ ! -f "$PREFIX/lib/libdrm.a" ]; then
     meson setup b --prefix="$PREFIX" --buildtype=release \
         --default-library=static -Dauto_features=disabled -Dtests=false
     ninja -C b install
+fi
+
+# Static libeconf (Alpine ships none): static libblkid's config reader needs it. Plain C, so a
+# direct compile+archive into the prefix beats carrying its build system.
+LIBECONF_VER=0.7.5
+if [ ! -f "$PREFIX/lib/libeconf.a" ]; then
+    cd /tmp
+    curl -fsSL "https://github.com/openSUSE/libeconf/archive/refs/tags/v${LIBECONF_VER}.tar.gz" | tar xz
+    cd "libeconf-${LIBECONF_VER}"
+    gcc -O2 -Iinclude -c lib/*.c
+    mkdir -p "$PREFIX/lib"
+    ar rcs "$PREFIX/lib/libeconf.a" *.o
 fi
 
 # Persist the clone + build tree in the (gitignored) build/ dir so re-runs reconfigure
@@ -67,7 +81,7 @@ if [ -n "${REBUILD:-}" ] || [ ! -f "$PREFIX/lib/libgstreamer-full-1.0.a" ]; then
         -Dgst-full-libraries="$GST_FULL_LIBS" \
         -Dbase=enabled -Dgood=enabled -Dbad=enabled \
         -Dugly=disabled -Ddevtools=disabled -Dges=disabled \
-        -Drtsp_server=disabled -Dlibav=disabled -Dgpl=disabled \
+        -Drtsp_server=enabled -Dlibav=disabled -Dgpl=disabled \
         -Dtests=disabled -Dexamples=disabled -Dtools=disabled \
         -Dintrospection=disabled -Ddoc=disabled -Dnls=disabled \
         -Dgstreamer:check=disabled \
@@ -78,6 +92,9 @@ if [ -n "${REBUILD:-}" ] || [ ! -f "$PREFIX/lib/libgstreamer-full-1.0.a" ]; then
         -Dgst-plugins-base:typefind=enabled \
         -Dgst-plugins-good:v4l2=enabled \
         -Dgst-plugins-good:isomp4=enabled \
+        -Dgst-plugins-good:rtp=enabled \
+        -Dgst-plugins-good:rtpmanager=enabled \
+        -Dgst-plugins-good:udp=enabled \
         -Dgst-plugins-bad:videoparsers=enabled \
         -Dgst-plugins-bad:kms=enabled
     ninja -C build
@@ -89,7 +106,7 @@ fi
 # The per-plugin .pc land in meson-private/ (not installed), but gstreamer-full-1.0.pc Requires
 # them, so install them into the prefix for pkg-config --static to resolve the whole closure.
 for p in gstcoreelements gstapp gsttypefindfunctions gstvideoconvertscale gstvideorate \
-         gstisomp4 gstvideo4linux2 gstvideoparsersbad gstkms; do
+         gstisomp4 gstvideo4linux2 gstvideoparsersbad gstkms gstrtp gstrtpmanager gstudp; do
     cp -f "build/meson-private/$p.pc" "$PREFIX/lib/pkgconfig/" 2>/dev/null || true
 done
 
@@ -99,9 +116,9 @@ pkg-config --exists gstreamer-full-1.0 && echo "have gstreamer-full-1.0" || echo
 # gst static libs are mutually circular -> --start-group/--end-group. --undefined (in the full .pc
 # Libs.private) pulls the static plugin registration.
 gcc -O2 -Wall -static -o "$OUT/ml-pipeline.debug" \
-    $(pkg-config --cflags gstreamer-full-1.0) \
+    $(pkg-config --cflags gstreamer-full-1.0 gstreamer-rtsp-server-1.0) \
     /w/gstreamer/src/ml-pipeline/*.c \
-    -Wl,--start-group $(pkg-config --libs --static gstreamer-full-1.0) -Wl,--end-group \
+    -Wl,--start-group $(pkg-config --libs --static gstreamer-full-1.0 gstreamer-rtsp-server-1.0) -leconf -Wl,--end-group \
     -lpthread || { echo "LINK FAILED - see errors above"; exit 1; }
 
 # Ship the stripped binary; keep the unstripped copy for symbolizing crashes.

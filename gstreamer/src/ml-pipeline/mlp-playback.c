@@ -178,7 +178,8 @@ static void clip_mp4_probe(const char *path, struct clip_mp4_info *info)
 /* Return to the live RF stream: restore the RF display mode and rebuild the decode graph. */
 static void resume_live(struct ctx *c)
 {
-    c->pb_scale = FALSE;   /* live uses the RF display path, never the playback scaler */
+    /* live uses the RF display path, never the playback scaler */
+    c->pb_scale = FALSE;
     c->single = FALSE;
     c->planes_on = c->rf_planes;
     if (drm_disp_init(c)) {
@@ -186,6 +187,11 @@ static void resume_live(struct ctx *c)
     }
 
     rf_decode_start(c);
+
+    /* restore the stream-only encoder that playback_play stopped (see there) */
+    if (c->rtsp_on && !c->enc_on) {
+        rec_start(c, NULL);
+    }
 }
 
 void playback_play(struct ctx *c, const char *path)
@@ -193,10 +199,23 @@ void playback_play(struct ctx *c, const char *path)
     GError *err = NULL;
 
     if (c->pb_active) {
-        playback_stop(c, FALSE);   /* switching clips: drop the current one, stay off-live */
+        /* switching clips: drop the current one, stay off-live */
+        playback_stop(c, FALSE);
     } else {
-        drm_disp_shutdown(c);      /* leaving live: tear the RF graph + its display mode down */
+        /* leaving live: tear the RF graph + its display mode down */
+        drm_disp_shutdown(c);
         rf_decode_stop(c);
+
+        /* A stream-only RTSP encoder holds a full wave5 encode session, which the playback
+         * decoder's buffer set cannot coexist with in the codec pool; it would only starve
+         * anyway (no composites during playback). Stop it; resume_live restores it, and
+         * MLM_STATE_F_RTSP reporting the encoder truth means the HUD's reconcile also
+         * recovers it if playback exits through an error path. A recording (rec_on) is
+         * left untouched.
+         */
+        if (c->enc_on && !c->rec_on) {
+            rec_stop(c);
+        }
     }
 
     struct clip_mp4_info info;

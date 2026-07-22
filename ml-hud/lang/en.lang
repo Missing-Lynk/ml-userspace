@@ -38,6 +38,7 @@ dvr.autostart = Auto Start Recording
 dvr.resolution = Resolution
 dvr.record_osd = Record OSD
 dvr.save_srt = Save SRT
+dvr.rtsp_stream = RTSP Stream
 dvr.format = Format SD Card
 dvr.format_prompt = Format the SD card?
 

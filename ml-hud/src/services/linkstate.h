@@ -85,6 +85,14 @@ int linkstate_pipeline_state(void);
 bool linkstate_has_pipeline_state(void);
 
 /**
+ * @brief Whether ml-pipeline reports the RTSP restream UP (MLM_STATE_F_RTSP from the last
+ *  MLM_T_STATE): enabled and its encoder actually running. The reconcile tick in hud.c
+ *  compares this against the dvr.rtsp_stream setting and re-asserts the setting while they
+ *  diverge, which retries pipeline-side failures and covers a pipeline restart.
+ */
+bool linkstate_is_rtsp_on(void);
+
+/**
  * @brief Playback progress from the pipeline's MLM_T_STATE.
  * @param paused  out: 1 if playback is paused (may be NULL).
  * @param pos_ms  out: current position in ms (may be NULL).
