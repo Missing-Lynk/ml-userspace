@@ -253,10 +253,17 @@ static int load_rf_driver(const char *fw, const char *cfg)
 }
 
 /* Wait for the sdio0 netdev the driver creates once the firmware is up, then bring it up and set
- * 10.0.0.1/24. The address add fires the inetaddr notifier the driver's RX path needs.
+ * its address. The address add fires the inetaddr notifier the driver's RX path needs. The
+ * address defaults to 10.0.0.1 (ground); ML_RF_SDIO_ADDR overrides it (the air uses 10.0.0.100),
+ * so one binary serves both roles.
  */
 static int configure_sdio0(void)
 {
+    const char *sdio_addr = getenv("ML_RF_SDIO_ADDR");
+    if (sdio_addr == NULL || sdio_addr[0] == '\0') {
+        sdio_addr = SDIO_ADDR;
+    }
+
     int attempt = 0;
     while (attempt < WAIT_TRIES && access(SYS_NET SDIO_IFACE, F_OK) != 0) {
         usleep(WAIT_STEP_US);
@@ -293,7 +300,7 @@ static int configure_sdio0(void)
     struct sockaddr_in *addr = (struct sockaddr_in *) &ifr.ifr_addr;
     memset(&ifr.ifr_addr, 0, sizeof(ifr.ifr_addr));
     addr->sin_family = AF_INET;
-    inet_pton(AF_INET, SDIO_ADDR, &addr->sin_addr);
+    inet_pton(AF_INET, sdio_addr, &addr->sin_addr);
     if (ioctl(sock, SIOCSIFADDR, &ifr) < 0) {
         perror(PROG ": SIOCSIFADDR");
         close(sock);
@@ -307,7 +314,7 @@ static int configure_sdio0(void)
     ioctl(sock, SIOCSIFNETMASK, &ifr);
 
     close(sock);
-    fprintf(stderr, PROG ": %s up, %s/24\n", SDIO_IFACE, SDIO_ADDR);
+    fprintf(stderr, PROG ": %s up, %s/24\n", SDIO_IFACE, sdio_addr);
     return 0;
 }
 
