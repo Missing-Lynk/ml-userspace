@@ -11,7 +11,7 @@
 # artifact) is staged only if found - the preview needs it only on a bare goggle with no display
 # service to paint the primary plane.
 #
-# Env: DEVICE_IP (default 192.168.3.100), ROOT_PASS (default libre), DEST (default /run/ml/hud),
+# Env: DEVICE_IP (active device, from board.conf; stock .100 in a standalone checkout), ROOT_PASS (default libre), DEST (default /run/ml/hud),
 #      NOSIGNAL_YUV (background image; default: the rootfs build's copy, skipped if absent).
 set -euo pipefail
 
@@ -19,14 +19,13 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 HUD="$(cd "$HERE/.." && pwd)"          # hud/
 ROOT="$(cd "$HUD/.." && pwd)"          # userspace/
 REPO="$(cd "$ROOT/.." && pwd)"         # wrapper repo root (glue/, rootfs/), if this is one
-DEVICE_IP="${DEVICE_IP:-192.168.3.100}"
 ROOT_PASS="${ROOT_PASS:-libre}"
 DEST="${DEST:-/run/ml/hud}"
 
 # Shared SSH options from the wrapper repo when available; otherwise the same no-host-key-
 # persistence set inline (slot hops change the device key, so never record it).
 if [ -f "$REPO/glue/lib/ssh-opts.sh" ]; then
-    . "$REPO/glue/lib/ssh-opts.sh"
+    . "$REPO/glue/lib/ssh-opts.sh"          # also resolves DEVICE_IP from the active board.conf
     SSHOPTS=("${SSH_OPTS_LIBRE[@]}")
 else
     SSHOPTS=(
@@ -36,6 +35,9 @@ else
         -o ConnectTimeout=8
     )
 fi
+# Stock address as the last-resort default for a standalone checkout; pass DEVICE_IP to target an
+# open device.
+DEVICE_IP="${DEVICE_IP:-192.168.3.100}"
 sshv() { sshpass -p "$ROOT_PASS" ssh "${SSHOPTS[@]}" root@"$DEVICE_IP" "$@"; }
 # gzip on the wire (the CDC-ECM gadget is slow and large cat-over-ssh has crashed it before).
 push_gz() { gzip -c "$1" | sshv "gunzip > '$2' && chmod ${3:-644} '$2'"; }

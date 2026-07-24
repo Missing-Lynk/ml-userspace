@@ -5,7 +5,7 @@
 # clip if present) into /mnt/sdcard/missinglynk/ over SSH (no scp/sftp on the device),
 # then loop-mounts the image at /mnt/gst. Re-runnable; remounts a stale loop mount.
 #
-# Env: DEVICE_IP (192.168.3.100), ROOT_PASS (libre).
+# Env: DEVICE_IP (active device, from board.conf; stock .100 in a standalone checkout), ROOT_PASS (libre).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -14,6 +14,9 @@ OUT="$REPO/rootfs/build/gst-sd"
 IMG="$OUT/gst-sd.sqsh"
 CLIP="$OUT/test-1080p60.h264"
 
+# DEVICE_IP resolves from the active device's board.conf via the wrapper repo when present; a
+# standalone userspace checkout falls back to the stock address (pass DEVICE_IP to target another).
+[ -f "$REPO/glue/lib/ssh-opts.sh" ] && . "$REPO/glue/lib/ssh-opts.sh"
 DEVICE_IP="${DEVICE_IP:-192.168.3.100}"
 PASS="${ROOT_PASS:-libre}"
 
