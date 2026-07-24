@@ -1,6 +1,16 @@
 # ml-linkd
 
-RF link daemon for the AR8030 link. Currently implements the receiving side: brings the link up, keeps it up, and starts the transmitter's video stream when a consumer is ready. Intended to become the single link daemon for both ends, RX and TX. Static binary, no external dependencies, single C file.
+RF link daemon for the AR8030 link. One binary, two roles selected by `--role` (default `rx`): the goggle (RX) side brings the link up, keeps it up, and starts the transmitter's video stream when a consumer is ready; the air unit (`--role air`) side transmits telemetry to the goggle. Static binary, no external dependencies, single C file.
+
+## Air (TX) role (`--role air`)
+
+On the air unit ml-linkd owns no bb-socket control plane - association is autonomous from the `artosyn_sdio` insmod config, so the air role never opens `/dev/artosyn_sdio`. It speaks only UDP on `sdio0`:
+
+- Reads the two SoC sensors over IIO: battery voltage from the SAR ADC (`artosyn-adc`, channel 1, `in_voltage1_input` x the board divider) and the junction temperature from the SoC sensor (`temperature`, `in_temp_scale`). Both are resolved by IIO device name and retried until the modules have coldplugged.
+- Transmits the vendor's `:10000` status frames to the goggle (10.0.0.1): `0x11` periodic (voltage, ~6 Hz) and `0x09` version/info (hw/fw strings + voltage + temperature, ~1 Hz).
+- Answers the goggle's `:20001` identity probe (mirrors the 520-byte type-0 datagram back with `byte[0]=0x01`).
+
+The goggle's RX role republishes the received `0x09`/`0x11` frames on `telemetry.sock` as `MLM_T_STATUS`, so the HUD shows the air unit's voltage and temperature.
 
 ## Behavior
 
@@ -61,8 +71,10 @@ make        # everything (daemons, gstreamer, hud)
 ## Usage
 
 ```
-ml-linkd [-d /dev/artosyn_sdio] [--no-gate] [-v]
+ml-linkd [-d /dev/artosyn_sdio] [--role air|rx] [--no-gate] [-v]
 ```
+
+`--role air` runs the air-unit telemetry transmitter (see the Air role section); the default `rx` runs the goggle side documented below.
 
 Foreground process. SIGINT/SIGTERM stop it cleanly (cadence stops, device closed, `link.sock` unlinked). `-v` logs every transmitted frame.
 

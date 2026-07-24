@@ -16,3 +16,4 @@ assets/osd-fonts/font_BTFL_hd.png
 # python
 __pycache__/
 *.pyc
+ml-linkd/version.h

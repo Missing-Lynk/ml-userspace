@@ -24,12 +24,17 @@
  *     GET_PAIR poll at 20 ms, pair-lock the reported MAC), refused while an air unit
  *     is alive; progress published as MLM_T_LINK BINDING / BIND_OK / BIND_FAIL.
  *
+ * The above is the RX (goggle) role, the default. --role air selects the air-unit (TX) role: it
+ * reads the battery voltage and SoC temperature over IIO and transmits the :10000 status frames to
+ * the goggle over sdio0, and answers the :20001 identity probe. Association is chip-autonomous from
+ * the insmod config. See ml-linkd-air.c.
+ *
  * Scope: the RF link ONLY. No module loading (ml-rf-bringup does bring-up; NEVER
  * warm-reload artosyn_sdio), no process supervision.
  * Static binary, runs on a bare slot-B boot.
  *
  * SAFETY: userspace only, sends exactly the frames the vendor stack sends; slot B only.
- * Usage: ml-linkd [-d /dev/artosyn_sdio] [--no-gate] [-v]
+ * Usage: ml-linkd [-d /dev/artosyn_sdio] [--role air|rx] [--no-gate] [-v]
  */
 #define _GNU_SOURCE                       /* pthread_timedjoin_np */
 #include <stdio.h>
@@ -52,14 +57,11 @@
 #include "../ml-shared/mlm.h"
 #include "bb-cmd.h"
 #include "mp-cmd.h"
+#include "ml-linkd.h"
 
-#define TAG              "[ml-linkd]"
+/* TAG, LOCAL_ADDR, AIR_ADDR, HELLO_PORT, PARAMS_PORT, HELLO_LEN, PKT_MAX, UDP_TICK_US are shared
+ * with the air role and live in ml-linkd.h. */
 #define DEV_NODE         "/dev/artosyn_sdio"
-
-#define LOCAL_ADDR       "10.0.0.1"
-#define AIR_ADDR         "10.0.0.100"
-#define HELLO_PORT       20001            /* :20001 3-way hello */
-#define PARAMS_PORT      10000            /* :10000 params handshake + telemetry */
 
 /* service intervals and timeouts (ms) */
 #define READY_WINDOW_MS  6000             /* consumer heartbeat liveness window */
@@ -77,7 +79,6 @@
 #define SETTLE_STEP_US   167000
 #define OPEN_STEP_US     60000
 #define STEADY_STEP_US   42000
-#define UDP_TICK_US      50000            /* 20 Hz service tick */
 #define READ_IDLE_US     2000
 
 #define SETTLE_TICKS     15               /* ~2.5 s of SETTLE */
@@ -176,14 +177,11 @@ enum air_tx_dbm {
 #define BIND_HITS        6                /* slot-0 hits before the lock (cumulative) */
 #define BIND_REPLY_MS    40               /* max wait for one GET_PAIR reply (as SWEEP_REPLY_MS) */
 
-/* datagram buffer sizes */
-#define PKT_MAX          600              /* receive buffer */
-#define HELLO_LEN        520              /* :20001 hello datagram */
-
-static volatile int g_run = 1;
+volatile int g_run = 1;                     /* shared with the air role (ml-linkd.h) */
 static int g_fd = -1;                       /* /dev/artosyn_sdio */
-static int g_verbose;
+int g_verbose;                              /* shared with the air role (ml-linkd.h) */
 static int g_no_gate;
+static int g_role_air;                      /* --role air: transmit-side (air unit), not the RX goggle */
 static int g_scan_probe;                    /* --scan-probe: hexdump the raw GetScanResult + Get1V1Info replies */
 
 /* handshake/link state shared between the FSM tick (main) and the UDP thread.
@@ -318,7 +316,7 @@ static void on_sig(int sig)
     g_run = 0;
 }
 
-static long now_ms(void)
+long now_ms(void)
 {
     struct timespec t;
 
@@ -1715,6 +1713,7 @@ static void assoc_bringup(void)
 int main(int argc, char **argv)
 {
     const char *node = DEV_NODE;
+    const char *hw_version = NULL;
     pthread_t reader_th, udp_th;
     struct sigaction sa;
     uint8_t frame[64], ff02[19];
@@ -1724,14 +1723,28 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-d") && i + 1 < argc) {
             node = argv[++i];
+        } else if (!strcmp(argv[i], "--hw-version") && i + 1 < argc) {
+            hw_version = argv[++i];
         } else if (!strcmp(argv[i], "--no-gate")) {
             g_no_gate = 1;
         } else if (!strcmp(argv[i], "--scan-probe")) {
             g_scan_probe = 1;
+        } else if (!strcmp(argv[i], "--role") && i + 1 < argc) {
+            i++;
+            if (!strcmp(argv[i], "air")) {
+                g_role_air = 1;
+            } else if (!strcmp(argv[i], "rx")) {
+                g_role_air = 0;
+            } else {
+                fprintf(stderr, "ml-linkd: unknown role '%s' (want air|rx)\n", argv[i]);
+                return 2;
+            }
         } else if (!strcmp(argv[i], "-v")) {
             g_verbose = 1;
         } else {
-            fprintf(stderr, "usage: ml-linkd [-d /dev/artosyn_sdio] [--no-gate] [--scan-probe] [-v]\n");
+            fprintf(stderr,
+                    "usage: ml-linkd [-d /dev/artosyn_sdio] [--role air|rx] [--hw-version STR] "
+                    "[--no-gate] [--scan-probe] [-v]\n");
             return 2;
         }
     }
@@ -1744,6 +1757,12 @@ int main(int argc, char **argv)
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
+
+    /* Air unit (--role air): UDP telemetry TX on sdio0, handled entirely in ml-linkd-air.c. */
+    if (g_role_air) {
+        air_main(hw_version);
+        return 0;
+    }
 
     g_mlm = socket(AF_UNIX, SOCK_DGRAM, 0);
 

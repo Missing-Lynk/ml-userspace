@@ -16,6 +16,16 @@
 REPO  := $(abspath .)
 BUILD := $(REPO)/build
 
+# Software version string embedded in ml-linkd (used as the air unit's fw_version); overridable.
+# Written to ml-linkd/version.h and rewritten only when it changes, so it never forces a rebuild.
+ML_VERSION ?= $(shell git -C $(REPO) describe --tags --always --dirty 2>/dev/null || echo dev)
+
+ml-linkd/version.h: FORCE
+	@line='#define ML_VERSION "$(ML_VERSION)"'; \
+	  [ -f $@ ] && [ "$$(cat $@)" = "$$line" ] || echo "$$line" > $@
+.PHONY: FORCE
+FORCE:
+
 # Device capability flags. The wrapper passes these from the device manifest (devices/<name>/device.mk);
 # when userspace/ is built standalone they default to the goggle. Forwarded to the ml-hud build as -D
 # defines so the device-agnostic UI code can gate per-device features (menu items a device lacks).
@@ -41,13 +51,14 @@ $(BUILD):
 # pin as the gstreamer stack and the slot-B rootfs, so musl and versions match the runtime).
 #   $(1)=name  $(2)=extra apk packages  $(3)=extra gcc flags
 define daemon_rule
-$(BUILD)/$(1): $(1)/$(1).c $(wildcard $(1)/*.h) ml-shared/mlm.h | $(BUILD)
+$(BUILD)/$(1): $(wildcard $(1)/*.c) $(wildcard $(1)/*.h) ml-shared/mlm.h | $(BUILD)
 	docker run --rm --platform linux/arm64 -v $(REPO):/w -w /w \
 	  alpine:3.24 sh -euc 'apk add -q build-base $(2); \
-	    gcc -O2 -Wall -static $(3) -o build/$(1) $(1)/$(1).c'
+	    gcc -O2 -Wall -static $(3) -o build/$(1) $(1)/*.c'
 	@ls -la $$@
 endef
 $(eval $(call daemon_rule,ml-linkd,,-pthread))
+$(BUILD)/ml-linkd: ml-linkd/version.h
 $(eval $(call daemon_rule,ml-ledd,linux-headers,))
 $(eval $(call daemon_rule,ml-rf-bringup,linux-headers,))
 

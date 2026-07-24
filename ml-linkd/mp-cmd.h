@@ -80,6 +80,43 @@ static inline int mp_stb_ack(uint8_t *frame, uint32_t stamp)
     return mp_header_only(frame, MP_STBACK, stamp);
 }
 
+/* Air->goggle status frames the air transmits on :10000. They share the common 20-byte header
+ * (type@0, timestamp@8, body_len@16, body@20) and carry a 12-byte zero trailer after the body. The
+ * goggle parses them at the offsets in ml-hud/src/channel/osd_proto.h. */
+#define MP_TRAILER_LEN     12
+
+/* 0x11 periodic status: 6-byte body, u16 voltage_mV at body offset 4 (the rest zero). */
+#define MP_STATUS_B_TOTAL  (MP_OFF_BODY + 6 + MP_TRAILER_LEN)   /* 38 */
+static inline int mp_status_periodic(uint8_t *frame, uint16_t voltage_mv, uint32_t stamp)
+{
+    mp_stamp(frame, MP_STATUS_B_TOTAL, MP_STATUS_B, stamp, 6);
+    memcpy(frame + MP_OFF_BODY + 4, &voltage_mv, sizeof voltage_mv);
+
+    return MP_STATUS_B_TOTAL;
+}
+
+/* 0x09 version/info status: 128-byte body carrying the hw/fw version strings, the battery voltage,
+ * and the air-unit temperature. Only the fields the goggle reads are set; the buffer is pre-zeroed
+ * by mp_stamp, so the 16-byte string fields stay NUL-padded. */
+#define MP_STATUS_A_TOTAL      (MP_OFF_BODY + 128 + MP_TRAILER_LEN)   /* 160 */
+#define MP_STATUS_A_OFF_HW     0
+#define MP_STATUS_A_OFF_FW     32
+#define MP_STATUS_A_OFF_VOLT   96
+#define MP_STATUS_A_OFF_TEMP   98
+static inline int mp_status_version(uint8_t *frame, const char *hw, const char *fw,
+                                    uint16_t voltage_mv, uint16_t temp_c, uint32_t stamp)
+{
+    uint8_t *body = frame + MP_OFF_BODY;
+
+    mp_stamp(frame, MP_STATUS_A_TOTAL, MP_STATUS_A, stamp, 128);
+    memcpy(body + MP_STATUS_A_OFF_HW, hw, strnlen(hw, 16));
+    memcpy(body + MP_STATUS_A_OFF_FW, fw, strnlen(fw, 16));
+    memcpy(body + MP_STATUS_A_OFF_VOLT, &voltage_mv, sizeof voltage_mv);
+    memcpy(body + MP_STATUS_A_OFF_TEMP, &temp_c, sizeof temp_c);
+
+    return MP_STATUS_A_TOTAL;
+}
+
 /* SetTranParm (0x0D): TX power + standby-arm. 34-byte frame, 10-byte body at offset 20: body[0]=dBm,
  * body[1]=0x04 (const in every captured frame), body[8]=u8StandbyModeEn. Only power and standby are
  * varied; the rest is the HW-confirmed vendor tuple. See plans/rf-air-config.md. */
