@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# build-static.sh - PRODUCTION track (plans/gst-static-rootfs.md): build a slim, standalone
-# ml-pipeline with GStreamer statically linked via the gst-full mechanism. Only the curated plugin
-# set is compiled in and registered at gst_init - no plugin dir, no registry scan. This is the
-# hand-compiled shipping binary that lands in the rootfs. (The SD squashfs, build-prefix.sh, remains
-# the experimentation track - untouched.)
+# build-static.sh - PRODUCTION track (plans/gst-static-rootfs.md): build the slim, standalone
+# GStreamer binaries with GStreamer statically linked via the gst-full mechanism. Only the curated
+# plugin set is compiled in and registered at gst_init - no plugin dir, no registry scan. These are
+# the hand-compiled shipping binaries that land in the rootfs: ml-pipeline (goggle decode/display)
+# and ml-air-video (air-unit synthetic-video TX), both against one shared gstreamer-full-1.0 static
+# lib. (The SD squashfs, build-prefix.sh, remains the experimentation track - untouched.)
 #
 # Cross-builds in the same Alpine 3.24 aarch64 container pin as the rootfs, so musl + versions match.
 # The actual build steps live in build-static-container.sh (this is just the docker wrapper).
@@ -32,4 +33,4 @@ docker run --rm --platform linux/arm64 \
   -e REBUILD="${REBUILD:-}" \
   alpine:3.24 sh /w/gstreamer/scripts/build-static-container.sh
 
-echo "[i] done; standalone binary at gstreamer/build/static/ml-pipeline"
+echo "[i] done; standalone binaries at gstreamer/build/static/{ml-pipeline,ml-air-video}"

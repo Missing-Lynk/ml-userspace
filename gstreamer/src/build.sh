@@ -9,6 +9,7 @@
 #   ml-hud      static, stb_truetype -lm - framecount HUD on the overlay plane
 #   ml-pipeline dynamic, gstreamer-1.0   - decode->display + telemetry producer
 #                                          (runs against the /mnt/gst prefix libs)
+#   ml-air-video dynamic, gstreamer-1.0  - air-unit synthetic two-tile H.265 TX on :10001
 #
 # Output: gstreamer/build/bin/ (gitignored). build-prefix.sh stages these into
 # the squashfs at /mnt/gst/missinglynk/bin/.
@@ -30,6 +31,8 @@ docker run --rm --platform linux/arm64 \
     gcc -O2 -Wall -static -o "$O/ml-hud"    ml-hud/ml-hud.c -I. -lm
     gcc -O2 -Wall -o "$O/ml-pipeline" ml-pipeline/*.c \
         $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0 gstreamer-allocators-1.0 gstreamer-rtsp-server-1.0 libdrm) -lpthread
+    gcc -O2 -Wall -o "$O/ml-air-video" ml-air-video/ml-air-video.c ml-air-video/vph.c \
+        $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0 gstreamer-allocators-1.0) -lpthread
     gcc -O2 -Wall -static -o "$O/ml-splash" ml-splash/ml-splash.c
     ls -la "$O"
   '

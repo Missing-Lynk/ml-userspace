@@ -89,8 +89,10 @@ if [ -n "${REBUILD:-}" ] || [ ! -f "$PREFIX/lib/libgstreamer-full-1.0.a" ]; then
         -Dgst-plugins-base:app=enabled \
         -Dgst-plugins-base:videoconvertscale=enabled \
         -Dgst-plugins-base:videorate=enabled \
+        -Dgst-plugins-base:videotestsrc=enabled \
         -Dgst-plugins-base:typefind=enabled \
         -Dgst-plugins-good:v4l2=enabled \
+        -Dgst-plugins-good:videocrop=enabled \
         -Dgst-plugins-good:isomp4=enabled \
         -Dgst-plugins-good:rtp=enabled \
         -Dgst-plugins-good:rtpmanager=enabled \
@@ -106,6 +108,7 @@ fi
 # The per-plugin .pc land in meson-private/ (not installed), but gstreamer-full-1.0.pc Requires
 # them, so install them into the prefix for pkg-config --static to resolve the whole closure.
 for p in gstcoreelements gstapp gsttypefindfunctions gstvideoconvertscale gstvideorate \
+         gstvideotestsrc gstvideocrop \
          gstisomp4 gstvideo4linux2 gstvideoparsersbad gstkms gstrtp gstrtpmanager gstudp; do
     cp -f "build/meson-private/$p.pc" "$PREFIX/lib/pkgconfig/" 2>/dev/null || true
 done
@@ -124,6 +127,19 @@ gcc -O2 -Wall -static -o "$OUT/ml-pipeline.debug" \
 # Ship the stripped binary; keep the unstripped copy for symbolizing crashes.
 cp "$OUT/ml-pipeline.debug" "$OUT/ml-pipeline"
 strip --strip-all "$OUT/ml-pipeline"
+
+echo "=== linking standalone ml-air-video against gstreamer-full-1.0 ==="
+# The air-unit synthetic-video TX. Same static gst-full closure as ml-pipeline, minus rtsp-server
+# (it only links gstreamer-1.0 + gstreamer-app-1.0). vph-test.c is excluded: it has its own main().
+gcc -O2 -Wall -static -o "$OUT/ml-air-video.debug" \
+    $(pkg-config --cflags gstreamer-full-1.0) \
+    /w/gstreamer/src/ml-air-video/ml-air-video.c /w/gstreamer/src/ml-air-video/vph.c \
+    -Wl,--start-group $(pkg-config --libs --static gstreamer-full-1.0) -leconf -Wl,--end-group \
+    -lpthread || { echo "LINK FAILED - see errors above"; exit 1; }
+
+cp "$OUT/ml-air-video.debug" "$OUT/ml-air-video"
+strip --strip-all "$OUT/ml-air-video"
+
 echo "=== result (standalone, fully static) ==="
-ls -la "$OUT/ml-pipeline" "$OUT/ml-pipeline.debug"
-file "$OUT/ml-pipeline"
+ls -la "$OUT/ml-pipeline" "$OUT/ml-pipeline.debug" "$OUT/ml-air-video" "$OUT/ml-air-video.debug"
+file "$OUT/ml-pipeline" "$OUT/ml-air-video"
