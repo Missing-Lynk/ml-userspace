@@ -8,6 +8,8 @@ The FC's Betaflight/INAV OSD arrives over **standard MSP DisplayPort**, `libvtxf
 
 **Vendor-specific (our RE, the body of this doc):** the Artosyn SHM canvas packing that `GetOsdContext` returns (the `b6 03` length-chained records), the GetOsdContext call/SHM, and the fact that the **menu** (not `ar_lowdelay`) must render it. From RE of `ar_lowdelay` / `test_uidesign` / `libvtxfc` + on-device captures.
 
+This doc describes the canvas as a **consumer** sees it. The producing side (the air unit polling a Betaflight FC over MSP on a serial port, packing the canvas, and relaying it as a `0x10` frame) is reverse-engineered in `plans/air-fc-msp-link.md`; the format below is what such an implementation has to emit.
+
 Confidence tags: **[confirmed]** (decoded cleanly + reproduces known text), **[inferred]**, **[open]**.
 
 ## GetOsdContext return [confirmed]
@@ -37,9 +39,19 @@ The shmids are plain System V ids passed straight to `shmat` (not keys, not size
 
 ## Byte format [confirmed]
 
-The canvas is a stream of **2-byte words, each followed by a `0xff` separator**. Strip the `0xff` bytes to get the packed stream: `<10-byte header> <record> <record> ...`
+The canvas is a stream of **2-byte words, each followed by a `0xff` separator**. Strip the `0xff` bytes to get the packed stream: `<9-byte header> <record> <record> ...`
 
-- **Header** (10 bytes), e.g. `06 00 00 03 91 00 00 00 51 0a`, the last byte (`0a` here) is the LENGTH of the first record's content (the rest is not yet decoded). **[open]**
+The `0xff` interleave is not part of MSP. It is a transmit-side repack in `libvtxfc` (`FUN_001044c8`), which rewrites the byte stream as `{b0, b1, 0xff}` triples, copying any odd tail byte plain.
+
+- **Header** (9 bytes, big-endian) **[confirmed]**, built by `processDisplayPort` on the `drawScreen` sub-command:
+
+  | off | size | field |
+  |-----|------|-------|
+  | 0 | u8 | record count accumulated since the last `clearScreen` |
+  | 1..4 | u32 be | canvas sequence, increments once per `drawScreen` |
+  | 5..8 | u32 be | total length = payload length + 9 |
+
+  Worked against the sample `06 00 00 03 91 00 00 00 51 0a`: 6 records, sequence 913, total 81 (= 72 + 9). The tenth byte (`0a`) is not header, it is the first record's content length, which belongs to the length-chain below.
 - **Records are LENGTH-CHAINED** [confirmed on-device]. The byte immediately BEFORE each `b6 03` marker is that record's content length. A record is `b6 03 <row> <col> <attr> <glyphs...> <next_len>` where the content (everything after `b6 03`) is `len` bytes and its **last byte is the length of the FOLLOWING record** (so it doubles as the next record's prefix). The displayable glyphs are content bytes `3 .. len-2` (skip row/col/attr and the trailing next_len). The final record has no trailing length.
   - `row`, `col`: cell position into the OSD grid.
   - `attr`: cell attribute (color/blink/font page). `0x00` in every sample seen. **[open]** (see "What's left").
@@ -97,5 +109,5 @@ The FC/MSP OSD renders over the live video, confirmed on a goggle running a Beta
 ### What's left (minor / future)
 
 - **`attr` byte** (the Betaflight DisplayPort write attribute, page / blink / colour). The vendor firmware carries it **opaquely**, RE-confirmed it is never bit-decoded (only an equality compare for add-vs-update in `add_osd_icon`) and is dropped before rendering, so we render monochrome page-0. It is `0x00` in every capture; non-zero only for Betaflight 4.5+ coloured/blinking warnings or page-2+ glyphs. Its bit layout is **upstream Betaflight** (`displayPortAttr_t`, `src/main/io/displayport_msp.c`), NOT recoverable from the vendor binaries (they don't interpret it). To apply it: take the bit layout from Betaflight source + a non-zero capture, then honour page/blink/colour in `msp_canvas.c`. Not blocking. **[open]**
-- **Header**: only its last byte (the first record's length) is decoded; the other 9 bytes are not needed for rendering. **[open]**
+- ~~**Header**: only its last byte (the first record's length) is decoded.~~ **Now fully decoded** (record count + big-endian sequence + big-endian total length), see "Byte format" above. Still not needed for rendering, but it is what a transmit-side implementation has to build. **[confirmed]**
 - **Custom font from SD**: the PNG loader already accepts any `font_<fcid>_hd.png`; only the menu UI to select one is deferred.
