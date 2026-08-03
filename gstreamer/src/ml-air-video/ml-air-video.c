@@ -26,6 +26,8 @@
  *   ML_AIR_PORT       goggle video port           (default 10001)
  *   ML_AIR_FPS        frame rate                  (default 15)
  *   ML_AIR_PATTERN    videotestsrc pattern        (default ball)
+ *   ML_AIR_CAMERA     ar-cvisp node, e.g. /dev/video2: use the sensor instead
+ *                     of the synthetic pattern (needs ar-cvisp depth >= 3)
  *   ML_AIR_ENC        encoder element + props     (default v4l2h265enc dmabuf-import, large GOP)
  *   ML_AIR_HEAP       dma_heap name for tile bufs (default: first non-mmz heap, else any)
  *   ML_AIR_DUMP       prefix: also write <prefix>_tileN.h265
@@ -207,13 +209,30 @@ static int air_heap_alloc(gsize len)
     return (int)a.fd;
 }
 
-/** Allocate and mmap a tile's dma-heap pool; returns the count obtained (>= AIR_POOL_MIN on ok). */
+/** Allocate and mmap a tile's dma-heap pool; returns the count obtained (>= AIR_POOL_MIN on ok).
+ *
+ * The tile buffers and the codec's own working buffers come from the same 32 MiB mmz pool,
+ * because that is the only dma-heap the air unit exposes. Two tiles at four buffers is about
+ * 12.9 MB of it, against roughly 13 MB the two encoder instances need, so the pool depth is a
+ * real lever when the second instance cannot allocate its FBC buffers. ML_AIR_POOL trades
+ * pipelining depth for headroom without a rebuild.
+ */
 static int air_pool_init(struct air_tile *t)
 {
+    const char *pool_env = getenv("ML_AIR_POOL");
+    int want = (pool_env != NULL && *pool_env != '\0') ? atoi(pool_env) : AIR_POOL_MAX;
+
+    if (want < AIR_POOL_MIN) {
+        want = AIR_POOL_MIN;
+    }
+    if (want > AIR_POOL_MAX) {
+        want = AIR_POOL_MAX;
+    }
+
     t->freeq = g_async_queue_new();
     t->pool_n = 0;
 
-    for (int i = 0; i < AIR_POOL_MAX; i++) {
+    for (int i = 0; i < want; i++) {
         int fd = air_heap_alloc(t->buf_size);
         guint8 *map;
 
@@ -579,6 +598,7 @@ int main(int argc, char **argv)
     int port = atoi(env_or("ML_AIR_PORT", "10001"));
     int fps = atoi(env_or("ML_AIR_FPS", "15"));
     const char *pattern = env_or("ML_AIR_PATTERN", "ball");
+    const char *camera = getenv("ML_AIR_CAMERA");
     const char *enc = env_or("ML_AIR_ENC",
                              "v4l2h265enc output-io-mode=dmabuf-import "
                              "extra-controls=\"controls,video_gop_size=65535\"");
@@ -711,12 +731,34 @@ int main(int argc, char **argv)
         gst_object_unref(ebus);
     }
 
-    /* Source pipeline: videotestsrc -> appsink (full 1080 frames). */
-    snprintf(desc, sizeof desc,
-             "videotestsrc is-live=true pattern=%s ! "
-             "video/x-raw,format=I420,width=%d,height=%d,framerate=%d/1 ! "
-             "appsink name=src sync=false max-buffers=4 drop=true",
-             pattern, AIR_COMP_W, AIR_COMP_H, fps);
+    /*
+     * Source pipeline: full 1080 frames into an appsink, which the tile
+     * splitter reads through gst_video_frame_map, so a source stride wider
+     * than the width costs nothing here.
+     *
+     * ML_AIR_CAMERA names the ar-cvisp capture node and swaps the synthetic
+     * source for the sensor. The camera runs at its own rate, which is
+     * higher than the link budget allows, so videorate drops to ML_AIR_FPS
+     * rather than the encoders being asked to swallow 60 fps: two tiles at
+     * 15 fps is what the transmit path was validated at. ar-cvisp must be
+     * loaded with depth 3 or more, because depth 1 re-arms one buffer per
+     * frame and the encoder then reads it mid-overwrite.
+     */
+    if (camera != NULL) {
+        snprintf(desc, sizeof desc,
+                 "v4l2src device=%s io-mode=mmap ! "
+                 "video/x-raw,format=I420,width=%d,height=%d ! "
+                 "videorate drop-only=true ! "
+                 "video/x-raw,framerate=%d/1 ! "
+                 "appsink name=src sync=false max-buffers=4 drop=true",
+                 camera, AIR_COMP_W, AIR_COMP_H, fps);
+    } else {
+        snprintf(desc, sizeof desc,
+                 "videotestsrc is-live=true pattern=%s ! "
+                 "video/x-raw,format=I420,width=%d,height=%d,framerate=%d/1 ! "
+                 "appsink name=src sync=false max-buffers=4 drop=true",
+                 pattern, AIR_COMP_W, AIR_COMP_H, fps);
+    }
 
     src_pipe = gst_parse_launch(desc, &err);
     if (src_pipe == NULL) {
