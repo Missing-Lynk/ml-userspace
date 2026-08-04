@@ -425,7 +425,7 @@ int rec_start(struct ctx *c, const char *path)
     /* Zero-copy dmabuf-import is the default: the encoder imports the composite buffers
      * directly (no MMAP input pool from the wave5 device pool, no 3 MiB/frame copy). Needs
      * COMP_ALLOC buffer sizing, the 3-plane wrap in rec_push, wave5 plane data_offset
-     * support (kernel patch 0013), and the gst qbuf bytesused-offset fix
+     * support (kernel patch 0280), and the gst qbuf bytesused-offset fix
      * (gstreamer/patches/0001). ML_DVR_NO_IMPORT=1 falls back to copy mode (the encoder's
      * own MMAP pool + per-frame memcpy); the CPU videoscale path always copies (scale
      * output is system memory). The HW-scale path imports too - the scaled dst dma-bufs,
@@ -712,7 +712,7 @@ void rec_push(struct ctx *c, GstBuffer *buf, GstClockTime pts)
         /* The driver negotiates 3 V4L2 planes (gst prefers the non-contiguous variant), and
          * gst's dmabuf import demands one memory per plane. All three share the pool buffer's
          * fd: each memory's offset becomes the plane's data_offset (wave5 applies it, kernel
-         * patch 0013), and its maxsize (COMP_ALLOC) covers every plane's 16-row-aligned
+         * patch 0280), and its maxsize (COMP_ALLOC) covers every plane's 16-row-aligned
          * minimum length. The pool buffer rides as qdata so the slot returns only when the
          * encoder is done with the frame.
          */

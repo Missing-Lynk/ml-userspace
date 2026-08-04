@@ -4,7 +4,7 @@ Reference for the Artosyn Proxima-9311 MPP video-encoder API (`AR_MPI_VENC_*` in
 
 ## Open V4L2 wave5 encoder - hardware-validated capabilities
 
-Everything below this section is the vendor MPP blob API. THIS section is the open path we actually build DVR on: the mainline Chips&Media wave5 V4L2 M2M encoder (`kernel/patches/0010-wave5-vpu-enc.patch`), same `wave5.ko` as the decoder, exposed as `/dev/video1` (`v4l2h264enc` / `v4l2h265enc`). Measured on the device (BetaFPV VR04, open kernel 6.18.36).
+Everything below this section is the vendor MPP blob API. THIS section is the open path we actually build DVR on: the mainline Chips&Media wave5 V4L2 M2M encoder (`kernel/patches/0280-wave5-vpu-enc.patch`), same `wave5.ko` as the decoder, exposed as `/dev/video1` (`v4l2h264enc` / `v4l2h265enc`). Measured on the device (BetaFPV VR04, open kernel 6.18.36).
 
 ### Formats
 

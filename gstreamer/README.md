@@ -99,7 +99,7 @@ State (mode + paused/ended/rendering flags + position/duration) is published to 
 
 - `kmssink` needs `driver-name=artosyn-vo plane-id=33`: its auto-probe knows neither our driver name nor that plane 0 is the scanout primary (its auto-pick grabs the ARGB4444 overlay and fails caps negotiation).
 - I420 through generic DRM clients needs the `artosyn_vo` 64-px dumb-pitch fix (in `kernel/overlay/.../artosyn_vo.c`): the DC hardcodes the chroma stride to width/2 while clients derive it as luma-pitch/2. Same fix makes wave5 decoder buffers (1920/960 strides) import 1:1.
-- The wave5 decoder needs the bitstream-sizeimage clamp + allocation instrumentation (patches `kernel/patches/0009-wave5-vpu-dec.patch`, `0006-wave5-vdi.patch`): GStreamer's 17.7 MiB worst-case bitstream request otherwise explodes into >100 MiB of codec-pool demand (power-of-2 rounding per allocation) and ENOMEMs.
+- The wave5 decoder needs the bitstream-sizeimage clamp + allocation instrumentation (patches `kernel/patches/0270-wave5-vpu-dec.patch`, `0230-wave5-vdi.patch`): GStreamer's 17.7 MiB worst-case bitstream request otherwise explodes into >100 MiB of codec-pool demand (power-of-2 rounding per allocation) and ENOMEMs.
 - The VPU only initializes on a cold power-on: a wedged/killed decode instance or a wave5.ko swap needs a power cycle, not rmmod/insmod (fails -16).
 - Keep `kmssink` as the sink when benchmarking: only it negotiates `memory:DMABuf` caps; with `fakesink` GStreamer silently falls back to copy-at-threshold out of uncached memory (~21 fps) and you measure the wrong thing.
 

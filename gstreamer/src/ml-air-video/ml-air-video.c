@@ -69,10 +69,22 @@
  * A ring of 8 rather than an A/B flip is deliberate. Two frames alternating can be defeated by
  * reference reuse (bring-up reports fbc_buf_count 2), which would silently return every other
  * frame to the skip-coded best case.
+ *
+ * None of those four is watchable, and that is inherent rather than a defect. The ring holds
+ * pool_n fixed images and the feeder takes whichever buffer the encoder released first, so the
+ * displayed phase hops among pool_n values in completion order instead of advancing, and the two
+ * tiles sit on unrelated phases so the seam between them does not line up. Judging any of them by
+ * eye reads as corruption.
+ *
+ * `scroll` is the tier to look at. It renders every frame with the phase taken from the shared
+ * frame counter, so motion is continuous and both tiles agree at the seam. That is a full CPU
+ * pass per frame per tile, the same cost that caps the live path near 17 fps, so it measures
+ * nothing: it exists to put a correct picture on the panel.
  */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <stdio.h>
@@ -95,6 +107,9 @@
 /** Composite frame geometry (both tiles report this Resolution). */
 #define AIR_COMP_W   1920
 #define AIR_COMP_H   1080
+/* Pixels the `scroll` tier advances per frame. 8 divides 1920, so the pattern wraps exactly and
+ * the loop has no discontinuity. */
+#define AIR_SCROLL_PX 8
 
 /** Number of tiles / encode channels. */
 #define AIR_NCHN     2
@@ -159,7 +174,27 @@ struct air_tile {
      * benchmark ask "did the encoder produce a frame", not "did the goggle receive one". */
     volatile guint64 done;
     volatile guint64 bytes;        /* encoded bytes out of the encoder */
+    /* Transmit losses, split by cause and counted separately from `dropped` (which is ring-slot
+     * starvation only). Both were previously silent: the frame vanished, `sent` simply did not
+     * advance, and every other counter on both ends still read healthy.
+     *
+     * oversize is a hard protocol limit, not a tuning problem. One access unit goes in one UDP
+     * datagram, so anything above AIR_TX_MAX - VPH overhead cannot be sent at all. Bytes per
+     * frame scale inversely with frame rate at a fixed bitrate, so a rate low enough makes the
+     * encoder's ordinary peaks uncarriable. */
+    volatile guint64 tx_oversize;  /* access unit too large for one datagram */
+    volatile guint64 tx_error;     /* sendto failed or sent short */
+    int tx_errno;                  /* errno of the most recent tx_error */
+    guint32 tx_maxlen;             /* largest access unit seen, for sizing the limit against */
+    /* A frame lost between the encoder and this program: appsrc refused the input, or a pulled
+     * sample could not be mapped. Rare, but the same failure class as tx_oversize was: without a
+     * counter the frame is gone and every other number still reads healthy. */
+    volatile guint64 lost;
 };
+
+/* Source frames discarded before any tile saw them: the live appsink could not be mapped. Not
+ * per-tile, because the frame is dropped upstream of the split. */
+static volatile guint64 g_src_lost;
 
 static struct air_tile g_tile[AIR_NCHN];
 static GMainLoop *g_loop;
@@ -649,8 +684,12 @@ static void air_push_frame(const int *idx, GstClockTime pts)
             struct air_tile *t = &g_tile[order[o]];
             int waited;
 
-            gst_app_src_push_buffer(t->src, air_wrap_tile(t, idx[order[o]], pts));
-            t->pushed++;
+            if (gst_app_src_push_buffer(t->src, air_wrap_tile(t, idx[order[o]], pts))
+                != GST_FLOW_OK) {
+                t->lost++;
+            } else {
+                t->pushed++;
+            }
             for (waited = 0; waited < 300 && t->done < 1; waited++) {
                 g_usleep(10000);
             }
@@ -664,8 +703,12 @@ static void air_push_frame(const int *idx, GstClockTime pts)
 
     for (int i = 0; i < AIR_NCHN; i++) {
         if (g_tile[i].active) {
-            gst_app_src_push_buffer(g_tile[i].src, air_wrap_tile(&g_tile[i], idx[i], pts));
-            g_tile[i].pushed++;
+            if (gst_app_src_push_buffer(g_tile[i].src, air_wrap_tile(&g_tile[i], idx[i], pts))
+                != GST_FLOW_OK) {
+                g_tile[i].lost++;
+            } else {
+                g_tile[i].pushed++;
+            }
         }
     }
 }
@@ -722,6 +765,7 @@ static gpointer air_bench_feed(gpointer user)
         guint64 seen[AIR_NCHN];
         gint64 progress = next;
         int need[AIR_NCHN];
+        int scroll;
 
         for (int i = 0; i < AIR_NCHN; i++) {
             at_start[i] = g_tile[i].done;
@@ -734,7 +778,16 @@ static gpointer air_bench_feed(gpointer user)
         }
 
         g_bench_stage = g_bench_stages[s];
-        g_printerr("[ml-air-video] bench: tier %s for %d s\n", g_bench_stage, g_bench_secs);
+        scroll = strcmp(g_bench_stage, "scroll") == 0;
+
+        if (scroll) {
+            for (int i = 0; i < AIR_NCHN; i++) {
+                need[i] = 0;
+            }
+        }
+
+        g_printerr("[ml-air-video] bench: tier %s for %d s%s\n", g_bench_stage, g_bench_secs,
+                   scroll ? " (visual tier: renders every frame, not a rate measurement)" : "");
 
         while (!g_bench_stop && g_get_monotonic_time() < until) {
             int idx[AIR_NCHN];
@@ -762,11 +815,37 @@ static gpointer air_bench_feed(gpointer user)
             }
 
             if (air_reserve_pair(idx)) {
-                for (int i = 0; i < AIR_NCHN; i++) {
-                    if (need[i] > 0 && !(renewed[i] & (1u << idx[i]))) {
-                        air_render_one(&g_tile[i], idx[i], g_bench_stage);
-                        renewed[i] |= 1u << idx[i];
-                        need[i]--;
+                if (scroll) {
+                    /* Visual tier: phase comes from the shared frame counter, so both tiles
+                     * render the same point in the scroll and the tile seam is continuous.
+                     * Re-rendering every frame is the only way to get smooth motion; the ring
+                     * tiers hold pool_n fixed phases and the feeder replays them in buffer
+                     * completion order, which hops rather than scrolls and puts the two tiles
+                     * on unrelated phases. That costs a CPU pass per frame per tile, so this
+                     * tier measures nothing: use it to look at a picture, not to take a rate. */
+                    for (int i = 0; i < AIR_NCHN; i++) {
+                        if (g_tile[i].active) {
+                            struct air_tile *t = &g_tile[i];
+
+                            air_dmabuf_sync(t->pool[idx[i]].fd, 1);
+                            /* No dither. It exists to defeat motion estimation so the ring tiers
+                             * carry residual, which is the opposite of what a visual tier wants:
+                             * perturbing every pixel every frame costs about 5x the bytes and
+                             * pushes access units past the 65467 B datagram ceiling, where they
+                             * are discarded and the picture breaks. A pure translation of flat
+                             * bars is what keeps frames small enough to arrive. */
+                            air_render_bars(t, t->pool[idx[i]].map,
+                                            (int)((n * AIR_SCROLL_PX) % AIR_COMP_W), 0);
+                            air_dmabuf_sync(t->pool[idx[i]].fd, 0);
+                        }
+                    }
+                } else {
+                    for (int i = 0; i < AIR_NCHN; i++) {
+                        if (need[i] > 0 && !(renewed[i] & (1u << idx[i]))) {
+                            air_render_one(&g_tile[i], idx[i], g_bench_stage);
+                            renewed[i] |= 1u << idx[i];
+                            need[i]--;
+                        }
                     }
                 }
 
@@ -803,9 +882,11 @@ static gpointer air_bench_feed(gpointer user)
             for (int i = 0; i < AIR_NCHN; i++) {
                 if (g_tile[i].active) {
                     g_printerr("[ml-air-video] bench: tier %s tile %d: %" G_GUINT64_FORMAT
-                               " frames%s\n",
+                               " frames, %" G_GUINT64_FORMAT " oversize, %" G_GUINT64_FORMAT
+                               " tx errors, %" G_GUINT64_FORMAT " lost, largest AU %u B%s\n",
                                g_bench_stage, i, g_tile[i].done - at_start[i],
-                               idle > 2.0 ? ", STALLED" : "");
+                               g_tile[i].tx_oversize, g_tile[i].tx_error, g_tile[i].lost,
+                               g_tile[i].tx_maxlen, idle > 2.0 ? ", STALLED" : "");
                 }
             }
 
@@ -842,6 +923,7 @@ static GstFlowReturn air_on_src(GstAppSink *sink, gpointer user)
 
     sbuf = gst_sample_get_buffer(sample);
     if (sbuf == NULL || !gst_video_frame_map(&frame, &g_src_info, sbuf, GST_MAP_READ)) {
+        g_src_lost++;
         gst_sample_unref(sample);
         return GST_FLOW_OK;
     }
@@ -886,6 +968,7 @@ static GstFlowReturn air_on_enc(GstAppSink *sink, gpointer user)
 
     buf = gst_sample_get_buffer(sample);
     if (buf == NULL || !gst_buffer_map(buf, &map, GST_MAP_READ)) {
+        t->lost++;
         gst_sample_unref(sample);
         return GST_FLOW_OK;
     }
@@ -905,14 +988,21 @@ static GstFlowReturn air_on_enc(GstAppSink *sink, gpointer user)
         }
     }
 
+    if (map.size > t->tx_maxlen) {
+        t->tx_maxlen = (guint32)map.size;
+    }
+
     if (!g_notx) {
         len = vph_build(t->txbuf, AIR_TX_MAX, (guint32)t->chn, is_idr, frame_id, ts_ms,
                         t->resolution, map.data, (guint32)map.size);
-        if (len > 0) {
-            if (sendto(t->sock, t->txbuf, len, MSG_DONTWAIT,
-                       (struct sockaddr *)&t->dst, sizeof t->dst) == (ssize_t)len) {
-                t->sent++;
-            }
+        if (len == 0) {
+            t->tx_oversize++;
+        } else if (sendto(t->sock, t->txbuf, len, MSG_DONTWAIT,
+                          (struct sockaddr *)&t->dst, sizeof t->dst) != (ssize_t)len) {
+            t->tx_error++;
+            t->tx_errno = errno;
+        } else {
+            t->sent++;
         }
     } else {
         t->sent++;
@@ -972,8 +1062,13 @@ static gboolean air_on_tick(gpointer user)
             } else {
                 g_printerr("[ml-air-video] bench %s tile %d: pushed %" G_GUINT64_FORMAT "/s"
                            " done %" G_GUINT64_FORMAT "/s tx %" G_GUINT64_FORMAT "/s"
-                           " %.2f Mbit/s dropped %" G_GUINT64_FORMAT "/s\n",
-                           bench, i, dp, dd, ds, (double)db * 8.0 / 1e6, dx);
+                           " %.2f Mbit/s dropped %" G_GUINT64_FORMAT "/s"
+                           " oversize %" G_GUINT64_FORMAT " txerr %" G_GUINT64_FORMAT
+                           " (%s) maxau %u\n",
+                           bench, i, dp, dd, ds, (double)db * 8.0 / 1e6, dx,
+                           g_tile[i].tx_oversize, g_tile[i].tx_error,
+                           g_tile[i].tx_errno ? g_strerror(g_tile[i].tx_errno) : "-",
+                           g_tile[i].tx_maxlen);
             }
 
             last_pushed[i] = g_tile[i].pushed;
@@ -1341,8 +1436,13 @@ int main(int argc, char **argv)
         }
     }
 
-    g_printerr("[ml-air-video] stopped (chn0=%" G_GUINT64_FORMAT " chn1=%" G_GUINT64_FORMAT ")\n",
-               g_tile[0].sent, g_tile[1].sent);
+    g_printerr("[ml-air-video] stopped (chn0=%" G_GUINT64_FORMAT " chn1=%" G_GUINT64_FORMAT
+               ", oversize %" G_GUINT64_FORMAT "/%" G_GUINT64_FORMAT
+               ", lost %" G_GUINT64_FORMAT "/%" G_GUINT64_FORMAT
+               ", src lost %" G_GUINT64_FORMAT ")\n",
+               g_tile[0].sent, g_tile[1].sent,
+               g_tile[0].tx_oversize, g_tile[1].tx_oversize,
+               g_tile[0].lost, g_tile[1].lost, g_src_lost);
 
     if (src_pipe != NULL) {
         gst_object_unref(src_pipe);
