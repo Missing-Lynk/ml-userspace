@@ -38,6 +38,37 @@
  *   ML_AIR_SAMEH      run both tiles at 560 rows (diagnostic)
  *   ML_AIR_NO_STAGGER concurrent (racy) encoder bring-up (diagnostic)
  *   ML_AIR_ORDER      01: bring tile 0 up first (diagnostic; known to hang the firmware)
+ *
+ * Throughput benchmark (ML_AIR_BENCH, no source pipeline at all):
+ *   ML_AIR_BENCH      comma-separated tiers from static|bars|detail|noise, run back to back on
+ *                     one encoder instance pair (e.g. static,bars,detail)
+ *   ML_AIR_BENCH_SECS seconds per tier (default 10); the run ends when the last tier does
+ *   ML_AIR_RING       ring length in frames (default 8; static ignores content variation)
+ *   ML_AIR_BENCH_FREE resubmit as fast as buffers return instead of pacing at ML_AIR_FPS
+ *
+ * The benchmark exists to separate the encoder and RF ceiling from the capture path: a
+ * pre-rendered ring touches no CVISP buffer, so it measures without the carveout resize the
+ * zero-copy path needs. Rendering per frame is not viable (a 1080p field is about 3.1 MB of
+ * writes, so 60 fps is roughly 187 MB/s into uncached memory, the same order as the tile copy
+ * that caps the live path); rendering once and resubmitting costs nothing per frame.
+ *
+ * The three patterns bound different things and only the middle one decides anything:
+ *   static  every ring buffer identical. After the first IRAP every block codes as skip, so
+ *           this bounds the plumbing with the encoder near-idle. Necessary, not sufficient.
+ *   bars    colour bars scrolled per frame plus a per-frame dither. The scroll alone is close
+ *           to best case, because a global translation is exactly what motion estimation
+ *           predicts; the dither is what stops every block resolving to a motion vector and
+ *           no residual.
+ *   detail  a low-passed noise texture sampled with a different horizontal velocity per band.
+ *           Dense high-frequency structure so coefficients are expensive, and no global motion
+ *           vector that predicts the frame, but still compressible. This is the worst case.
+ *   noise   full entropy in every block. Diagnostic only: incompressible data expands under
+ *           entropy coding, overflows any bitstream buffer bounded by the raw frame, and wedges
+ *           the instance, so it measures the buffer rather than the encoder.
+ *
+ * A ring of 8 rather than an A/B flip is deliberate. Two frames alternating can be defeated by
+ * reference reuse (bring-up reports fbc_buf_count 2), which would silently return every other
+ * frame to the skip-coded best case.
  */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -69,9 +100,16 @@
 #define AIR_NCHN     2
 
 /** dma-heap tile buffers per channel (filled/in-encoder/spare). Allocated at startup; the pool
- * shrinks to whatever the heap yields, down to a floor of AIR_POOL_MIN. */
-#define AIR_POOL_MAX 4
+ * shrinks to whatever the heap yields, down to a floor of AIR_POOL_MIN. AIR_POOL_MAX bounds the
+ * array only: the live path asks for AIR_POOL_DEF, and the benchmark asks for its ring length,
+ * which is the only caller that wants more than a pipelining depth. */
+#define AIR_POOL_MAX 16
+#define AIR_POOL_DEF 4
 #define AIR_POOL_MIN 2
+
+/** Benchmark ring length when ML_AIR_RING is unset. Long enough that the period exceeds any
+ * plausible reference window, so no frame can find an exact match and code as skip. */
+#define AIR_RING_DEF 8
 
 /** Send buffer capacity: the largest a single UDP datagram can be (the kernel IP-fragments it). */
 #define AIR_TX_MAX   65507
@@ -102,6 +140,7 @@ struct air_tile {
     gsize buf_size;                /* dma-heap buffer size (stride*alloc_h*3/2) */
 
     GstAppSrc *src;                /* encoder input (fed dma-heap I420 buffers) */
+    guint8 *tex;                   /* detail tier's shared source texture, built once */
     struct air_buf pool[AIR_POOL_MAX];
     int pool_n;
     GAsyncQueue *freeq;            /* free pool indices, stored as (idx+1) */
@@ -112,8 +151,14 @@ struct air_tile {
     guint32 resolution;            /* composite Resolution word */
     guint8 *txbuf;                 /* per-channel send buffer (off the thread stack) */
     int dumpfd;                    /* ML_AIR_DUMP raw stream, or -1 */
-    volatile guint64 sent;
+    volatile guint64 sent;         /* access units actually transmitted */
     volatile guint64 dropped;      /* frames skipped because no free buffer */
+    volatile guint64 pushed;       /* frames handed to the encoder */
+    /* Encoder output, counted whether or not it goes out on the wire. Kept apart from `sent`
+     * because a transmit to an absent peer fails, and both the bring-up handshake and the
+     * benchmark ask "did the encoder produce a frame", not "did the goggle receive one". */
+    volatile guint64 done;
+    volatile guint64 bytes;        /* encoded bytes out of the encoder */
 };
 
 static struct air_tile g_tile[AIR_NCHN];
@@ -125,6 +170,12 @@ static int g_verbose;
 static int g_notx;
 static int g_stagger;              /* ML_AIR_STAGGER: serialize the two encoder bring-ups */
 static int g_primed;               /* set once the staggered bring-up completed */
+static int g_bench_free;           /* ML_AIR_BENCH_FREE: resubmit unpaced */
+static volatile int g_bench_stop;  /* feeder thread exit flag */
+static int g_bench_fps;            /* pacing rate and PTS base for the feeder */
+static int g_bench_secs;           /* ML_AIR_BENCH_SECS: seconds per tier */
+static char **g_bench_stages;      /* ML_AIR_BENCH split on commas */
+static const char *g_bench_stage;  /* tier currently running, for the rate line */
 
 /** Bracket CPU writes to a dma-heap buffer so the encoder's DMA sees them (start=1 before the
  * write, start=0 after to flush to DDR). */
@@ -217,11 +268,8 @@ static int air_heap_alloc(gsize len)
  * real lever when the second instance cannot allocate its FBC buffers. ML_AIR_POOL trades
  * pipelining depth for headroom without a rebuild.
  */
-static int air_pool_init(struct air_tile *t)
+static int air_pool_init(struct air_tile *t, int want)
 {
-    const char *pool_env = getenv("ML_AIR_POOL");
-    int want = (pool_env != NULL && *pool_env != '\0') ? atoi(pool_env) : AIR_POOL_MAX;
-
     if (want < AIR_POOL_MIN) {
         want = AIR_POOL_MIN;
     }
@@ -255,6 +303,243 @@ static int air_pool_init(struct air_tile *t)
 
     return t->pool_n;
 }
+
+/* BT.601 colour bars, left to right: white, yellow, cyan, green, magenta, red, blue, black.
+ * Nominal studio-range values, not a conformance-checked SMPTE field; the benchmark cares about
+ * the spectral content, not the colorimetry. */
+static const guint8 air_bar_y[8] = { 235, 210, 170, 145, 106,  81,  41,  16 };
+static const guint8 air_bar_u[8] = { 128,  16, 166,  54, 202,  90, 240, 128 };
+static const guint8 air_bar_v[8] = { 128, 146,  16,  34, 222, 240, 110, 128 };
+
+/** xorshift32. Deterministic so two runs of the same tier encode identical content. */
+static guint32 air_rand(guint32 *s)
+{
+    guint32 x = *s;
+
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *s = x;
+
+    return x;
+}
+
+/** Render colour bars into a tile buffer, packed I420 at the coded height (chroma at
+ * stride*height), the layout air_wrap_tile describes to the encoder.
+ *
+ * @p shift scrolls the bars horizontally. On its own that is close to best case, because a
+ * global translation is what motion estimation is built to predict; @p dither perturbs luma by
+ * a few LSB per pixel with a per-frame seed, which is what leaves a residual behind after the
+ * motion vector and makes the tier represent something.
+ */
+static void air_render_bars(struct air_tile *t, guint8 *dst, int shift, int dither)
+{
+    const int ys = AIR_COMP_W;
+    const int cs = AIR_COMP_W / 2;
+    guint8 *y = dst;
+    guint8 *cb = dst + (gsize)ys * t->height;
+    guint8 *cr = cb + (gsize)cs * (t->height / 2);
+    guint32 s = 0x1234567u + (guint32)shift * 2654435761u + (guint32)t->chn;
+
+    for (int r = 0; r < t->height; r++) {
+        for (int c = 0; c < ys; c++) {
+            int bar = ((c + shift) % AIR_COMP_W) * 8 / AIR_COMP_W;
+            int v = air_bar_y[bar];
+
+            if (dither) {
+                v += (int)(air_rand(&s) & 7) - 3;
+            }
+
+            y[(gsize)r * ys + c] = (guint8)CLAMP(v, 16, 235);
+        }
+    }
+
+    for (int r = 0; r < t->height / 2; r++) {
+        for (int c = 0; c < cs; c++) {
+            int bar = ((c * 2 + shift) % AIR_COMP_W) * 8 / AIR_COMP_W;
+
+            cb[(gsize)r * cs + c] = air_bar_u[bar];
+            cr[(gsize)r * cs + c] = air_bar_v[bar];
+        }
+    }
+}
+
+/** Build the detail tier's source texture: white noise low-passed with a 3x3 box.
+ *
+ * The blur is the whole point. Full-entropy content expands under entropy coding, so a frame of
+ * it cannot fit a bitstream buffer bounded by the raw frame, and the encoder returns
+ * WAVE5_SYSERR_VLC_BUF_FULL before any rate can be measured. That makes `noise` a measurement of
+ * the buffer rather than of the encoder. Low-passing keeps dense high-frequency structure, which
+ * is what costs coefficients, while leaving the frame compressible enough to code.
+ */
+static void air_make_texture(struct air_tile *t)
+{
+    const int w = AIR_COMP_W;
+    const int h = t->height;
+    guint8 *raw = g_malloc((gsize)w * h);
+    guint32 s = 0x2545f491u ^ (guint32)t->chn;
+
+    t->tex = g_malloc((gsize)w * h);
+
+    for (gsize i = 0; i < (gsize)w * h; i++) {
+        raw[i] = (guint8)(16 + (air_rand(&s) % 220));
+    }
+
+    for (int r = 0; r < h; r++) {
+        for (int c = 0; c < w; c++) {
+            int acc = 0;
+            int n = 0;
+
+            for (int dr = -1; dr <= 1; dr++) {
+                int rr = r + dr;
+
+                if (rr < 0 || rr >= h) {
+                    continue;
+                }
+
+                for (int dc = -1; dc <= 1; dc++) {
+                    int cc = c + dc;
+
+                    if (cc < 0 || cc >= w) {
+                        continue;
+                    }
+
+                    acc += raw[(gsize)rr * w + cc];
+                    n++;
+                }
+            }
+
+            t->tex[(gsize)r * w + c] = (guint8)(acc / n);
+        }
+    }
+
+    g_free(raw);
+}
+
+/** Detail tier: the shared texture sampled with a different horizontal velocity per band.
+ *
+ * A single global scroll is close to best case, because one motion vector predicts the whole
+ * frame. Eight bands moving at different speeds and in alternating directions leave no global
+ * vector that works, so the encoder pays real residual across the picture while the content
+ * itself stays codeable. This is the worst case that produces a number instead of a wedge.
+ */
+static void air_render_detail(struct air_tile *t, guint8 *dst, int frame)
+{
+    const int ys = AIR_COMP_W;
+    const int cs = AIR_COMP_W / 2;
+    const int bands = 8;
+    guint8 *y = dst;
+    guint8 *cb = dst + (gsize)ys * t->height;
+    guint8 *cr = cb + (gsize)cs * (t->height / 2);
+    int band_h = t->height / bands;
+
+    if (t->tex == NULL) {
+        air_make_texture(t);
+    }
+
+    if (band_h < 1) {
+        band_h = 1;
+    }
+
+    for (int r = 0; r < t->height; r++) {
+        int b = r / band_h;
+        int vel;
+        int off;
+        const guint8 *src = t->tex + (gsize)r * ys;
+
+        if (b > bands - 1) {
+            b = bands - 1;
+        }
+
+        vel = (b & 1) ? -(3 + b) : (3 + b);
+        off = ((frame * vel) % AIR_COMP_W + AIR_COMP_W) % AIR_COMP_W;
+
+        for (int c = 0; c < ys; c++) {
+            y[(gsize)r * ys + c] = src[(c + off) % AIR_COMP_W];
+        }
+    }
+
+    /* Chroma carries the same structure at a quarter of the excursion: a sensor's chroma is
+     * smoother than its luma, and a full-amplitude chroma field would be harder than anything
+     * the camera can produce. */
+    for (int r = 0; r < t->height / 2; r++) {
+        const guint8 *src = t->tex + (gsize)(r * 2) * ys;
+        int off = (frame * 5) % AIR_COMP_W;
+
+        for (int c = 0; c < cs; c++) {
+            int v = (int)src[(c * 2 + off) % AIR_COMP_W] - 128;
+
+            cb[(gsize)r * cs + c] = (guint8)(128 + (v / 4));
+            cr[(gsize)r * cs + c] = (guint8)(128 - (v / 4));
+        }
+    }
+}
+
+/** Fill a tile buffer with pseudo-random bytes across the whole packed extent. Every block then
+ * carries full spectral energy and no prediction mode is cheap.
+ *
+ * Kept as a diagnostic, not as the worst-case tier: it reliably overflows the bitstream buffer
+ * and wedges the instance, so it yields no rate. Use `detail` for a worst case that measures.
+ */
+static void air_render_noise(struct air_tile *t, guint8 *dst, int frame)
+{
+    const gsize len = (gsize)AIR_COMP_W * t->height
+                      + (gsize)(AIR_COMP_W / 2) * (t->height / 2) * 2;
+    guint32 s = 0x9e3779b9u ^ ((guint32)frame * 2654435761u) ^ (guint32)t->chn;
+    gsize i = 0;
+
+    while (i + 4 <= len) {
+        guint32 v = air_rand(&s);
+
+        dst[i++] = (guint8)(16 + (v & 0xdf));
+        dst[i++] = (guint8)(16 + ((v >> 8) & 0xdf));
+        dst[i++] = (guint8)(16 + ((v >> 16) & 0xdf));
+        dst[i++] = (guint8)(16 + ((v >> 24) & 0xdf));
+    }
+    while (i < len) {
+        dst[i++] = (guint8)(16 + (air_rand(&s) & 0xdf));
+    }
+}
+
+/** Render ring slot @p idx. `static` writes the same field into every slot, so the ring still
+ * supplies pipelining depth while the content never changes; anything unrecognised is bars. */
+static void air_render_one(struct air_tile *t, int idx, const char *pattern)
+{
+    air_dmabuf_sync(t->pool[idx].fd, 1);
+
+    if (strcmp(pattern, "noise") == 0) {
+        air_render_noise(t, t->pool[idx].map, idx);
+    } else if (strcmp(pattern, "detail") == 0) {
+        air_render_detail(t, t->pool[idx].map, idx);
+    } else if (strcmp(pattern, "static") == 0) {
+        air_render_bars(t, t->pool[idx].map, 0, 0);
+    } else {
+        air_render_bars(t, t->pool[idx].map, idx * 7, 1);
+    }
+
+    air_dmabuf_sync(t->pool[idx].fd, 0);
+}
+
+/** Render the whole ring. */
+static void air_render_ring(struct air_tile *t, const char *pattern)
+{
+    for (int i = 0; i < t->pool_n; i++) {
+        air_render_one(t, i, pattern);
+    }
+}
+
+/* Tiers differ only in buffer content, so running them as separate processes would open a fresh
+ * pair of wave5 instances for each. Instances after the first pair in a boot watchdog or produce
+ * nothing at all (HW-confirmed, and reconfirmed the hard way: a third instance sat in PIC_RUN
+ * emitting zero frames), which would corrupt exactly the measurement being taken. So the ring is
+ * rewritten in place and one instance pair lives for the whole run.
+ *
+ * The rewrite happens slot by slot as the feeder reserves each one, not in a barrier at the tier
+ * boundary. Draining the whole free queue first looks tidier but cannot finish: the encoder keeps
+ * the most recently pushed buffer referenced until another replaces it, so one slot per tile
+ * never comes back and carries the previous tier's content for the whole of the next one.
+ * Renewing on reserve covers every slot, because a reserved slot is held exclusively.
+ */
 
 /** Return a pool index to the free queue when its GstBuffer is finalized (encoder done with it). */
 struct air_recycle {
@@ -340,64 +625,16 @@ static GstBuffer *air_wrap_tile(struct air_tile *t, int idx, GstClockTime pts)
     return buf;
 }
 
-/** Source callback: split one 1920x1080 frame into the two aligned tiles and push each into its
- * encoder. Both tiles carry the same PTS, so their encoded FrameIds match. Skips a frame whole
- * if either tile has no free pool buffer, keeping the pair aligned. */
-static GstFlowReturn air_on_src(GstAppSink *sink, gpointer user)
+/** Push one already-filled buffer per active tile into its encoder, both carrying @p pts so the
+ * encoded FrameIds match. @p idx is read only for active tiles.
+ *
+ * Holds the staggered, ordered bring-up: on the first frame, feed tile 1 (552 lines) and wait
+ * for its first encoded output, then tile 0 (560 lines). The order is what matters: the
+ * firmware hangs bringing the 552-height instance up after the 560-height instance exists,
+ * while 560-after-552 is clean.
+ */
+static void air_push_frame(const int *idx, GstClockTime pts)
 {
-    GstSample *sample = gst_app_sink_pull_sample(sink);
-    GstBuffer *sbuf;
-    GstVideoFrame frame;
-    GstClockTime pts;
-    gpointer p[AIR_NCHN];
-    int idx[AIR_NCHN];
-
-    (void)user;
-    if (sample == NULL) {
-        return GST_FLOW_OK;
-    }
-
-    sbuf = gst_sample_get_buffer(sample);
-    if (sbuf == NULL || !gst_video_frame_map(&frame, &g_src_info, sbuf, GST_MAP_READ)) {
-        gst_sample_unref(sample);
-        return GST_FLOW_OK;
-    }
-
-    pts = GST_BUFFER_PTS(sbuf);
-
-    /* Reserve a free buffer for every active tile; if any active tile has none, keep the pair
-     * aligned by returning what we took and dropping the whole frame. */
-    for (int i = 0; i < AIR_NCHN; i++) {
-        p[i] = g_tile[i].active ? g_async_queue_try_pop(g_tile[i].freeq) : NULL;
-    }
-
-    for (int i = 0; i < AIR_NCHN; i++) {
-        if (g_tile[i].active && p[i] == NULL) {
-            for (int j = 0; j < AIR_NCHN; j++) {
-                if (p[j] != NULL) {
-                    g_async_queue_push(g_tile[j].freeq, p[j]);
-                }
-            }
-            g_tile[i].dropped++;
-            gst_video_frame_unmap(&frame);
-            gst_sample_unref(sample);
-
-            return GST_FLOW_OK;
-        }
-    }
-
-    for (int i = 0; i < AIR_NCHN; i++) {
-        if (g_tile[i].active) {
-            idx[i] = GPOINTER_TO_INT(p[i]) - 1;
-            air_fill_tile(&g_tile[i], idx[i], &frame);
-        }
-    }
-    gst_video_frame_unmap(&frame);
-
-    /* Staggered, ordered bring-up: on the first frame, feed tile 1 (552 lines) and wait for
-     * its first encoded output, then tile 0 (560 lines). The order is what matters: the
-     * firmware hangs bringing the 552-height instance up after the 560-height instance
-     * exists, while 560-after-552 is clean. */
     if (g_stagger && !g_primed && g_tile[0].active && g_tile[1].active) {
         /* Tile 1 (the 552-line tile) is brought up first; ML_AIR_ORDER=01 reverses. */
         const char *order_env = getenv("ML_AIR_ORDER");
@@ -413,23 +650,219 @@ static GstFlowReturn air_on_src(GstAppSink *sink, gpointer user)
             int waited;
 
             gst_app_src_push_buffer(t->src, air_wrap_tile(t, idx[order[o]], pts));
-            for (waited = 0; waited < 300 && t->sent < 1; waited++) {
+            t->pushed++;
+            for (waited = 0; waited < 300 && t->done < 1; waited++) {
                 g_usleep(10000);
             }
             g_printerr("[ml-air-video] stagger: tile %d first output %s\n",
-                       t->chn, t->sent >= 1 ? "OK" : "TIMEOUT");
+                       t->chn, t->done >= 1 ? "OK" : "TIMEOUT");
         }
 
         g_primed = 1;
-        gst_sample_unref(sample);
-        return GST_FLOW_OK;
+        return;
     }
 
     for (int i = 0; i < AIR_NCHN; i++) {
         if (g_tile[i].active) {
             gst_app_src_push_buffer(g_tile[i].src, air_wrap_tile(&g_tile[i], idx[i], pts));
+            g_tile[i].pushed++;
         }
     }
+}
+
+/** Reserve one free pool buffer for every active tile, writing indices into @p idx. Returns 0
+ * and counts a drop if any active tile has none, returning what was taken so the pair stays
+ * aligned. */
+static int air_reserve_pair(int *idx)
+{
+    gpointer p[AIR_NCHN];
+
+    for (int i = 0; i < AIR_NCHN; i++) {
+        p[i] = g_tile[i].active ? g_async_queue_try_pop(g_tile[i].freeq) : NULL;
+    }
+
+    for (int i = 0; i < AIR_NCHN; i++) {
+        if (g_tile[i].active && p[i] == NULL) {
+            for (int j = 0; j < AIR_NCHN; j++) {
+                if (p[j] != NULL) {
+                    g_async_queue_push(g_tile[j].freeq, p[j]);
+                }
+            }
+            g_tile[i].dropped++;
+
+            return 0;
+        }
+    }
+
+    for (int i = 0; i < AIR_NCHN; i++) {
+        if (g_tile[i].active) {
+            idx[i] = GPOINTER_TO_INT(p[i]) - 1;
+        }
+    }
+
+    return 1;
+}
+
+/** Benchmark feeder: resubmit the pre-rendered ring with no source pipeline and no per-frame CPU
+ * work at all. Paced to ML_AIR_FPS by default, so a shortfall shows up as drops and the
+ * sustainable rate is what the counters report; ML_AIR_BENCH_FREE instead waits for a buffer to
+ * come back and pushes immediately, which measures the ceiling rather than a target. */
+static gpointer air_bench_feed(gpointer user)
+{
+    const gint64 period = G_USEC_PER_SEC / g_bench_fps;
+    guint64 n = 0;
+
+    (void)user;
+
+    for (int s = 0; g_bench_stages[s] != NULL && !g_bench_stop; s++) {
+        gint64 next = g_get_monotonic_time();
+        gint64 until = next + (gint64)g_bench_secs * G_USEC_PER_SEC;
+        guint32 renewed[AIR_NCHN] = { 0, 0 };
+        guint64 at_start[AIR_NCHN];
+        guint64 seen[AIR_NCHN];
+        gint64 progress = next;
+        int need[AIR_NCHN];
+
+        for (int i = 0; i < AIR_NCHN; i++) {
+            at_start[i] = g_tile[i].done;
+            seen[i] = g_tile[i].done;
+        }
+
+        /* The first tier was rendered at startup; later tiers renew each slot on reserve. */
+        for (int i = 0; i < AIR_NCHN; i++) {
+            need[i] = (s > 0 && g_tile[i].active) ? g_tile[i].pool_n : 0;
+        }
+
+        g_bench_stage = g_bench_stages[s];
+        g_printerr("[ml-air-video] bench: tier %s for %d s\n", g_bench_stage, g_bench_secs);
+
+        while (!g_bench_stop && g_get_monotonic_time() < until) {
+            int idx[AIR_NCHN];
+
+            if (g_bench_free) {
+                /* Block on each active tile so the loop tracks buffer returns rather than
+                 * spinning on try_pop; the pop is put straight back for air_reserve_pair. */
+                gboolean starved = FALSE;
+
+                for (int i = 0; i < AIR_NCHN; i++) {
+                    if (g_tile[i].active) {
+                        gpointer p = g_async_queue_timeout_pop(g_tile[i].freeq, 100000);
+
+                        if (p == NULL) {
+                            starved = TRUE;
+                            break;
+                        }
+                        g_async_queue_push_front(g_tile[i].freeq, p);
+                    }
+                }
+
+                if (starved) {
+                    continue;
+                }
+            }
+
+            if (air_reserve_pair(idx)) {
+                for (int i = 0; i < AIR_NCHN; i++) {
+                    if (need[i] > 0 && !(renewed[i] & (1u << idx[i]))) {
+                        air_render_one(&g_tile[i], idx[i], g_bench_stage);
+                        renewed[i] |= 1u << idx[i];
+                        need[i]--;
+                    }
+                }
+
+                air_push_frame(idx, gst_util_uint64_scale(n, GST_SECOND, (guint64)g_bench_fps));
+                n++;
+            }
+
+            for (int i = 0; i < AIR_NCHN; i++) {
+                if (g_tile[i].active && g_tile[i].done != seen[i]) {
+                    seen[i] = g_tile[i].done;
+                    progress = g_get_monotonic_time();
+                }
+            }
+
+            if (!g_bench_free) {
+                gint64 now;
+
+                next += period;
+                now = g_get_monotonic_time();
+                if (next > now) {
+                    g_usleep((gulong)(next - now));
+                } else {
+                    next = now;
+                }
+            }
+        }
+
+        /* Per-tier verdict. Some tiers are rate measurements and some are survival tests, and
+         * the counters alone do not say which failed: a wedged encoder and a slow one both show
+         * a low rate. Stall time since the last output separates them. */
+        {
+            double idle = (double)(g_get_monotonic_time() - progress) / G_USEC_PER_SEC;
+
+            for (int i = 0; i < AIR_NCHN; i++) {
+                if (g_tile[i].active) {
+                    g_printerr("[ml-air-video] bench: tier %s tile %d: %" G_GUINT64_FORMAT
+                               " frames%s\n",
+                               g_bench_stage, i, g_tile[i].done - at_start[i],
+                               idle > 2.0 ? ", STALLED" : "");
+                }
+            }
+
+            if (idle > 2.0) {
+                g_printerr("[ml-air-video] bench: tier %s produced no output for %.1f s: FAIL\n",
+                           g_bench_stage, idle);
+            }
+        }
+    }
+
+    /* All tiers done: end the run rather than idling, so a scripted benchmark terminates. */
+    if (g_loop != NULL) {
+        g_main_loop_quit(g_loop);
+    }
+
+    return NULL;
+}
+
+/** Source callback: split one 1920x1080 frame into the two aligned tiles and push each into its
+ * encoder. Both tiles carry the same PTS, so their encoded FrameIds match. Skips a frame whole
+ * if either tile has no free pool buffer, keeping the pair aligned. */
+static GstFlowReturn air_on_src(GstAppSink *sink, gpointer user)
+{
+    GstSample *sample = gst_app_sink_pull_sample(sink);
+    GstBuffer *sbuf;
+    GstVideoFrame frame;
+    GstClockTime pts;
+    int idx[AIR_NCHN];
+
+    (void)user;
+    if (sample == NULL) {
+        return GST_FLOW_OK;
+    }
+
+    sbuf = gst_sample_get_buffer(sample);
+    if (sbuf == NULL || !gst_video_frame_map(&frame, &g_src_info, sbuf, GST_MAP_READ)) {
+        gst_sample_unref(sample);
+        return GST_FLOW_OK;
+    }
+
+    pts = GST_BUFFER_PTS(sbuf);
+
+    if (!air_reserve_pair(idx)) {
+        gst_video_frame_unmap(&frame);
+        gst_sample_unref(sample);
+
+        return GST_FLOW_OK;
+    }
+
+    for (int i = 0; i < AIR_NCHN; i++) {
+        if (g_tile[i].active) {
+            air_fill_tile(&g_tile[i], idx[i], &frame);
+        }
+    }
+    gst_video_frame_unmap(&frame);
+
+    air_push_frame(idx, pts);
 
     gst_sample_unref(sample);
     return GST_FLOW_OK;
@@ -485,6 +918,9 @@ static GstFlowReturn air_on_enc(GstAppSink *sink, gpointer user)
         t->sent++;
     }
 
+    t->done++;
+    t->bytes += map.size;
+
     gst_buffer_unmap(buf, &map);
     gst_sample_unref(sample);
     return GST_FLOW_OK;
@@ -500,10 +936,53 @@ static gboolean air_on_signal(gpointer user)
     return G_SOURCE_REMOVE;
 }
 
+/** Once a second: cumulative counts when verbose, and per-second rates when benchmarking, which
+ * is the benchmark's entire output. Rates come from deltas rather than an average since start,
+ * so a ramp or a stall is visible instead of being smoothed away. */
 static gboolean air_on_tick(gpointer user)
 {
+    static guint64 last_pushed[AIR_NCHN];
+    static guint64 last_done[AIR_NCHN];
+    static guint64 last_sent[AIR_NCHN];
+    static guint64 last_bytes[AIR_NCHN];
+    static guint64 last_dropped[AIR_NCHN];
+    const char *bench = g_bench_stage;
+
     (void)user;
-    if (g_verbose) {
+
+    if (bench != NULL) {
+        for (int i = 0; i < AIR_NCHN; i++) {
+            guint64 dp = g_tile[i].pushed - last_pushed[i];
+            guint64 dd = g_tile[i].done - last_done[i];
+            guint64 ds = g_tile[i].sent - last_sent[i];
+            guint64 db = g_tile[i].bytes - last_bytes[i];
+            guint64 dx = g_tile[i].dropped - last_dropped[i];
+
+            if (!g_tile[i].active) {
+                continue;
+            }
+
+            /* tx is reported only when transmitting: with no peer it reads zero while the
+             * encoder is healthy, and printing it beside done invites reading it as a fault. */
+            if (g_notx) {
+                g_printerr("[ml-air-video] bench %s tile %d: pushed %" G_GUINT64_FORMAT "/s"
+                           " done %" G_GUINT64_FORMAT "/s %.2f Mbit/s"
+                           " dropped %" G_GUINT64_FORMAT "/s\n",
+                           bench, i, dp, dd, (double)db * 8.0 / 1e6, dx);
+            } else {
+                g_printerr("[ml-air-video] bench %s tile %d: pushed %" G_GUINT64_FORMAT "/s"
+                           " done %" G_GUINT64_FORMAT "/s tx %" G_GUINT64_FORMAT "/s"
+                           " %.2f Mbit/s dropped %" G_GUINT64_FORMAT "/s\n",
+                           bench, i, dp, dd, ds, (double)db * 8.0 / 1e6, dx);
+            }
+
+            last_pushed[i] = g_tile[i].pushed;
+            last_done[i] = g_tile[i].done;
+            last_sent[i] = g_tile[i].sent;
+            last_bytes[i] = g_tile[i].bytes;
+            last_dropped[i] = g_tile[i].dropped;
+        }
+    } else if (g_verbose) {
         g_printerr("[ml-air-video] tx chn0=%" G_GUINT64_FORMAT " chn1=%" G_GUINT64_FORMAT
                    " dropped=%" G_GUINT64_FORMAT "\n",
                    g_tile[0].sent, g_tile[1].sent, g_tile[0].dropped);
@@ -599,6 +1078,10 @@ int main(int argc, char **argv)
     int fps = atoi(env_or("ML_AIR_FPS", "15"));
     const char *pattern = env_or("ML_AIR_PATTERN", "ball");
     const char *camera = getenv("ML_AIR_CAMERA");
+    const char *bench = getenv("ML_AIR_BENCH");
+    const char *ring_env = getenv("ML_AIR_RING");
+    const char *pool_env = getenv("ML_AIR_POOL");
+    int pool_want;
     const char *enc = env_or("ML_AIR_ENC",
                              "v4l2h265enc output-io-mode=dmabuf-import "
                              "extra-controls=\"controls,video_gop_size=65535\"");
@@ -611,10 +1094,33 @@ int main(int argc, char **argv)
     GstAppSinkCallbacks cbs;
     GstElement *el;
     struct sockaddr_in dstaddr;
+    GThread *feeder = NULL;
     int sock;
 
     g_verbose = (getenv("ML_AIR_VERBOSE") != NULL);
     g_notx = (getenv("ML_AIR_NOTX") != NULL);
+    g_bench_free = (getenv("ML_AIR_BENCH_FREE") != NULL);
+    g_bench_fps = fps > 0 ? fps : 60;
+
+    if (bench != NULL && *bench == '\0') {
+        bench = NULL;
+    }
+
+    if (bench != NULL) {
+        g_bench_secs = atoi(env_or("ML_AIR_BENCH_SECS", "10"));
+        if (g_bench_secs < 1) {
+            g_bench_secs = 1;
+        }
+        g_bench_stages = g_strsplit(bench, ",", 0);
+    }
+
+    /* The live path wants a pipelining depth; the benchmark wants its whole ring resident, and
+     * is the only caller that asks for more than a handful. */
+    if (bench != NULL) {
+        pool_want = (ring_env != NULL && *ring_env != '\0') ? atoi(ring_env) : AIR_RING_DEF;
+    } else {
+        pool_want = (pool_env != NULL && *pool_env != '\0') ? atoi(pool_env) : AIR_POOL_DEF;
+    }
     /* Staggered encoder bring-up is the default: concurrent instance creation while the other
      * encoder has frames in flight races the wave5 firmware (corrupt output or a VCPU watchdog,
      * HW-confirmed). ML_AIR_NO_STAGGER restores the concurrent bring-up for diagnostics. */
@@ -695,7 +1201,7 @@ int main(int argc, char **argv)
         t->sent = 0;
         t->dropped = 0;
 
-        if (air_pool_init(t) < AIR_POOL_MIN) {
+        if (air_pool_init(t, pool_want) < AIR_POOL_MIN) {
             g_printerr("[ml-air-video] tile %d: dma-heap pool alloc failed (need %d, got %d)\n",
                        i, AIR_POOL_MIN, t->pool_n);
             return 1;
@@ -709,6 +1215,14 @@ int main(int argc, char **argv)
             if (t->dumpfd >= 0) {
                 g_printerr("[ml-air-video] dumping tile %d -> %s\n", i, path);
             }
+        }
+
+        /* Render the ring once. Everything after this point in benchmark mode is pointer
+         * shuffling: no source element, no copy, no CPU pass over a pixel. */
+        if (bench != NULL) {
+            air_render_ring(t, g_bench_stages[0]);
+            g_printerr("[ml-air-video] bench: tile %d ring of %d rendered as %s\n",
+                       i, t->pool_n, g_bench_stages[0]);
         }
     }
 
@@ -744,45 +1258,53 @@ int main(int argc, char **argv)
      * loaded with depth 3 or more, because depth 1 re-arms one buffer per
      * frame and the encoder then reads it mid-overwrite.
      */
-    if (camera != NULL) {
-        snprintf(desc, sizeof desc,
-                 "v4l2src device=%s io-mode=mmap ! "
-                 "video/x-raw,format=I420,width=%d,height=%d ! "
-                 "videorate drop-only=true ! "
-                 "video/x-raw,framerate=%d/1 ! "
-                 "appsink name=src sync=false max-buffers=4 drop=true",
-                 camera, AIR_COMP_W, AIR_COMP_H, fps);
-    } else {
-        snprintf(desc, sizeof desc,
-                 "videotestsrc is-live=true pattern=%s ! "
-                 "video/x-raw,format=I420,width=%d,height=%d,framerate=%d/1 ! "
-                 "appsink name=src sync=false max-buffers=4 drop=true",
-                 pattern, AIR_COMP_W, AIR_COMP_H, fps);
+    src_pipe = NULL;
+    if (bench == NULL) {
+        if (camera != NULL) {
+            snprintf(desc, sizeof desc,
+                     "v4l2src device=%s io-mode=mmap ! "
+                     "video/x-raw,format=I420,width=%d,height=%d ! "
+                     "videorate drop-only=true ! "
+                     "video/x-raw,framerate=%d/1 ! "
+                     "appsink name=src sync=false max-buffers=4 drop=true",
+                     camera, AIR_COMP_W, AIR_COMP_H, fps);
+        } else {
+            snprintf(desc, sizeof desc,
+                     "videotestsrc is-live=true pattern=%s ! "
+                     "video/x-raw,format=I420,width=%d,height=%d,framerate=%d/1 ! "
+                     "appsink name=src sync=false max-buffers=4 drop=true",
+                     pattern, AIR_COMP_W, AIR_COMP_H, fps);
+        }
+
+        src_pipe = gst_parse_launch(desc, &err);
+        if (src_pipe == NULL) {
+            g_printerr("[ml-air-video] source build failed: %s\n", err ? err->message : "?");
+            close(sock);
+            return 1;
+        }
+
+        el = gst_bin_get_by_name(GST_BIN(src_pipe), "src");
+        memset(&cbs, 0, sizeof cbs);
+        cbs.new_sample = air_on_src;
+        gst_app_sink_set_callbacks(GST_APP_SINK(el), &cbs, NULL, NULL);
+        gst_object_unref(el);
+
+        bus = gst_element_get_bus(src_pipe);
+        gst_bus_add_watch(bus, air_on_bus, NULL);
+        gst_object_unref(bus);
     }
-
-    src_pipe = gst_parse_launch(desc, &err);
-    if (src_pipe == NULL) {
-        g_printerr("[ml-air-video] source build failed: %s\n", err ? err->message : "?");
-        close(sock);
-        return 1;
-    }
-
-    el = gst_bin_get_by_name(GST_BIN(src_pipe), "src");
-    memset(&cbs, 0, sizeof cbs);
-    cbs.new_sample = air_on_src;
-    gst_app_sink_set_callbacks(GST_APP_SINK(el), &cbs, NULL, NULL);
-    gst_object_unref(el);
-
-    bus = gst_element_get_bus(src_pipe);
-    gst_bus_add_watch(bus, air_on_bus, NULL);
-    gst_object_unref(bus);
 
     g_loop = g_main_loop_new(NULL, FALSE);
     g_unix_signal_add(SIGINT, air_on_signal, NULL);
     g_unix_signal_add(SIGTERM, air_on_signal, NULL);
     g_timeout_add_seconds(1, air_on_tick, NULL);
 
-    if (g_notx) {
+    if (bench != NULL) {
+        g_printerr("[ml-air-video] bench %s: %dx%d two H.265 tiles, %s, %s, %d s per tier\n",
+                   bench, AIR_COMP_W, AIR_COMP_H,
+                   g_bench_free ? "unpaced" : "paced to ML_AIR_FPS",
+                   g_notx ? "encode-only (no transmit)" : "transmitting", g_bench_secs);
+    } else if (g_notx) {
         g_printerr("[ml-air-video] %dx%d @ %d fps, two H.265 tiles, encode-only (no transmit)\n",
                    AIR_COMP_W, AIR_COMP_H, fps);
     } else {
@@ -795,11 +1317,23 @@ int main(int argc, char **argv)
             gst_element_set_state(enc_pipe[i], GST_STATE_PLAYING);
         }
     }
-    gst_element_set_state(src_pipe, GST_STATE_PLAYING);
+
+    if (bench != NULL) {
+        feeder = g_thread_new("air-bench", air_bench_feed, NULL);
+    } else {
+        gst_element_set_state(src_pipe, GST_STATE_PLAYING);
+    }
 
     g_main_loop_run(g_loop);
 
-    gst_element_set_state(src_pipe, GST_STATE_NULL);
+    if (feeder != NULL) {
+        g_bench_stop = 1;
+        g_thread_join(feeder);
+    }
+
+    if (src_pipe != NULL) {
+        gst_element_set_state(src_pipe, GST_STATE_NULL);
+    }
     for (int i = 0; i < AIR_NCHN; i++) {
         if (enc_pipe[i] != NULL) {
             gst_app_src_end_of_stream(g_tile[i].src);
@@ -810,7 +1344,9 @@ int main(int argc, char **argv)
     g_printerr("[ml-air-video] stopped (chn0=%" G_GUINT64_FORMAT " chn1=%" G_GUINT64_FORMAT ")\n",
                g_tile[0].sent, g_tile[1].sent);
 
-    gst_object_unref(src_pipe);
+    if (src_pipe != NULL) {
+        gst_object_unref(src_pipe);
+    }
     for (int i = 0; i < AIR_NCHN; i++) {
         if (enc_pipe[i] != NULL) {
             gst_object_unref(enc_pipe[i]);
