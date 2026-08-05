@@ -135,6 +135,13 @@
  * be in the encoder at once and is sized above ML_AIR_INFLIGHT. */
 #define AIR_ENC_CAP_BUFS 6
 #define AIR_ENC_OUT_BUFS 8
+/* An encoder holding source buffers this long has stopped making progress. Generous next to a
+ * 16 ms frame period, because the cost of acting is the frames in flight and the cost of a false
+ * positive at a lower threshold is a needless glitch. */
+#define AIR_ENC_STALL_US (500 * 1000)
+/* Recovery rebuilds the encoder instance, so a tile that needs it repeatedly is not recovering.
+ * Retire it and keep the rest of the pipeline running rather than rebuild forever. */
+#define AIR_ENC_MAX_RESTARTS 5
 
 /** dma-heap tile buffers per channel (filled/in-encoder/spare). Allocated at startup; the pool
  * shrinks to whatever the heap yields, down to a floor of AIR_POOL_MIN. AIR_POOL_MAX bounds the
@@ -192,6 +199,10 @@ struct air_tile {
     int enc_out_n;
     struct air_cap_buf *enc_out_cb[AIR_ENC_OUT_BUFS];  /* index -> buffer held, NULL if free */
     guint32 enc_seq;               /* frame_id for emitted access units */
+    gint64 enc_progress_us;        /* monotonic time of the last buffer this encoder returned */
+    guint32 enc_restarts;          /* instance rebuilds performed */
+    char enc_node[32];             /* node to re-open on recovery */
+    int enc_fps;                   /* rate to re-apply on recovery */
 
     GstAppSrc *src;                /* encoder input (fed dma-heap I420 buffers) */
     guint8 *tex;                   /* detail tier's shared source texture, built once */
@@ -250,6 +261,9 @@ static int g_enc_direct;
 struct air_cap_buf;
 static int air_enc_queue(struct air_tile *t, struct air_cap_buf *cb);
 static void air_enc_drain(struct air_tile *t);
+static void air_enc_restart(struct air_tile *t);
+static void air_enc_close(struct air_tile *t);
+static int air_enc_held(const struct air_tile *t);
 static void air_emit_au(struct air_tile *t, const guint8 *data, size_t size,
                         guint32 frame_id, guint32 is_idr);
 
@@ -1332,10 +1346,35 @@ static int air_cap_open(const char *dev, int want)
 static gpointer air_cap_feed(gpointer user)
 {
     const gint64 period = g_cap_fps > 0 ? G_USEC_PER_SEC / g_cap_fps : 0;
+    struct pollfd pfd[1 + AIR_NCHN];
+    int enc_slot[AIR_NCHN];
     gint64 base_us = 0;
     gint64 due_us = 0;
+    gint64 cap_err_us = 0;
+    /* Silence is only the encoder's fault while frames are still arriving for it. A quiet camera
+     * would otherwise read as a stalled encoder and buy a rebuild that fixes nothing. */
+    gint64 last_cap_us = 0;
+    int nfd;
 
     (void)user;
+
+    /* Slot 0 is the camera; the direct path's encoders take the slots after it. The set is fixed
+     * for the life of the thread because a tile cannot become active after start-up. */
+    memset(pfd, 0, sizeof pfd);
+    pfd[0].fd = g_cap_fd;
+    pfd[0].events = POLLIN;
+    nfd = 1;
+
+    for (int i = 0; i < AIR_NCHN; i++) {
+        enc_slot[i] = -1;
+
+        if (g_enc_direct && g_tile[i].active && g_tile[i].enc_fd >= 0) {
+            enc_slot[i] = nfd;
+            pfd[nfd].fd = g_tile[i].enc_fd;
+            pfd[nfd].events = POLLIN | POLLOUT;
+            nfd++;
+        }
+    }
 
     while (!g_cap_stop) {
         struct v4l2_plane planes[AIR_CAP_PLANES];
@@ -1344,14 +1383,63 @@ static gpointer air_cap_feed(gpointer user)
         GstBuffer *buf[AIR_NCHN] = { NULL, NULL };
         gpointer pool[AIR_NCHN] = { NULL, NULL };
         gint64 ts_us;
+        gint64 now_us;
         int nshare = 0;
         int starved = 0;
 
-        struct pollfd pfd = { .fd = g_cap_fd, .events = POLLIN, .revents = 0 };
+        for (int i = 0; i < nfd; i++) {
+            pfd[i].revents = 0;
+        }
 
         /* Polled rather than blocking in DQBUF, so the exit path does not depend on a frame
          * arriving to be noticed. */
-        if (poll(&pfd, 1, 200) <= 0) {
+        if (poll(pfd, nfd, 200) <= 0) {
+            continue;
+        }
+
+        /* The encoders are in the same poll set as the camera, so a coded frame is collected on
+         * its own readiness rather than waiting for the next capture frame, and output keeps
+         * flowing if capture stalls. v4l2-mem2mem raises POLLOUT for a finished source buffer and
+         * POLLIN for a finished coded one, and only ever from a done list, so this cannot spin.
+         * Draining is also what lowers g_cap_inflight, which is why it must stay ahead of the
+         * in-flight gate below: behind it, reaching the ceiling would deadlock the loop. */
+        now_us = g_get_monotonic_time();
+
+        for (int i = 0; i < AIR_NCHN; i++) {
+            struct air_tile *t = &g_tile[i];
+
+            if (enc_slot[i] < 0) {
+                continue;
+            }
+
+            if (pfd[enc_slot[i]].revents & (POLLIN | POLLOUT)) {
+                air_enc_drain(t);
+            }
+
+            /* Nothing here ends the stream. A stalled encoder costs the frames it is holding
+             * and nothing else: an error on the fd, or silence for AIR_ENC_STALL_US while
+             * source buffers are outstanding, cycles its OUTPUT queue and carries on. The
+             * alternative is worse than a glitch, because the frames it holds are capture
+             * frames and g_cap_inflight cannot fall until they are back. */
+            if (pfd[enc_slot[i]].revents & (POLLERR | POLLNVAL)) {
+                g_printerr("[ml-air-video] tile %d: encoder poll 0x%x, recovering\n",
+                           t->chn, pfd[enc_slot[i]].revents);
+                air_enc_restart(t);
+            } else if (air_enc_held(t) > 0 && now_us - t->enc_progress_us > AIR_ENC_STALL_US &&
+                       now_us - last_cap_us < AIR_ENC_STALL_US) {
+                g_printerr("[ml-air-video] tile %d: encoder silent for %" G_GINT64_FORMAT " ms "
+                           "holding %d frames, recovering\n",
+                           t->chn, (now_us - t->enc_progress_us) / 1000, air_enc_held(t));
+                air_enc_restart(t);
+            } else {
+                continue;
+            }
+
+            /* Recovery replaced the fd, or retired the tile. Either way the poll set is stale. */
+            pfd[enc_slot[i]].fd = t->active ? t->enc_fd : -1;
+        }
+
+        if ((pfd[0].revents & POLLIN) == 0) {
             continue;
         }
 
@@ -1362,29 +1450,21 @@ static gpointer air_cap_feed(gpointer user)
         b.length = AIR_CAP_PLANES;
         b.m.planes = planes;
 
+        /* A failed dequeue costs this frame, not the stream. The loop goes back to poll and
+         * picks up whenever the camera produces again; only g_cap_stop ends it. Reported at most
+         * once a second so a persistent fault cannot flood a 32 MiB /tmp. */
         if (ioctl(g_cap_fd, VIDIOC_DQBUF, &b) != 0) {
-            if (errno == EINTR) {
-                continue;
+            if (errno != EINTR && now_us - cap_err_us > G_USEC_PER_SEC) {
+                cap_err_us = now_us;
+                g_printerr("[ml-air-video] capture DQBUF: %s\n", strerror(errno));
             }
 
-            g_printerr("[ml-air-video] capture DQBUF: %s\n", strerror(errno));
-            break;
+            continue;
         }
 
         cb = &g_cap[b.index];
         g_cap_frames++;
-
-        /* Ahead of the gates below, both of which skip the rest of the iteration. Draining is
-         * what returns a capture buffer and lowers g_cap_inflight, so reaching the in-flight
-         * ceiling with the drain behind that gate would be a deadlock: no drain, no release, no
-         * headroom, every subsequent frame skipped. */
-        if (g_enc_direct) {
-            for (int i = 0; i < AIR_NCHN; i++) {
-                if (g_tile[i].active) {
-                    air_enc_drain(&g_tile[i]);
-                }
-            }
-        }
+        last_cap_us = now_us;
 
         ts_us = (gint64)b.timestamp.tv_sec * G_USEC_PER_SEC + b.timestamp.tv_usec;
         if (base_us == 0) {
@@ -1415,8 +1495,7 @@ static gpointer air_cap_feed(gpointer user)
         }
 
         /* Direct V4L2: the capture buffer is queued into each encoder as it stands, at the
-         * tile's row offset, with no GstBuffer in between. Encoder output is collected by the
-         * drain at the top of the next iteration, so a coded frame waits one capture period. */
+         * tile's row offset, with no GstBuffer in between. */
         if (g_enc_direct) {
             int nq = 0;
 
@@ -1538,6 +1617,56 @@ static void air_enc_ctrl(struct air_tile *t, guint32 id, gint32 val, const char 
     if (ioctl(t->enc_fd, VIDIOC_S_EXT_CTRLS, &cs) != 0) {
         g_printerr("[ml-air-video] tile %d: %s: %s\n", t->chn, name, strerror(errno));
     }
+}
+
+/** Find the node that encodes to HEVC, by capability rather than by index.
+ *
+ * The camera node is skipped by path: it is already open, and a node that offers HEVC on its
+ * capture queue is what makes an encoder, so probing is the only thing that stays true if the
+ * enumeration order moves. ML_AIR_ENC_NODE overrides the search. */
+static int air_enc_find_node(const char *camera, char *out, size_t len)
+{
+    const char *forced = getenv("ML_AIR_ENC_NODE");
+
+    if (forced != NULL) {
+        g_strlcpy(out, forced, len);
+        return 0;
+    }
+
+    for (int n = 0; n < 16; n++) {
+        struct v4l2_fmtdesc d;
+        char path[32];
+        int fd;
+        int hit = 0;
+
+        g_snprintf(path, sizeof path, "/dev/video%d", n);
+        if (camera != NULL && strcmp(path, camera) == 0) {
+            continue;
+        }
+
+        fd = open(path, O_RDWR | O_CLOEXEC);
+        if (fd < 0) {
+            continue;
+        }
+
+        memset(&d, 0, sizeof d);
+        d.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        for (d.index = 0; hit == 0 && ioctl(fd, VIDIOC_ENUM_FMT, &d) == 0; d.index++) {
+            if (d.pixelformat == V4L2_PIX_FMT_HEVC) {
+                hit = 1;
+            }
+        }
+
+        close(fd);
+
+        if (hit) {
+            g_strlcpy(out, path, len);
+            return 0;
+        }
+    }
+
+    g_printerr("[ml-air-video] no node offers HEVC on its capture queue\n");
+    return -1;
 }
 
 /** Open and configure one encoder instance for this tile.
@@ -1695,6 +1824,14 @@ static int air_enc_open(struct air_tile *t, const char *dev, int fps)
         return -1;
     }
 
+    /* Both are what recovery needs to rebuild this instance, and the stamp is what keeps the
+     * stall watchdog from reading an unstarted encoder as one that has been silent since boot. */
+    if (dev != t->enc_node) {
+        g_strlcpy(t->enc_node, dev, sizeof t->enc_node);
+    }
+    t->enc_fps = fps;
+    t->enc_progress_us = g_get_monotonic_time();
+
     return 0;
 }
 
@@ -1759,6 +1896,8 @@ static void air_enc_drain(struct air_tile *t)
         if (ioctl(t->enc_fd, VIDIOC_DQBUF, &b) != 0) {
             break;
         }
+        t->enc_progress_us = g_get_monotonic_time();
+
         if (b.index < (unsigned int)t->enc_out_n && t->enc_out_cb[b.index] != NULL) {
             air_cap_release(t->enc_out_cb[b.index]);
             t->enc_out_cb[b.index] = NULL;
@@ -1776,6 +1915,8 @@ static void air_enc_drain(struct air_tile *t)
             break;
         }
 
+        t->enc_progress_us = g_get_monotonic_time();
+
         if (b.index < (unsigned int)t->enc_cap_n && t->enc_cap_map[b.index] != NULL &&
             pl[0].bytesused > 0) {
             air_emit_au(t, t->enc_cap_map[b.index] + pl[0].data_offset,
@@ -1789,6 +1930,61 @@ static void air_enc_drain(struct air_tile *t)
             break;
         }
     }
+}
+
+/** Capture frames this encoder has taken and not yet given back. */
+static int air_enc_held(const struct air_tile *t)
+{
+    int held = 0;
+    int i;
+
+    for (i = 0; i < t->enc_out_n; i++) {
+        if (t->enc_out_cb[i] != NULL) {
+            held++;
+        }
+    }
+
+    return held;
+}
+
+/** Recover a stalled encoder by rebuilding the instance, and keep the stream alive either way.
+ *
+ * Cycling only the OUTPUT queue would be cheaper and was tried first; it does not work. wave5's
+ * stop_streaming calls switch_state(inst, VPU_INST_STATE_STOP) whenever both queues are
+ * streaming, and start_streaming's re-initialisation is guarded by inst->state ==
+ * VPU_INST_STATE_OPEN, so a re-STREAMON on a STOP instance skips initialize_sequence and
+ * prepare_fb and never reaches PIC_RUN again. The driver has no in-place restart: state leaves
+ * NONE once and only a fresh open returns there.
+ *
+ * So this closes and re-opens. That does build a new encoder instance, which is the operation
+ * this part has historically watchdogged on, but the alternative is an encoder that is already
+ * dead. Attempts are capped: past AIR_ENC_MAX_RESTARTS the tile is retired rather than thrashed,
+ * and the other tile and the capture loop carry on without it.
+ *
+ * Either way the held capture frames are released. They are the reason this cannot be ignored:
+ * until they come back g_cap_inflight never falls, and a stall on one tile would starve the
+ * whole pipeline instead of just that tile. Frames in flight are lost; the stream continues. */
+static void air_enc_restart(struct air_tile *t)
+{
+    if (t->enc_restarts >= AIR_ENC_MAX_RESTARTS) {
+        g_printerr("[ml-air-video] tile %d: %u recoveries, retiring the tile\n",
+                   t->chn, t->enc_restarts);
+        air_enc_close(t);
+        t->active = 0;
+        return;
+    }
+
+    t->enc_restarts++;
+    air_enc_close(t);
+
+    if (air_enc_open(t, t->enc_node, t->enc_fps) != 0) {
+        g_printerr("[ml-air-video] tile %d: recovery re-open failed, retiring the tile\n", t->chn);
+        air_enc_close(t);
+        t->active = 0;
+        return;
+    }
+
+    t->enc_progress_us = g_get_monotonic_time();
 }
 
 /** STREAMOFF both queues and close. STREAMOFF returns every queued buffer, so the capture
@@ -2394,11 +2590,21 @@ int main(int argc, char **argv)
         /* After air_cap_open: the encoders are configured from the capture node's strides,
          * which is the entire point of this path, so they cannot be opened before it. */
         if (g_enc_direct) {
+            char enc_node[32];
+
+            if (air_enc_find_node(camera, enc_node, sizeof enc_node) != 0) {
+                air_cap_close();
+                close(sock);
+                return 1;
+            }
+
+            g_print("[ml-air-video] encoder %s\n", enc_node);
+
             for (int i = 0; i < AIR_NCHN; i++) {
                 if (!g_tile[i].active) {
                     continue;
                 }
-                if (air_enc_open(&g_tile[i], env_or("ML_AIR_ENC_NODE", "/dev/video2"), fps) != 0) {
+                if (air_enc_open(&g_tile[i], enc_node, fps) != 0) {
                     for (int j = 0; j < AIR_NCHN; j++) {
                         air_enc_close(&g_tile[j]);
                     }
@@ -2441,10 +2647,12 @@ int main(int argc, char **argv)
     g_printerr("[ml-air-video] stopped (chn0=%" G_GUINT64_FORMAT " chn1=%" G_GUINT64_FORMAT
                ", oversize %" G_GUINT64_FORMAT "/%" G_GUINT64_FORMAT
                ", lost %" G_GUINT64_FORMAT "/%" G_GUINT64_FORMAT
-               ", src lost %" G_GUINT64_FORMAT ")\n",
+               ", src lost %" G_GUINT64_FORMAT
+               ", enc recoveries %u/%u)\n",
                g_tile[0].sent, g_tile[1].sent,
                g_tile[0].tx_oversize, g_tile[1].tx_oversize,
-               g_tile[0].lost, g_tile[1].lost, g_src_lost);
+               g_tile[0].lost, g_tile[1].lost, g_src_lost,
+               g_tile[0].enc_restarts, g_tile[1].enc_restarts);
 
     if (src_pipe != NULL) {
         gst_object_unref(src_pipe);
