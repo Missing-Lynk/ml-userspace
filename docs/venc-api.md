@@ -170,7 +170,39 @@ Proven: the per-codec valid ranges (CreateChn) and the CBR=1/10, VBR=2/11, CVBR=
 
 ### rcParam (SetRcParam, 0x438 = 1080 bytes)
 
-Separate from stRcAttr; carries per-mode QP clamps. Field names from the vendor print strings (offsets `TODO(unverified)`): s32CuOrMbLevelRcEnable, s32HvsQPEnable, s32HvsQpScale, s32HvsMaxDeltaQp, s32FirstFrameStartQp, and per-mode stParamH264Cbr/H264Vbr/H265Cbr/H265Vbr {u32MinIQp, u32MaxIQp, u32MinPQp, u32MaxPQp, u32MinBQp, u32MaxBQp, u32MinIprop, u32MaxIprop, bQpMapEn}, stParamH264Fixqp/H265Fixqp {u32IQp, u32PQp, u32BQp}.
+Separate from stRcAttr; carries per-mode QP clamps. Field names from the vendor print strings; offsets from the `dumpRcParam` print sequence in `libmpi_venc.so`, each `AR_MPI_VENC_SetRcParam+off` logging `x21+<offset>` against a known string.
+
+Top level:
+
+| offset | field | H.265 CBR value |
+|---:|---|---:|
+| 0x00 | s32CuOrMbLevelRcEnable | 1 |
+| 0x04 | s32HvsQPEnable | 1 |
+| 0x08 | s32HvsQpScale | 4 |
+| 0x0c | s32HvsMaxDeltaQp | 4 |
+| 0x10 | s32FirstFrameStartQp | -1 |
+
+The mode union follows at 0x14. For stParamH265Cbr:
+
+| offset | field | value |
+|---:|---|---:|
+| 0x14 | u32MinIprop | 50 |
+| 0x18 | u32MaxIprop | 100 |
+| 0x20 | u32MaxBQp | 51 |
+| 0x24 | u32MinBQp | 0 |
+| 0x28 | u32MaxPQp | 51 |
+| 0x2c | u32MinPQp | 0 |
+| 0x30 | u32MaxIQp | 51 |
+| 0x34 | u32MinIQp | 0 |
+| 0x38 | bQpMapEn | 0 |
+
+The remaining per-mode unions are stParamH264Cbr/H264Vbr/H265Vbr with the same member set, and stParamH264Fixqp/H265Fixqp {u32IQp, u32PQp, u32BQp}. Offset 0x1c is not written by any observed path.
+
+Which values come from where: ar_lowdelay's H.265 CBR path calls GetRcParam, overwrites only 0x14, 0x18, 0x20, 0x24, 0x28, 0x2c, 0x30 and 0x34, then calls SetRcParam. The five top-level fields and bQpMapEn are therefore the defaults GetRcParam returns, recovered from `libmpp_service.so` (`ar_video_h26x_enc_exe_gen_default_param` initialising the service object from the template at rodata 0x304fd0 / 0x304fc0).
+
+How these vendor values compare against the open V4L2 driver's defaults, and which gaps were closed in the driver: `air-video-benchmark.md`, "The rate-control parameters, settled".
+
+u32MinIprop and u32MaxIprop are stored and returned but never consumed on this path. SetRcParam packs them to sparam+0x3b4 / +0x3b0, `ar_video_h26x_enc_exe_set_rc_param` copies them to the per-channel object at +256 / +260, and `ar_video_h26x_enc_exe_get_param_ext` reads them back for a later Get. The host-side VBR helper takes its inputs from the open-parameter block and from a different pair of slots (+656 / +660, written by set_dynamic_param), not from these.
 
 ## SendFrame input pixel formats (VIDEO_FRAME enPixelFormat)
 

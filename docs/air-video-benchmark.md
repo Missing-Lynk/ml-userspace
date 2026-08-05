@@ -65,17 +65,33 @@ Two things this rules out, both checked in the decompile:
 - **Not intra refresh.** `AR_MPI_VENC_SetIntraRefresh` is exported and implemented, but the H.265 RTSP path never calls it. Mainline's `HEVC_REFRESH_TYPE` only offers IDR anyway, so it is not a parity control here.
 - **Not slice splitting.** `AR_MPI_VENC_SetH265SliceSplit` exists but venc8 does not use it, and it takes CTU rows rather than a byte cap.
 
-Parity gaps this exposed:
-
-| setting | driver default | vendor | control |
-|---|---|---|---|
-| CU-level rate control | **off** | on (inferred) | `h264_mb_level_rate_control` |
-| bitrate per tile | n/a | 5000 kbit/s | `video_bitrate` |
-| GOP | 0 | 0 | `video_gop_size`, range **0 to 2047** |
-
-`V4L2_CID_MPEG_VIDEO_MB_RC_ENABLE` sets `mb_level_rc_enable`, `cu_level_rc_enable` **and** `hvs_qp_enable` together, giving per-CTU QP adaptation inside a frame. That is the mechanism that holds a frame to its budget when part of it is hard, and it is the leading candidate for the vendor's flat peak-to-mean. Every measurement in this document above was taken with it off.
-
 Note that `video_gop_size` has a range of 0 to 2047, so the `65535` used in earlier runs could never have been accepted. The driver default of 0 applied instead, which happens to match the vendor.
+
+### The rate-control parameters, settled
+
+Every field the vendor's `GetRcParam` / mutate / `SetRcParam` sequence touches is now typed with an offset and a value, and so is every default the `Get` returns. The struct layout, the vendor values, and where each one was recovered from are in `venc-api.md` (`rcParam`); this section is the parity comparison against the open driver and what follows from it.
+
+| field | vendor | driver default | control |
+|---|---:|---|---|
+| `s32CuOrMbLevelRcEnable` | 1 | 0 | `h264_mb_level_rate_control` (aggregate) |
+| `s32HvsQPEnable` | 1 | 0 | same aggregate |
+| `s32HvsQpScale` | **4** | 2, hardcoded | none yet: open gap |
+| `s32HvsMaxDeltaQp` | **4** | 10, hardcoded | none yet: open gap |
+| `s32FirstFrameStartQp` | -1 | -1 when RC is on | none needed |
+| `u32Min/MaxIprop` | 50 / 100 | n/a | none, and none needed: see below |
+| `u32Max{B,P,I}Qp` | 51 | 51 | `hevc_maximum_qp_value` |
+| `u32Min{B,P,I}Qp` | 0 | **8** | `hevc_minimum_qp_value` |
+| `bQpMapEn` | 0 | 0 | none needed |
+
+Three consequences.
+
+**CU-level rate control is confirmed parity**, not an improvement. It was enabled on inference and cut peak access-unit size 6.2x on `detail`; the vendor default turns out to be 1. The aggregate control is coarser than the vendor's three separate fields, but every field it sets matches.
+
+**HVS QP scale and max delta are a real parity gap, still open.** The driver hardcodes 2 and 10 in `wave5_set_enc_openparam`; the vendor uses 4 and 4. Because there is one correct value per field on this hardware, the fix belongs in the driver rather than in a new control. Not yet written, so no measurement above reflects it.
+
+**Iprop is retired as the explanation for the vendor's flat peak-to-mean.** The service stores and returns the pair but nothing on this path consumes it (call chain in `venc-api.md`); the host-side VBR helper reads a different pair of slots. It is public API state the service preserves, not a rate-allocation input. Whatever flattens the vendor's peak, it is not this.
+
+**`MINQP` is now 0**, the vendor value, where the recorded runs above used 25. The driver's default of 8 is what let rate control pin flat content at the QP floor and overshoot the target 1.6x on `bars`; raising it shapes the stream better than the vendor does, which makes it an improvement rather than parity. The case for a floor above 0 lives in `plans/beyond-vendor-backlog.md`. Every table above was taken at `MINQP=25` and is not comparable to a run at the new default.
 
 ### VBV does not bound the peak on hard content
 
