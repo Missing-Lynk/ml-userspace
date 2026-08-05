@@ -1,18 +1,27 @@
 /**
  * @file ml-air-video.c
- * @brief Air-unit synthetic video transmitter for the RF downlink on UDP :10001.
+ * @brief Air-unit video transmitter for the RF downlink on UDP :10001.
  *
- * Drives a 1920x1080 videotestsrc into the vendor's two-tile split (top 1920x560, bottom
- * 1920x552, 32-row overlap), encodes each tile as an independent H.265 elementary stream, and
- * sends every access unit to the goggle wrapped in the :10001 video_packet_header (see vph.h).
- * The two tiles of one source frame share a FrameId and are distinguished by ChnIndex, exactly
- * as the goggle's ml-pipeline receiver expects. Swapping videotestsrc for the camera later
- * changes only the source element.
+ * Drives a 1920x1080 source into the vendor's two-tile split (top 1920x560, bottom 1920x552,
+ * 32-row overlap), encodes each tile as an independent H.265 elementary stream, and sends every
+ * access unit to the goggle wrapped in the :10001 video_packet_header (see vph.h). The two tiles
+ * of one source frame share a FrameId and are distinguished by ChnIndex, exactly as the goggle's
+ * ml-pipeline receiver expects.
  *
- * Each tile is copied into a dma-heap buffer as packed I420 at its coded height (chroma at
- * stride*height, matching the wave5 encoder's plane math and the DVR feed; the allocation is
- * padded to the 16-aligned height only at the tail) and fed by dmabuf-import, so the coded
- * height stays the vendor-exact 560/552.
+ * There are two source paths and they feed the encoders differently.
+ *
+ * ML_AIR_CAMERA is the production path and copies nothing. The capture node is driven directly
+ * (open, REQBUFS, EXPBUF, DQBUF), each plane of each buffer is wrapped in a GstMemory once, and a
+ * frame becomes two GstBuffers of three gst_memory_share() views at the tile's row offset. The
+ * offsets reach V4L2 as per-plane data_offset and the capture stride reaches it through the video
+ * meta, which is what wave5_widen_src_stride() accepts. See the capture section below.
+ *
+ * videotestsrc is the pattern path and copies each tile into a dma-heap buffer as packed I420 at
+ * its coded height (chroma at stride*height, matching the wave5 encoder's plane math and the DVR
+ * feed; the allocation is padded to the 16-aligned height only at the tail). That copy is about
+ * 6 MB per frame on one A53 and caps this path near 17 fps at 1080p. It is kept because it is the
+ * configuration the end-to-end link was validated at, and because the benchmark reuses the same
+ * dma-heap pool machinery.
  *
  * The two encoder instances are brought up staggered and in a fixed order: tile 1 (the
  * 552-line tile) runs its whole create -> seq-init -> framebuffer-registration -> first-frame
@@ -28,6 +37,10 @@
  *   ML_AIR_PATTERN    videotestsrc pattern        (default ball)
  *   ML_AIR_CAMERA     ar-cvisp node, e.g. /dev/video2: use the sensor instead
  *                     of the synthetic pattern (needs ar-cvisp depth >= 3)
+ *   ML_AIR_BUFS       capture buffers to request  (default 8; camera path only)
+ *   ML_AIR_INFLIGHT   capture buffers the encoders may hold at once (default 3)
+ *   ML_AIR_COPY       0|1: feed that tile by copy instead of by sharing the capture buffer,
+ *                     so the two encoder instances no longer read one allocation (camera only)
  *   ML_AIR_ENC        encoder element + props     (default v4l2h265enc dmabuf-import, large GOP)
  *   ML_AIR_HEAP       dma_heap name for tile bufs (default: first non-mmz heap, else any)
  *   ML_AIR_DUMP       prefix: also write <prefix>_tileN.h265
@@ -87,6 +100,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -94,6 +108,8 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+#include <linux/videodev2.h>
 
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
@@ -113,6 +129,12 @@
 
 /** Number of tiles / encode channels. */
 #define AIR_NCHN     2
+
+/** Direct V4L2 encoder queues, camera path only. CAPTURE is MMAP and holds coded access units;
+ * OUTPUT is DMABUF and never owns memory, so its count only bounds how many capture buffers can
+ * be in the encoder at once and is sized above ML_AIR_INFLIGHT. */
+#define AIR_ENC_CAP_BUFS 6
+#define AIR_ENC_OUT_BUFS 8
 
 /** dma-heap tile buffers per channel (filled/in-encoder/spare). Allocated at startup; the pool
  * shrinks to whatever the heap yields, down to a floor of AIR_POOL_MIN. AIR_POOL_MAX bounds the
@@ -151,8 +173,25 @@ struct air_tile {
     int active;                    /* 1 unless ML_AIR_ONLY selects the other tile */
     int crop_y;                    /* source row this tile starts at */
     int height;                    /* coded/display height (560 or 552) */
+    /* ML_AIR_COPY: this tile is copied out of the capture buffer instead of sharing it. The
+     * diagnostic for the two-instance watchdog, and the fallback if sharing one capture buffer
+     * between two encoder instances turns out to be what the firmware cannot take. */
+    int copy;
     int alloc_h;                   /* physical rows = ALIGN(height,16) */
     gsize buf_size;                /* dma-heap buffer size (stride*alloc_h*3/2) */
+
+    /* Direct V4L2 encoder, used by the camera path only. GStreamer takes the source
+     * bytesperline from the caps at S_FMT (gstv4l2object.c, "format.fmt.pix_mp.plane_fmt[i]
+     * .bytesperline = GST_VIDEO_INFO_PLANE_STRIDE"), so 1920-wide caps describe the 2048-pitch
+     * capture buffer as 1920 and every row slips 128 bytes. Per-buffer video meta cannot fix
+     * that: S_FMT is negotiated before any buffer exists. Stating the stride needs the ioctl. */
+    int enc_fd;
+    int enc_cap_n;
+    guint8 *enc_cap_map[AIR_ENC_CAP_BUFS];
+    gsize enc_cap_len[AIR_ENC_CAP_BUFS];
+    int enc_out_n;
+    struct air_cap_buf *enc_out_cb[AIR_ENC_OUT_BUFS];  /* index -> buffer held, NULL if free */
+    guint32 enc_seq;               /* frame_id for emitted access units */
 
     GstAppSrc *src;                /* encoder input (fed dma-heap I420 buffers) */
     guint8 *tex;                   /* detail tier's shared source texture, built once */
@@ -203,6 +242,17 @@ static GstVideoInfo g_src_info;    /* source 1920x1080 I420 layout */
 static GQuark g_recycle_quark;
 static int g_verbose;
 static int g_notx;
+/* Camera path drives the encoders through V4L2 directly instead of GStreamer, which is the only
+ * way to state the capture stride. ML_AIR_GST=1 restores the GStreamer path for comparison. */
+static int g_enc_direct;
+
+/* The direct encoder backend is defined below the capture code but driven from inside it. */
+struct air_cap_buf;
+static int air_enc_queue(struct air_tile *t, struct air_cap_buf *cb);
+static void air_enc_drain(struct air_tile *t);
+static void air_emit_au(struct air_tile *t, const guint8 *data, size_t size,
+                        guint32 frame_id, guint32 is_idr);
+
 static int g_stagger;              /* ML_AIR_STAGGER: serialize the two encoder bring-ups */
 static int g_primed;               /* set once the staggered bring-up completed */
 static int g_bench_free;           /* ML_AIR_BENCH_FREE: resubmit unpaced */
@@ -660,15 +710,20 @@ static GstBuffer *air_wrap_tile(struct air_tile *t, int idx, GstClockTime pts)
     return buf;
 }
 
-/** Push one already-filled buffer per active tile into its encoder, both carrying @p pts so the
- * encoded FrameIds match. @p idx is read only for active tiles.
+/** Push one ready buffer per active tile into its encoder. @p buf is read only for active tiles,
+ * and ownership of every entry transfers here whether or not the push succeeds.
+ *
+ * Takes GstBuffers rather than pool indices because the two source paths build them differently:
+ * the pattern and benchmark paths wrap a filled dma-heap buffer, the camera path shares three
+ * ranges of a capture buffer with no copy at all. Both then want the same push, the same counters
+ * and the same bring-up order.
  *
  * Holds the staggered, ordered bring-up: on the first frame, feed tile 1 (552 lines) and wait
  * for its first encoded output, then tile 0 (560 lines). The order is what matters: the
  * firmware hangs bringing the 552-height instance up after the 560-height instance exists,
  * while 560-after-552 is clean.
  */
-static void air_push_frame(const int *idx, GstClockTime pts)
+static void air_push_frame(GstBuffer **buf)
 {
     if (g_stagger && !g_primed && g_tile[0].active && g_tile[1].active) {
         /* Tile 1 (the 552-line tile) is brought up first; ML_AIR_ORDER=01 reverses. */
@@ -684,8 +739,7 @@ static void air_push_frame(const int *idx, GstClockTime pts)
             struct air_tile *t = &g_tile[order[o]];
             int waited;
 
-            if (gst_app_src_push_buffer(t->src, air_wrap_tile(t, idx[order[o]], pts))
-                != GST_FLOW_OK) {
+            if (gst_app_src_push_buffer(t->src, buf[order[o]]) != GST_FLOW_OK) {
                 t->lost++;
             } else {
                 t->pushed++;
@@ -703,14 +757,27 @@ static void air_push_frame(const int *idx, GstClockTime pts)
 
     for (int i = 0; i < AIR_NCHN; i++) {
         if (g_tile[i].active) {
-            if (gst_app_src_push_buffer(g_tile[i].src, air_wrap_tile(&g_tile[i], idx[i], pts))
-                != GST_FLOW_OK) {
+            if (gst_app_src_push_buffer(g_tile[i].src, buf[i]) != GST_FLOW_OK) {
                 g_tile[i].lost++;
             } else {
                 g_tile[i].pushed++;
             }
         }
     }
+}
+
+/** Wrap one pool buffer per active tile and push the frame. */
+static void air_push_pool_frame(const int *idx, GstClockTime pts)
+{
+    GstBuffer *buf[AIR_NCHN] = { NULL, NULL };
+
+    for (int i = 0; i < AIR_NCHN; i++) {
+        if (g_tile[i].active) {
+            buf[i] = air_wrap_tile(&g_tile[i], idx[i], pts);
+        }
+    }
+
+    air_push_frame(buf);
 }
 
 /** Reserve one free pool buffer for every active tile, writing indices into @p idx. Returns 0
@@ -849,7 +916,8 @@ static gpointer air_bench_feed(gpointer user)
                     }
                 }
 
-                air_push_frame(idx, gst_util_uint64_scale(n, GST_SECOND, (guint64)g_bench_fps));
+                air_push_pool_frame(idx,
+                                    gst_util_uint64_scale(n, GST_SECOND, (guint64)g_bench_fps));
                 n++;
             }
 
@@ -905,9 +973,864 @@ static gpointer air_bench_feed(gpointer user)
     return NULL;
 }
 
+/*
+ * Zero-copy camera capture.
+ *
+ * The capture node is driven directly rather than through v4l2src, for one reason: the buffer
+ * count. The block completes a buffer only when another is queued, so every buffer the encoder
+ * holds is one the rotation cannot use, and the count is what decides whether capture and encode
+ * pipeline at all. REQBUFS takes it as an argument; gst-v4l2 derives it from a negotiation whose
+ * inputs (the driver's V4L2_CID_MIN_BUFFERS_FOR_CAPTURE, which this node does not implement, and
+ * a downstream allocation query appsink does not answer) are not ours to set. Driving the node
+ * also removes the appsink queue and the videorate element from the latency path.
+ *
+ * Each plane of each buffer is exported once with EXPBUF and wrapped in a GstMemory that lives
+ * for the process. A frame is then two GstBuffers of three gst_memory_share() views into those
+ * memories, at the tile's row offset. No allocation, no copy, no CPU read.
+ *
+ * The share carries its offset into V4L2 as the plane's data_offset, and the video meta's wider
+ * stride makes gst-v4l2 re-run S_FMT on the encoder's OUTPUT queue at 2048 bytes, which is what
+ * wave5_widen_src_stride() exists to accept.
+ */
+#define AIR_CAP_PLANES     3
+#define AIR_CAP_BUFS_MAX   16
+#define AIR_CAP_BUFS_DEF   8
+/* Frames the encoders may hold at once. Each one is a buffer withheld from the rotation, and
+ * also a frame of queueing ahead of the encoder, so this is a latency bound as much as a credit
+ * bound. The rest of the pool stays with the driver. */
+#define AIR_CAP_INFLIGHT_DEF 3
+
+/** One capture buffer: its three exported planes, and how many tiles still reference it. */
+struct air_cap_buf {
+    GstMemory *mem[AIR_CAP_PLANES];
+    guint8 *map[AIR_CAP_PLANES];   /* CPU view, only read by the ML_AIR_COPY path */
+    /* The exported plane, kept as a bare fd as well as a GstMemory. The direct V4L2 encoder
+     * path queues the fd itself, because it is the only way to state the capture stride to the
+     * encoder: gstv4l2 takes the source bytesperline from the caps at S_FMT, so a 1920-wide
+     * caps describes a 2048-pitch buffer as 1920 and every row slips 128 bytes. */
+    int fd[AIR_CAP_PLANES];
+    gsize len[AIR_CAP_PLANES];
+    unsigned int index;
+    gint refs;
+};
+
+static int g_cap_fd = -1;
+static struct air_cap_buf g_cap[AIR_CAP_BUFS_MAX];
+static int g_cap_n;
+static int g_cap_inflight_max;
+static int g_cap_fps;                   /* ML_AIR_FPS: 0 means take every frame the node gives */
+static gint g_cap_inflight;
+static guint32 g_cap_stride[AIR_CAP_PLANES];
+static volatile int g_cap_stop;
+static volatile guint64 g_cap_frames;   /* dequeued from the node */
+static volatile guint64 g_cap_skipped;  /* returned unused: rate limit or no credit */
+
+/** Hand one capture buffer back to the driver. */
+static void air_cap_qbuf(struct air_cap_buf *cb)
+{
+    struct v4l2_plane planes[AIR_CAP_PLANES];
+    struct v4l2_buffer b;
+
+    /* Tile buffers outlive the node: the encoder pipelines are torn down after air_cap_close,
+     * so the last releases arrive with the fd already gone. Not an error, just late. */
+    if (g_cap_fd < 0) {
+        return;
+    }
+
+    memset(planes, 0, sizeof planes);
+    memset(&b, 0, sizeof b);
+    b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    b.memory = V4L2_MEMORY_MMAP;
+    b.index = cb->index;
+    b.length = AIR_CAP_PLANES;
+    b.m.planes = planes;
+
+    if (ioctl(g_cap_fd, VIDIOC_QBUF, &b) != 0) {
+        perror("[ml-air-video] capture QBUF");
+    }
+}
+
+/** Last tile buffer sharing this capture buffer was finalized: the encoders are done reading it,
+ * so it goes back to the rotation. Runs on whichever thread finalized the tile buffer. */
+static void air_cap_release(gpointer data)
+{
+    struct air_cap_buf *cb = data;
+
+    if (g_atomic_int_dec_and_test(&cb->refs)) {
+        g_atomic_int_add(&g_cap_inflight, -1);
+        air_cap_qbuf(cb);
+    }
+}
+
+/** Byte offset of a tile's first row within a capture plane. */
+static gsize air_cap_off(const struct air_tile *t, int plane)
+{
+    if (plane == 0) {
+        return (gsize)t->crop_y * g_cap_stride[0];
+    }
+
+    return (gsize)(t->crop_y / 2) * g_cap_stride[plane];
+}
+
+/** Bytes of a capture plane a tile covers.
+ *
+ * The ALIGNED height, not the coded one. The encoder aligns its source geometry to 16 rows, so
+ * s_fmt on a 552-row tile reports a 560-row plane, gst-v4l2 accumulates its plane offsets from
+ * those sizeimages, and the alignment set on the video meta below computes 560-row plane sizes.
+ * Sharing only 552 rows would make all three disagree with each other.
+ *
+ * The extra rows are read into the encoder's source buffer and never coded, because the coded
+ * height stays the requested 552 (kernel patch 0280 item 6). Tile 1 then ends flush against the
+ * end of the capture plane: 528 + 560 = 1088 rows, which is exactly what the block allocates.
+ */
+static gsize air_cap_len(const struct air_tile *t, int plane)
+{
+    if (plane == 0) {
+        return (gsize)t->alloc_h * g_cap_stride[0];
+    }
+
+    return (gsize)(t->alloc_h / 2) * g_cap_stride[plane];
+}
+
+/** Build one tile's encoder input as three shared views of @p cb, with no copy.
+ *
+ * The video meta carries the capture strides, not the picture width. That is what makes
+ * gst-v4l2 re-negotiate the encoder's OUTPUT format to a 2048-byte luma stride; without it the
+ * encoder would read 1920-byte rows out of a 2048-byte-pitch frame and shear the picture.
+ */
+static GstBuffer *air_cap_share(struct air_tile *t, struct air_cap_buf *cb, GstClockTime pts)
+{
+    gsize offset[GST_VIDEO_MAX_PLANES] = { 0, 0, 0, 0 };
+    gint stride[GST_VIDEO_MAX_PLANES] = { 0, 0, 0, 0 };
+    GstVideoAlignment align;
+    GstVideoMeta *meta;
+    GstBuffer *buf = gst_buffer_new();
+    gsize flat = 0;
+
+    for (int p = 0; p < AIR_CAP_PLANES; p++) {
+        gsize len = air_cap_len(t, p);
+
+        gst_buffer_append_memory(buf, gst_memory_share(cb->mem[p], (gssize)air_cap_off(t, p),
+                                                       (gssize)len));
+        offset[p] = flat;
+        stride[p] = (gint)g_cap_stride[p];
+        flat += len;
+    }
+
+    GST_BUFFER_PTS(buf) = pts;
+    meta = gst_buffer_add_video_meta_full(buf, GST_VIDEO_FRAME_FLAG_NONE, GST_VIDEO_FORMAT_I420,
+                                          AIR_COMP_W, t->height, AIR_CAP_PLANES, offset, stride);
+
+    /* The padding has to be stated, not just implied by the strides. A meta carrying offsets and
+     * strides but no alignment fails its own consistency check: gst_video_meta_get_plane_size
+     * recomputes the strides from the picture size with zero alignment, gets 1920/960/960 against
+     * our 2048/1024/1024, and returns FALSE. gst_video_meta_get_plane_height then returns FALSE
+     * without writing anything, and gst-v4l2 passes a zero padded_height into
+     * gst_v4l2_object_match_buffer_layout, which drops back to the current format height and
+     * never sets obj->align.padding_bottom.
+     *
+     * padding_right is in pixels: 2048 - 1920 = 128 gives luma stride 2048 and chroma 1024.
+     * padding_bottom is the 16-row source alignment the encoder applies anyway, 8 rows on the
+     * 552 tile and 0 on the 560 one. With both set the meta reproduces exactly the plane sizes
+     * air_cap_len shares, so plane_height comes out as the aligned height and every number
+     * gst-v4l2 derives matches what the driver reports.
+     */
+    gst_video_alignment_reset(&align);
+    align.padding_right = g_cap_stride[0] - AIR_COMP_W;
+    align.padding_bottom = (guint)(t->alloc_h - t->height);
+    if (!gst_video_meta_set_alignment(meta, align)) {
+        g_printerr("[ml-air-video] tile %d: video meta rejected padding %u right %u bottom\n",
+                   t->chn, align.padding_right, align.padding_bottom);
+    }
+
+    gst_mini_object_set_qdata(GST_MINI_OBJECT(buf), g_recycle_quark, cb, air_cap_release);
+    return buf;
+}
+
+/** Copy one tile out of the capture buffer into a pool buffer, packed at the coded height.
+ *
+ * The same layout air_fill_tile produces, so air_wrap_tile takes it unchanged. Reads come out of
+ * a no-map coherent carveout and are therefore uncached, which is the whole cost: about 1.6 MB
+ * per tile per frame, against zero for a share.
+ */
+static void air_cap_fill(struct air_tile *t, int idx, struct air_cap_buf *cb)
+{
+    guint8 *dst = t->pool[idx].map;
+    const int ys = AIR_COMP_W;
+    const int cs = AIR_COMP_W / 2;
+    guint8 *d_y = dst;
+    guint8 *d_cb = dst + (gsize)ys * t->height;
+    guint8 *d_cr = d_cb + (gsize)cs * (t->height / 2);
+
+    air_dmabuf_sync(t->pool[idx].fd, 1);
+
+    for (int r = 0; r < t->height; r++) {
+        memcpy(d_y + (gsize)r * ys,
+               cb->map[0] + (gsize)(t->crop_y + r) * g_cap_stride[0], AIR_COMP_W);
+    }
+
+    for (int r = 0; r < t->height / 2; r++) {
+        memcpy(d_cb + (gsize)r * cs,
+               cb->map[1] + (gsize)(t->crop_y / 2 + r) * g_cap_stride[1], cs);
+        memcpy(d_cr + (gsize)r * cs,
+               cb->map[2] + (gsize)(t->crop_y / 2 + r) * g_cap_stride[2], cs);
+    }
+
+    air_dmabuf_sync(t->pool[idx].fd, 0);
+}
+
+/** Open the capture node, export every plane of every buffer, and start streaming.
+ * Returns 0 on success. */
+static int air_cap_open(const char *dev, int want)
+{
+    struct v4l2_requestbuffers req;
+    struct v4l2_format fmt;
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+
+    if (want < 2) {
+        want = 2;
+    }
+    if (want > AIR_CAP_BUFS_MAX) {
+        want = AIR_CAP_BUFS_MAX;
+    }
+
+    g_cap_fd = open(dev, O_RDWR | O_CLOEXEC);
+    if (g_cap_fd < 0) {
+        g_printerr("[ml-air-video] open %s: %s\n", dev, strerror(errno));
+        return -1;
+    }
+
+    /* The node's geometry is not negotiable (it is the geometry the block is configured for),
+     * so this reads the format rather than proposing one, and the strides come from the driver
+     * instead of from a constant here that could drift from it. */
+    memset(&fmt, 0, sizeof fmt);
+    fmt.type = type;
+    if (ioctl(g_cap_fd, VIDIOC_G_FMT, &fmt) != 0) {
+        g_printerr("[ml-air-video] %s G_FMT: %s\n", dev, strerror(errno));
+        return -1;
+    }
+
+    if (fmt.fmt.pix_mp.num_planes != AIR_CAP_PLANES ||
+        fmt.fmt.pix_mp.width != AIR_COMP_W || fmt.fmt.pix_mp.height != AIR_COMP_H) {
+        g_printerr("[ml-air-video] %s is %ux%u in %u planes, expected %dx%d in %d\n",
+                   dev, fmt.fmt.pix_mp.width, fmt.fmt.pix_mp.height,
+                   fmt.fmt.pix_mp.num_planes, AIR_COMP_W, AIR_COMP_H, AIR_CAP_PLANES);
+        return -1;
+    }
+
+    for (int p = 0; p < AIR_CAP_PLANES; p++) {
+        g_cap_stride[p] = fmt.fmt.pix_mp.plane_fmt[p].bytesperline;
+    }
+
+    memset(&req, 0, sizeof req);
+    req.count = (unsigned int)want;
+    req.type = type;
+    req.memory = V4L2_MEMORY_MMAP;
+    if (ioctl(g_cap_fd, VIDIOC_REQBUFS, &req) != 0) {
+        g_printerr("[ml-air-video] %s REQBUFS %d: %s\n", dev, want, strerror(errno));
+        return -1;
+    }
+
+    if (req.count > AIR_CAP_BUFS_MAX) {
+        req.count = AIR_CAP_BUFS_MAX;
+    }
+    g_cap_n = (int)req.count;
+
+    for (int i = 0; i < g_cap_n; i++) {
+        struct v4l2_plane planes[AIR_CAP_PLANES];
+        struct v4l2_buffer b;
+        struct air_cap_buf *cb = &g_cap[i];
+
+        memset(planes, 0, sizeof planes);
+        memset(&b, 0, sizeof b);
+        b.type = type;
+        b.memory = V4L2_MEMORY_MMAP;
+        b.index = (unsigned int)i;
+        b.length = AIR_CAP_PLANES;
+        b.m.planes = planes;
+        if (ioctl(g_cap_fd, VIDIOC_QUERYBUF, &b) != 0) {
+            g_printerr("[ml-air-video] QUERYBUF %d: %s\n", i, strerror(errno));
+            return -1;
+        }
+
+        cb->index = (unsigned int)i;
+        for (int p = 0; p < AIR_CAP_PLANES; p++) {
+            struct v4l2_exportbuffer exp;
+
+            memset(&exp, 0, sizeof exp);
+            exp.type = type;
+            exp.index = (unsigned int)i;
+            exp.plane = (unsigned int)p;
+            exp.flags = O_RDWR | O_CLOEXEC;
+            if (ioctl(g_cap_fd, VIDIOC_EXPBUF, &exp) != 0) {
+                g_printerr("[ml-air-video] EXPBUF %d plane %d: %s\n", i, p, strerror(errno));
+                return -1;
+            }
+
+            cb->len[p] = planes[p].length;
+            /* gst_dmabuf_allocator_alloc takes the fd, so the V4L2 path gets its own. */
+            cb->fd[p] = dup(exp.fd);
+            cb->mem[p] = gst_dmabuf_allocator_alloc(g_dmabuf_alloc, exp.fd, cb->len[p]);
+            if (cb->fd[p] < 0) {
+                g_printerr("[ml-air-video] dup(dmabuf) %d plane %d: %s\n", i, p, strerror(errno));
+                return -1;
+            }
+
+            /* Only the ML_AIR_COPY path reads this. Mapped unconditionally because it costs one
+             * mmap per plane at startup and nothing per frame, and because a tile switching to
+             * the copy path mid-run would otherwise need the node re-opened. */
+            cb->map[p] = mmap(NULL, cb->len[p], PROT_READ, MAP_SHARED, g_cap_fd,
+                              (off_t)planes[p].m.mem_offset);
+            if (cb->map[p] == MAP_FAILED) {
+                cb->map[p] = NULL;
+            }
+        }
+
+        air_cap_qbuf(cb);
+    }
+
+    /* A tile that runs off the end of a plane is rejected by the kernel at QBUF time, one frame
+     * at a time and with nothing said about why. Check it once, here, where the numbers are. */
+    for (int i = 0; i < AIR_NCHN; i++) {
+        struct air_tile *t = &g_tile[i];
+
+        if (!t->active) {
+            continue;
+        }
+
+        for (int p = 0; p < AIR_CAP_PLANES; p++) {
+            if (t->copy && g_cap[0].map[p] == NULL) {
+                g_printerr("[ml-air-video] tile %d is ML_AIR_COPY but plane %d did not mmap\n",
+                           t->chn, p);
+                return -1;
+            }
+
+            if (air_cap_off(t, p) + air_cap_len(t, p) > g_cap[0].len[p]) {
+                g_printerr("[ml-air-video] tile %d plane %d: rows %d..%d at stride %u needs "
+                           "%" G_GSIZE_FORMAT " B of a %" G_GSIZE_FORMAT " B plane\n",
+                           t->chn, p, t->crop_y, t->crop_y + t->height, g_cap_stride[p],
+                           air_cap_off(t, p) + air_cap_len(t, p), g_cap[0].len[p]);
+                return -1;
+            }
+        }
+    }
+
+    if (ioctl(g_cap_fd, VIDIOC_STREAMON, &type) != 0) {
+        g_printerr("[ml-air-video] STREAMON: %s\n", strerror(errno));
+        return -1;
+    }
+
+    g_printerr("[ml-air-video] camera %s: %d buffers, strides %u/%u/%u, up to %d in flight\n",
+               dev, g_cap_n, g_cap_stride[0], g_cap_stride[1], g_cap_stride[2],
+               g_cap_inflight_max);
+    return 0;
+}
+
+/** Capture thread: dequeue, share into both tiles, push. A frame that is not wanted (rate limit)
+ * or cannot be afforded (no credit) goes straight back to the driver, which is the cheapest
+ * possible drop and keeps the rotation fed. */
+static gpointer air_cap_feed(gpointer user)
+{
+    const gint64 period = g_cap_fps > 0 ? G_USEC_PER_SEC / g_cap_fps : 0;
+    gint64 base_us = 0;
+    gint64 due_us = 0;
+
+    (void)user;
+
+    while (!g_cap_stop) {
+        struct v4l2_plane planes[AIR_CAP_PLANES];
+        struct v4l2_buffer b;
+        struct air_cap_buf *cb;
+        GstBuffer *buf[AIR_NCHN] = { NULL, NULL };
+        gpointer pool[AIR_NCHN] = { NULL, NULL };
+        gint64 ts_us;
+        int nshare = 0;
+        int starved = 0;
+
+        struct pollfd pfd = { .fd = g_cap_fd, .events = POLLIN, .revents = 0 };
+
+        /* Polled rather than blocking in DQBUF, so the exit path does not depend on a frame
+         * arriving to be noticed. */
+        if (poll(&pfd, 1, 200) <= 0) {
+            continue;
+        }
+
+        memset(planes, 0, sizeof planes);
+        memset(&b, 0, sizeof b);
+        b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        b.memory = V4L2_MEMORY_MMAP;
+        b.length = AIR_CAP_PLANES;
+        b.m.planes = planes;
+
+        if (ioctl(g_cap_fd, VIDIOC_DQBUF, &b) != 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            g_printerr("[ml-air-video] capture DQBUF: %s\n", strerror(errno));
+            break;
+        }
+
+        cb = &g_cap[b.index];
+        g_cap_frames++;
+
+        /* Ahead of the gates below, both of which skip the rest of the iteration. Draining is
+         * what returns a capture buffer and lowers g_cap_inflight, so reaching the in-flight
+         * ceiling with the drain behind that gate would be a deadlock: no drain, no release, no
+         * headroom, every subsequent frame skipped. */
+        if (g_enc_direct) {
+            for (int i = 0; i < AIR_NCHN; i++) {
+                if (g_tile[i].active) {
+                    air_enc_drain(&g_tile[i]);
+                }
+            }
+        }
+
+        ts_us = (gint64)b.timestamp.tv_sec * G_USEC_PER_SEC + b.timestamp.tv_usec;
+        if (base_us == 0) {
+            base_us = ts_us;
+            due_us = ts_us;
+        }
+
+        /* Rate limit against the driver's own timestamps rather than wall clock, so a frame is
+         * judged by when it was captured. period is truncated down, so at a request equal to the
+         * sensor rate every frame is due and nothing is dropped. */
+        if (period > 0 && ts_us < due_us) {
+            g_cap_skipped++;
+            air_cap_qbuf(cb);
+            continue;
+        }
+
+        if (g_atomic_int_get(&g_cap_inflight) >= g_cap_inflight_max) {
+            g_cap_skipped++;
+            air_cap_qbuf(cb);
+            continue;
+        }
+
+        if (period > 0) {
+            due_us += period;
+            if (due_us < ts_us) {
+                due_us = ts_us + period;
+            }
+        }
+
+        /* Direct V4L2: the capture buffer is queued into each encoder as it stands, at the
+         * tile's row offset, with no GstBuffer in between. Encoder output is collected by the
+         * drain at the top of the next iteration, so a coded frame waits one capture period. */
+        if (g_enc_direct) {
+            int nq = 0;
+
+            for (int i = 0; i < AIR_NCHN; i++) {
+                if (g_tile[i].active) {
+                    nq++;
+                }
+            }
+
+            g_atomic_int_inc(&g_cap_inflight);
+            g_atomic_int_set(&cb->refs, nq);
+
+            for (int i = 0; i < AIR_NCHN; i++) {
+                if (g_tile[i].active && air_enc_queue(&g_tile[i], cb) != 0) {
+                    /* This encoder will never return the buffer, so drop its reference now. */
+                    air_cap_release(cb);
+                }
+            }
+
+            continue;
+        }
+
+        /* Copy tiles need a pool slot before anything is committed, because running out of one
+         * halfway through a frame would leave the pair misaligned. Share tiles need nothing. */
+        for (int i = 0; i < AIR_NCHN; i++) {
+            if (!g_tile[i].active) {
+                continue;
+            }
+
+            if (!g_tile[i].copy) {
+                nshare++;
+                continue;
+            }
+
+            pool[i] = g_async_queue_try_pop(g_tile[i].freeq);
+            if (pool[i] == NULL) {
+                starved = 1;
+            }
+        }
+
+        if (starved) {
+            for (int i = 0; i < AIR_NCHN; i++) {
+                if (pool[i] != NULL) {
+                    g_async_queue_push(g_tile[i].freeq, pool[i]);
+                }
+            }
+
+            g_tile[0].dropped++;
+            g_cap_skipped++;
+            air_cap_qbuf(cb);
+            continue;
+        }
+
+        /* Only the sharing tiles hold the capture buffer, so only they are counted. With every
+         * tile copied nothing holds it and it goes straight back below. */
+        if (nshare > 0) {
+            g_atomic_int_inc(&g_cap_inflight);
+            g_atomic_int_set(&cb->refs, nshare);
+        }
+
+        for (int i = 0; i < AIR_NCHN; i++) {
+            GstClockTime pts = (GstClockTime)(ts_us - base_us) * GST_USECOND;
+
+            if (!g_tile[i].active) {
+                continue;
+            }
+
+            if (g_tile[i].copy) {
+                int idx = GPOINTER_TO_INT(pool[i]) - 1;
+
+                air_cap_fill(&g_tile[i], idx, cb);
+                buf[i] = air_wrap_tile(&g_tile[i], idx, pts);
+            } else {
+                buf[i] = air_cap_share(&g_tile[i], cb, pts);
+            }
+        }
+
+        if (nshare == 0) {
+            air_cap_qbuf(cb);
+        }
+
+        air_push_frame(buf);
+    }
+
+    return NULL;
+}
+
+/** Stop the capture node. The exported memories are deliberately not freed: shares of them may
+ * still be in an encoder queue, and the process is exiting. */
+static void air_cap_close(void)
+{
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+
+    if (g_cap_fd < 0) {
+        return;
+    }
+
+    ioctl(g_cap_fd, VIDIOC_STREAMOFF, &type);
+    close(g_cap_fd);
+    g_cap_fd = -1;
+}
+
+static const char *env_or(const char *name, const char *dflt);
+
+/** Set one integer encoder control, reporting but not failing on a control the driver lacks. */
+static void air_enc_ctrl(struct air_tile *t, guint32 id, gint32 val, const char *name)
+{
+    struct v4l2_ext_control c;
+    struct v4l2_ext_controls cs;
+
+    memset(&c, 0, sizeof c);
+    memset(&cs, 0, sizeof cs);
+    c.id = id;
+    c.value = val;
+    cs.count = 1;
+    cs.controls = &c;
+    cs.which = V4L2_CTRL_WHICH_CUR_VAL;
+
+    if (ioctl(t->enc_fd, VIDIOC_S_EXT_CTRLS, &cs) != 0) {
+        g_printerr("[ml-air-video] tile %d: %s: %s\n", t->chn, name, strerror(errno));
+    }
+}
+
+/** Open and configure one encoder instance for this tile.
+ *
+ * The whole reason this path exists is the OUTPUT S_FMT below: bytesperline comes from the
+ * capture node, not from the picture width, and the driver's answer is checked. A stride the
+ * encoder silently rewrote produced two sessions of sheared video that every counter reported
+ * as healthy, so a mismatch fails the run here rather than becoming a picture nobody decodes. */
+static int air_enc_open(struct air_tile *t, const char *dev, int fps)
+{
+    struct v4l2_format f;
+    struct v4l2_requestbuffers rb;
+    enum v4l2_buf_type otype = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+    enum v4l2_buf_type ctype = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    int p;
+    int i;
+
+    /* O_NONBLOCK is load bearing: air_enc_drain empties both queues by dequeuing until DQBUF
+     * fails, which on a blocking fd never happens. */
+    t->enc_fd = open(dev, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+    if (t->enc_fd < 0) {
+        g_printerr("[ml-air-video] tile %d: open %s: %s\n", t->chn, dev, strerror(errno));
+        return -1;
+    }
+
+    memset(&f, 0, sizeof f);
+    f.type = otype;
+    f.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_YUV420M;
+    f.fmt.pix_mp.width = AIR_COMP_W;
+    f.fmt.pix_mp.height = (guint32)t->height;
+    f.fmt.pix_mp.field = V4L2_FIELD_NONE;
+    f.fmt.pix_mp.num_planes = AIR_CAP_PLANES;
+    for (p = 0; p < AIR_CAP_PLANES; p++) {
+        f.fmt.pix_mp.plane_fmt[p].bytesperline = g_cap_stride[p];
+        f.fmt.pix_mp.plane_fmt[p].sizeimage = (guint32)air_cap_len(t, p);
+    }
+
+    if (ioctl(t->enc_fd, VIDIOC_S_FMT, &f) != 0) {
+        g_printerr("[ml-air-video] tile %d: S_FMT OUTPUT: %s\n", t->chn, strerror(errno));
+        return -1;
+    }
+
+    if (f.fmt.pix_mp.pixelformat != V4L2_PIX_FMT_YUV420M ||
+        f.fmt.pix_mp.num_planes != AIR_CAP_PLANES) {
+        g_printerr("[ml-air-video] tile %d: encoder substituted the source format\n", t->chn);
+        return -1;
+    }
+
+    for (p = 0; p < AIR_CAP_PLANES; p++) {
+        guint32 bpl = f.fmt.pix_mp.plane_fmt[p].bytesperline;
+        guint32 want = g_cap_stride[p];
+
+        g_printerr("[ml-air-video] tile %d: enc plane %d bytesperline %u (asked %u), "
+                   "sizeimage %u (buffer has %zu)\n",
+                   t->chn, p, bpl, want, f.fmt.pix_mp.plane_fmt[p].sizeimage,
+                   air_cap_len(t, p));
+
+        if (bpl != want) {
+            g_printerr("[ml-air-video] tile %d: encoder rewrote the source stride; "
+                       "refusing to encode a sheared picture\n", t->chn);
+            return -1;
+        }
+        if (f.fmt.pix_mp.plane_fmt[p].sizeimage > air_cap_len(t, p)) {
+            g_printerr("[ml-air-video] tile %d: encoder demands more than the capture "
+                       "buffer holds on plane %d\n", t->chn, p);
+            return -1;
+        }
+    }
+
+    memset(&f, 0, sizeof f);
+    f.type = ctype;
+    f.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_HEVC;
+    f.fmt.pix_mp.width = AIR_COMP_W;
+    f.fmt.pix_mp.height = (guint32)t->height;
+    f.fmt.pix_mp.field = V4L2_FIELD_NONE;
+    f.fmt.pix_mp.num_planes = 1;
+    if (ioctl(t->enc_fd, VIDIOC_S_FMT, &f) != 0) {
+        g_printerr("[ml-air-video] tile %d: S_FMT CAPTURE HEVC: %s\n", t->chn, strerror(errno));
+        return -1;
+    }
+
+    air_enc_ctrl(t, V4L2_CID_MPEG_VIDEO_BITRATE,
+                 atoi(env_or("ML_AIR_BITRATE", "5000000")), "bitrate");
+    air_enc_ctrl(t, V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
+                 V4L2_MPEG_VIDEO_BITRATE_MODE_CBR, "bitrate mode");
+    air_enc_ctrl(t, V4L2_CID_MPEG_VIDEO_GOP_SIZE,
+                 atoi(env_or("ML_AIR_GOP", "0")), "gop size");
+    air_enc_ctrl(t, V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE, 1, "frame rc");
+    air_enc_ctrl(t, V4L2_CID_MPEG_VIDEO_MB_RC_ENABLE,
+                 atoi(env_or("ML_AIR_MBRC", "1")), "mb rc");
+    air_enc_ctrl(t, V4L2_CID_MPEG_VIDEO_HEVC_MIN_QP,
+                 atoi(env_or("ML_AIR_MINQP", "0")), "min qp");
+    air_enc_ctrl(t, V4L2_CID_MPEG_VIDEO_HEVC_MAX_QP,
+                 atoi(env_or("ML_AIR_MAXQP", "51")), "max qp");
+    air_enc_ctrl(t, V4L2_CID_MPEG_VIDEO_HEVC_I_FRAME_QP,
+                 atoi(env_or("ML_AIR_IQP", "30")), "i frame qp");
+    (void)fps;
+
+    memset(&rb, 0, sizeof rb);
+    rb.type = otype;
+    rb.memory = V4L2_MEMORY_DMABUF;
+    rb.count = AIR_ENC_OUT_BUFS;
+    if (ioctl(t->enc_fd, VIDIOC_REQBUFS, &rb) != 0) {
+        g_printerr("[ml-air-video] tile %d: REQBUFS OUTPUT: %s\n", t->chn, strerror(errno));
+        return -1;
+    }
+    t->enc_out_n = (int)rb.count;
+
+    memset(&rb, 0, sizeof rb);
+    rb.type = ctype;
+    rb.memory = V4L2_MEMORY_MMAP;
+    rb.count = AIR_ENC_CAP_BUFS;
+    if (ioctl(t->enc_fd, VIDIOC_REQBUFS, &rb) != 0) {
+        g_printerr("[ml-air-video] tile %d: REQBUFS CAPTURE: %s\n", t->chn, strerror(errno));
+        return -1;
+    }
+    t->enc_cap_n = (int)rb.count;
+
+    for (i = 0; i < t->enc_cap_n; i++) {
+        struct v4l2_buffer b;
+        struct v4l2_plane pl;
+
+        memset(&b, 0, sizeof b);
+        memset(&pl, 0, sizeof pl);
+        b.type = ctype;
+        b.memory = V4L2_MEMORY_MMAP;
+        b.index = (unsigned int)i;
+        b.length = 1;
+        b.m.planes = &pl;
+        if (ioctl(t->enc_fd, VIDIOC_QUERYBUF, &b) != 0) {
+            g_printerr("[ml-air-video] tile %d: QUERYBUF %d: %s\n", t->chn, i, strerror(errno));
+            return -1;
+        }
+
+        t->enc_cap_len[i] = pl.length;
+        t->enc_cap_map[i] = mmap(NULL, pl.length, PROT_READ, MAP_SHARED, t->enc_fd,
+                                 (off_t)pl.m.mem_offset);
+        if (t->enc_cap_map[i] == MAP_FAILED) {
+            t->enc_cap_map[i] = NULL;
+            g_printerr("[ml-air-video] tile %d: mmap capture %d: %s\n",
+                       t->chn, i, strerror(errno));
+            return -1;
+        }
+
+        if (ioctl(t->enc_fd, VIDIOC_QBUF, &b) != 0) {
+            g_printerr("[ml-air-video] tile %d: QBUF capture %d: %s\n",
+                       t->chn, i, strerror(errno));
+            return -1;
+        }
+    }
+
+    if (ioctl(t->enc_fd, VIDIOC_STREAMON, &otype) != 0 ||
+        ioctl(t->enc_fd, VIDIOC_STREAMON, &ctype) != 0) {
+        g_printerr("[ml-air-video] tile %d: STREAMON: %s\n", t->chn, strerror(errno));
+        return -1;
+    }
+
+    return 0;
+}
+
+/** Queue one capture buffer into this tile's encoder at the tile's row offset. Takes a
+ * reference on the buffer, released when the OUTPUT buffer comes back. */
+static int air_enc_queue(struct air_tile *t, struct air_cap_buf *cb)
+{
+    struct v4l2_buffer b;
+    struct v4l2_plane pl[AIR_CAP_PLANES];
+    int idx = -1;
+    int p;
+    int i;
+
+    for (i = 0; i < t->enc_out_n; i++) {
+        if (t->enc_out_cb[i] == NULL) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx < 0) {
+        return -1;
+    }
+
+    memset(&b, 0, sizeof b);
+    memset(pl, 0, sizeof pl);
+    b.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+    b.memory = V4L2_MEMORY_DMABUF;
+    b.index = (unsigned int)idx;
+    b.length = AIR_CAP_PLANES;
+    b.m.planes = pl;
+    for (p = 0; p < AIR_CAP_PLANES; p++) {
+        pl[p].m.fd = cb->fd[p];
+        pl[p].length = (unsigned int)cb->len[p];
+        pl[p].data_offset = (unsigned int)air_cap_off(t, p);
+        pl[p].bytesused = pl[p].data_offset + (unsigned int)air_cap_len(t, p);
+    }
+
+    if (ioctl(t->enc_fd, VIDIOC_QBUF, &b) != 0) {
+        t->lost++;
+        return -1;
+    }
+
+    t->enc_out_cb[idx] = cb;
+    t->pushed++;
+    return 0;
+}
+
+/** Drain whatever this tile's encoder has ready: coded access units out, spent source buffers
+ * back. Non-blocking; the caller polls. */
+static void air_enc_drain(struct air_tile *t)
+{
+    struct v4l2_buffer b;
+    struct v4l2_plane pl[AIR_CAP_PLANES];
+
+    for (;;) {
+        memset(&b, 0, sizeof b);
+        memset(pl, 0, sizeof pl);
+        b.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+        b.memory = V4L2_MEMORY_DMABUF;
+        b.length = AIR_CAP_PLANES;
+        b.m.planes = pl;
+        if (ioctl(t->enc_fd, VIDIOC_DQBUF, &b) != 0) {
+            break;
+        }
+        if (b.index < (unsigned int)t->enc_out_n && t->enc_out_cb[b.index] != NULL) {
+            air_cap_release(t->enc_out_cb[b.index]);
+            t->enc_out_cb[b.index] = NULL;
+        }
+    }
+
+    for (;;) {
+        memset(&b, 0, sizeof b);
+        memset(pl, 0, sizeof pl);
+        b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        b.memory = V4L2_MEMORY_MMAP;
+        b.length = 1;
+        b.m.planes = pl;
+        if (ioctl(t->enc_fd, VIDIOC_DQBUF, &b) != 0) {
+            break;
+        }
+
+        if (b.index < (unsigned int)t->enc_cap_n && t->enc_cap_map[b.index] != NULL &&
+            pl[0].bytesused > 0) {
+            air_emit_au(t, t->enc_cap_map[b.index] + pl[0].data_offset,
+                        pl[0].bytesused - pl[0].data_offset, t->enc_seq++,
+                        (b.flags & V4L2_BUF_FLAG_KEYFRAME) ? 1 : 0);
+        }
+
+        if (ioctl(t->enc_fd, VIDIOC_QBUF, &b) != 0) {
+            g_printerr("[ml-air-video] tile %d: requeue capture %u: %s\n",
+                       t->chn, b.index, strerror(errno));
+            break;
+        }
+    }
+}
+
+/** STREAMOFF both queues and close. STREAMOFF returns every queued buffer, so the capture
+ * references this tile still holds are dropped here rather than leaked; wave5 needs the
+ * instance torn down cleanly or its next open finds the firmware busy. */
+static void air_enc_close(struct air_tile *t)
+{
+    enum v4l2_buf_type otype = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+    enum v4l2_buf_type ctype = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    int i;
+
+    if (t->enc_fd < 0) {
+        return;
+    }
+
+    ioctl(t->enc_fd, VIDIOC_STREAMOFF, &otype);
+    ioctl(t->enc_fd, VIDIOC_STREAMOFF, &ctype);
+
+    for (i = 0; i < t->enc_out_n; i++) {
+        if (t->enc_out_cb[i] != NULL) {
+            air_cap_release(t->enc_out_cb[i]);
+            t->enc_out_cb[i] = NULL;
+        }
+    }
+
+    for (i = 0; i < t->enc_cap_n; i++) {
+        if (t->enc_cap_map[i] != NULL) {
+            munmap(t->enc_cap_map[i], t->enc_cap_len[i]);
+            t->enc_cap_map[i] = NULL;
+        }
+    }
+
+    close(t->enc_fd);
+    t->enc_fd = -1;
+}
+
 /** Source callback: split one 1920x1080 frame into the two aligned tiles and push each into its
  * encoder. Both tiles carry the same PTS, so their encoded FrameIds match. Skips a frame whole
- * if either tile has no free pool buffer, keeping the pair aligned. */
+ * if either tile has no free pool buffer, keeping the pair aligned.
+ *
+ * This is the pattern path only. It copies, which is what caps it near 17 fps at 1080p; the
+ * camera path above shares instead. */
 static GstFlowReturn air_on_src(GstAppSink *sink, gpointer user)
 {
     GstSample *sample = gst_app_sink_pull_sample(sink);
@@ -944,13 +1867,50 @@ static GstFlowReturn air_on_src(GstAppSink *sink, gpointer user)
     }
     gst_video_frame_unmap(&frame);
 
-    air_push_frame(idx, pts);
+    air_push_pool_frame(idx, pts);
 
     gst_sample_unref(sample);
     return GST_FLOW_OK;
 }
 
 /** Encoder-output callback: frame one tile access unit and send it to the goggle. */
+/** Dump, count and transmit one access unit. Shared by the GStreamer and direct V4L2 backends. */
+static void air_emit_au(struct air_tile *t, const guint8 *data, size_t size,
+                        guint32 frame_id, guint32 is_idr)
+{
+    guint32 ts_ms = (guint32)((guint64)frame_id * 1000u / (guint32)t->fps);
+    size_t len;
+
+    if (t->dumpfd >= 0) {
+        if (write(t->dumpfd, data, size) != (ssize_t)size) {
+            /* best-effort capture */
+        }
+    }
+
+    if (size > t->tx_maxlen) {
+        t->tx_maxlen = (guint32)size;
+    }
+
+    if (!g_notx) {
+        len = vph_build(t->txbuf, AIR_TX_MAX, (guint32)t->chn, is_idr, frame_id, ts_ms,
+                        t->resolution, data, (guint32)size);
+        if (len == 0) {
+            t->tx_oversize++;
+        } else if (sendto(t->sock, t->txbuf, len, MSG_DONTWAIT,
+                          (struct sockaddr *)&t->dst, sizeof t->dst) != (ssize_t)len) {
+            t->tx_error++;
+            t->tx_errno = errno;
+        } else {
+            t->sent++;
+        }
+    } else {
+        t->sent++;
+    }
+
+    t->done++;
+    t->bytes += size;
+}
+
 static GstFlowReturn air_on_enc(GstAppSink *sink, gpointer user)
 {
     struct air_tile *t = user;
@@ -958,9 +1918,6 @@ static GstFlowReturn air_on_enc(GstAppSink *sink, gpointer user)
     GstBuffer *buf;
     GstMapInfo map;
     guint32 frame_id;
-    guint32 is_idr;
-    guint32 ts_ms;
-    size_t len;
 
     if (sample == NULL) {
         return GST_FLOW_OK;
@@ -979,37 +1936,8 @@ static GstFlowReturn air_on_enc(GstAppSink *sink, gpointer user)
         frame_id = 0;
     }
 
-    is_idr = GST_BUFFER_FLAG_IS_SET(buf, GST_BUFFER_FLAG_DELTA_UNIT) ? 0 : 1;
-    ts_ms = (guint32)((guint64)frame_id * 1000u / (guint32)t->fps);
-
-    if (t->dumpfd >= 0) {
-        if (write(t->dumpfd, map.data, map.size) != (ssize_t)map.size) {
-            /* best-effort capture */
-        }
-    }
-
-    if (map.size > t->tx_maxlen) {
-        t->tx_maxlen = (guint32)map.size;
-    }
-
-    if (!g_notx) {
-        len = vph_build(t->txbuf, AIR_TX_MAX, (guint32)t->chn, is_idr, frame_id, ts_ms,
-                        t->resolution, map.data, (guint32)map.size);
-        if (len == 0) {
-            t->tx_oversize++;
-        } else if (sendto(t->sock, t->txbuf, len, MSG_DONTWAIT,
-                          (struct sockaddr *)&t->dst, sizeof t->dst) != (ssize_t)len) {
-            t->tx_error++;
-            t->tx_errno = errno;
-        } else {
-            t->sent++;
-        }
-    } else {
-        t->sent++;
-    }
-
-    t->done++;
-    t->bytes += map.size;
+    air_emit_au(t, map.data, map.size, frame_id,
+                GST_BUFFER_FLAG_IS_SET(buf, GST_BUFFER_FLAG_DELTA_UNIT) ? 0 : 1);
 
     gst_buffer_unmap(buf, &map);
     gst_sample_unref(sample);
@@ -1081,6 +2009,26 @@ static gboolean air_on_tick(gpointer user)
         g_printerr("[ml-air-video] tx chn0=%" G_GUINT64_FORMAT " chn1=%" G_GUINT64_FORMAT
                    " dropped=%" G_GUINT64_FORMAT "\n",
                    g_tile[0].sent, g_tile[1].sent, g_tile[0].dropped);
+
+        /* Camera rates as per-second deltas. The whole point of the zero-copy path is that
+         * `cap` and `enc` both sit at the sensor rate with `skip` at zero; a cumulative count
+         * cannot show that, and neither can a count taken once. */
+        if (g_cap_fd >= 0) {
+            static guint64 last_cap;
+            static guint64 last_skip;
+
+            g_printerr("[ml-air-video] cam cap=%" G_GUINT64_FORMAT "/s skip=%" G_GUINT64_FORMAT
+                       "/s inflight=%d enc=%" G_GUINT64_FORMAT "/%" G_GUINT64_FORMAT "/s\n",
+                       g_cap_frames - last_cap, g_cap_skipped - last_skip,
+                       g_atomic_int_get(&g_cap_inflight),
+                       g_tile[0].done - last_done[0], g_tile[1].done - last_done[1]);
+            last_cap = g_cap_frames;
+            last_skip = g_cap_skipped;
+        }
+
+        for (int i = 0; i < AIR_NCHN; i++) {
+            last_done[i] = g_tile[i].done;
+        }
     }
 
     return G_SOURCE_CONTINUE;
@@ -1177,6 +2125,7 @@ int main(int argc, char **argv)
     const char *ring_env = getenv("ML_AIR_RING");
     const char *pool_env = getenv("ML_AIR_POOL");
     int pool_want;
+    int cap_want = atoi(env_or("ML_AIR_BUFS", G_STRINGIFY(AIR_CAP_BUFS_DEF)));
     const char *enc = env_or("ML_AIR_ENC",
                              "v4l2h265enc output-io-mode=dmabuf-import "
                              "extra-controls=\"controls,video_gop_size=65535\"");
@@ -1196,6 +2145,11 @@ int main(int argc, char **argv)
     g_notx = (getenv("ML_AIR_NOTX") != NULL);
     g_bench_free = (getenv("ML_AIR_BENCH_FREE") != NULL);
     g_bench_fps = fps > 0 ? fps : 60;
+    g_cap_fps = fps;
+    g_cap_inflight_max = atoi(env_or("ML_AIR_INFLIGHT", G_STRINGIFY(AIR_CAP_INFLIGHT_DEF)));
+    if (g_cap_inflight_max < 1) {
+        g_cap_inflight_max = 1;
+    }
 
     if (bench != NULL && *bench == '\0') {
         bench = NULL;
@@ -1220,6 +2174,12 @@ int main(int argc, char **argv)
      * encoder has frames in flight races the wave5 firmware (corrupt output or a VCPU watchdog,
      * HW-confirmed). ML_AIR_NO_STAGGER restores the concurrent bring-up for diagnostics. */
     g_stagger = (getenv("ML_AIR_NO_STAGGER") == NULL);
+    /* Camera mode drives the encoders directly; ML_AIR_GST=1 falls back to GStreamer,
+     * which cannot state the capture stride and therefore shears the picture. */
+    g_enc_direct = (camera != NULL && getenv("ML_AIR_GST") == NULL);
+    for (int i = 0; i < AIR_NCHN; i++) {
+        g_tile[i].enc_fd = -1;
+    }
     gst_init(&argc, &argv);
 
     g_recycle_quark = g_quark_from_static_string("air-recycle");
@@ -1260,6 +2220,18 @@ int main(int argc, char **argv)
         g_tile[1].active = (only == NULL || only[0] == '\0' || only[0] == '1');
     }
 
+    /* ML_AIR_COPY names the tile fed by copy instead of by sharing the capture buffer, so the two
+     * encoder instances no longer read overlapping ranges of one allocation. That is the isolation
+     * test for the watchdog the second instance hits under full zero-copy, and the fallback if the
+     * firmware turns out not to take aliased source windows: it keeps half the copy saving. */
+    {
+        const char *copy = getenv("ML_AIR_COPY");
+
+        if (copy != NULL && (copy[0] == '0' || copy[0] == '1')) {
+            g_tile[copy[0] - '0'].copy = 1;
+        }
+    }
+
     /* ML_AIR_SAMEH runs both concurrent instances at the SAME geometry (both 560) to test whether
      * the dual-instance corruption is specific to mismatched (560 vs 552) geometry or affects any
      * two concurrent encodes. tile1 then covers source rows 520..1079. */
@@ -1296,7 +2268,10 @@ int main(int argc, char **argv)
         t->sent = 0;
         t->dropped = 0;
 
-        if (air_pool_init(t, pool_want) < AIR_POOL_MIN) {
+        /* The camera path shares capture buffers, so it allocates no tile buffers at all and
+         * the whole mmz pool stays with the two encoder instances. A tile named by ML_AIR_COPY is
+         * the exception: it is fed by copy and needs its pool back. */
+        if ((camera == NULL || t->copy) && air_pool_init(t, pool_want) < AIR_POOL_MIN) {
             g_printerr("[ml-air-video] tile %d: dma-heap pool alloc failed (need %d, got %d)\n",
                        i, AIR_POOL_MIN, t->pool_n);
             return 1;
@@ -1325,7 +2300,7 @@ int main(int argc, char **argv)
     for (int i = 0; i < AIR_NCHN; i++) {
         GstBus *ebus = NULL;
 
-        if (!g_tile[i].active) {
+        if (!g_tile[i].active || g_enc_direct) {
             enc_pipe[i] = NULL;
             continue;
         }
@@ -1354,22 +2329,12 @@ int main(int argc, char **argv)
      * frame and the encoder then reads it mid-overwrite.
      */
     src_pipe = NULL;
-    if (bench == NULL) {
-        if (camera != NULL) {
-            snprintf(desc, sizeof desc,
-                     "v4l2src device=%s io-mode=mmap ! "
-                     "video/x-raw,format=I420,width=%d,height=%d ! "
-                     "videorate drop-only=true ! "
-                     "video/x-raw,framerate=%d/1 ! "
-                     "appsink name=src sync=false max-buffers=4 drop=true",
-                     camera, AIR_COMP_W, AIR_COMP_H, fps);
-        } else {
-            snprintf(desc, sizeof desc,
-                     "videotestsrc is-live=true pattern=%s ! "
-                     "video/x-raw,format=I420,width=%d,height=%d,framerate=%d/1 ! "
-                     "appsink name=src sync=false max-buffers=4 drop=true",
-                     pattern, AIR_COMP_W, AIR_COMP_H, fps);
-        }
+    if (bench == NULL && camera == NULL) {
+        snprintf(desc, sizeof desc,
+                 "videotestsrc is-live=true pattern=%s ! "
+                 "video/x-raw,format=I420,width=%d,height=%d,framerate=%d/1 ! "
+                 "appsink name=src sync=false max-buffers=4 drop=true",
+                 pattern, AIR_COMP_W, AIR_COMP_H, fps);
 
         src_pipe = gst_parse_launch(desc, &err);
         if (src_pipe == NULL) {
@@ -1400,11 +2365,13 @@ int main(int argc, char **argv)
                    g_bench_free ? "unpaced" : "paced to ML_AIR_FPS",
                    g_notx ? "encode-only (no transmit)" : "transmitting", g_bench_secs);
     } else if (g_notx) {
-        g_printerr("[ml-air-video] %dx%d @ %d fps, two H.265 tiles, encode-only (no transmit)\n",
-                   AIR_COMP_W, AIR_COMP_H, fps);
+        g_printerr("[ml-air-video] %dx%d @ %d fps from %s, two H.265 tiles, "
+                   "encode-only (no transmit)\n",
+                   AIR_COMP_W, AIR_COMP_H, fps, camera != NULL ? camera : "videotestsrc");
     } else {
-        g_printerr("[ml-air-video] %dx%d @ %d fps, two H.265 tiles -> %s:%d\n",
-                   AIR_COMP_W, AIR_COMP_H, fps, dst, port);
+        g_printerr("[ml-air-video] %dx%d @ %d fps from %s, two H.265 tiles -> %s:%d\n",
+                   AIR_COMP_W, AIR_COMP_H, fps, camera != NULL ? camera : "videotestsrc",
+                   dst, port);
     }
 
     for (int i = 0; i < AIR_NCHN; i++) {
@@ -1415,6 +2382,34 @@ int main(int argc, char **argv)
 
     if (bench != NULL) {
         feeder = g_thread_new("air-bench", air_bench_feed, NULL);
+    } else if (camera != NULL) {
+        /* Opened here rather than with the rest of the setup so the node streams for as short a
+         * time as possible before anything dequeues: buffers completed while nothing is reading
+         * are stale by the time the first DQBUF returns them. */
+        if (air_cap_open(camera, cap_want) != 0) {
+            close(sock);
+            return 1;
+        }
+
+        /* After air_cap_open: the encoders are configured from the capture node's strides,
+         * which is the entire point of this path, so they cannot be opened before it. */
+        if (g_enc_direct) {
+            for (int i = 0; i < AIR_NCHN; i++) {
+                if (!g_tile[i].active) {
+                    continue;
+                }
+                if (air_enc_open(&g_tile[i], env_or("ML_AIR_ENC_NODE", "/dev/video2"), fps) != 0) {
+                    for (int j = 0; j < AIR_NCHN; j++) {
+                        air_enc_close(&g_tile[j]);
+                    }
+                    air_cap_close();
+                    close(sock);
+                    return 1;
+                }
+            }
+        }
+
+        feeder = g_thread_new("air-cap", air_cap_feed, NULL);
     } else {
         gst_element_set_state(src_pipe, GST_STATE_PLAYING);
     }
@@ -1423,8 +2418,15 @@ int main(int argc, char **argv)
 
     if (feeder != NULL) {
         g_bench_stop = 1;
+        g_cap_stop = 1;
         g_thread_join(feeder);
     }
+
+    for (int i = 0; i < AIR_NCHN; i++) {
+        air_enc_close(&g_tile[i]);
+    }
+
+    air_cap_close();
 
     if (src_pipe != NULL) {
         gst_element_set_state(src_pipe, GST_STATE_NULL);
