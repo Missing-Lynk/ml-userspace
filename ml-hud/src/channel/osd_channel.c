@@ -45,6 +45,8 @@ int osd_decode_periodic(const unsigned char *payload, int payload_len, osd_perio
         return -1;
     }
 
+    out->arm_flag = payload[OSD10K_PERIODIC_OFF_ARM_FLAG];
+    out->mah_drawn_x10 = read_u16(payload, OSD10K_PERIODIC_OFF_MAH_X10);
     out->voltage_mV = read_u16(payload, OSD10K_PERIODIC_OFF_VOLTAGE_MV);
     return 0;
 }

@@ -85,14 +85,28 @@ static inline int mp_stb_ack(uint8_t *frame, uint32_t stamp)
  * goggle parses them at the offsets in ml-hud/src/channel/osd_proto.h. */
 #define MP_TRAILER_LEN     12
 
-/* 0x11 periodic status: 6-byte body, u16 voltage_mV at body offset 4 (the rest zero). */
+/* 0x11 periodic status: 6-byte body relayed from the FC link. A bench air unit still sends this
+ * frame with ADC voltage fallback while FC telemetry is stale. */
 #define MP_STATUS_B_TOTAL  (MP_OFF_BODY + 6 + MP_TRAILER_LEN)   /* 38 */
-static inline int mp_status_periodic(uint8_t *frame, uint16_t voltage_mv, uint32_t stamp)
+static inline int mp_status_periodic(uint8_t *frame, uint8_t arm_flag, uint16_t mah_drawn_x10,
+                                     uint16_t voltage_mv, uint32_t stamp)
 {
     mp_stamp(frame, MP_STATUS_B_TOTAL, MP_STATUS_B, stamp, 6);
+    frame[MP_OFF_BODY] = arm_flag;
+    memcpy(frame + MP_OFF_BODY + 2, &mah_drawn_x10, sizeof mah_drawn_x10);
     memcpy(frame + MP_OFF_BODY + 4, &voltage_mv, sizeof voltage_mv);
 
     return MP_STATUS_B_TOTAL;
+}
+
+/* 0x10 MSP DisplayPort canvas frame. `canvas` is the vendor-packed body generated from the FC's
+ * MSP_DISPLAYPORT drawScreen update. */
+static inline int mp_msp_canvas(uint8_t *frame, const uint8_t *canvas, uint8_t canvas_len,
+                                uint32_t stamp)
+{
+    mp_stamp(frame, MP_OFF_BODY + canvas_len + MP_TRAILER_LEN, MP_MSP, stamp, canvas_len);
+    memcpy(frame + MP_OFF_BODY, canvas, canvas_len);
+    return MP_OFF_BODY + canvas_len + MP_TRAILER_LEN;
 }
 
 /* 0x09 version/info status: 128-byte body carrying the hw/fw version strings, the battery voltage,

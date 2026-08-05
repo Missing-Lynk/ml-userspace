@@ -24,6 +24,6 @@ long now_ms(void);
 
 /* Air (TX) role entry point (--role air); hw_version is the board's hardware version string for the
  * status frame (NULL selects the default). Returns when g_run clears. */
-void air_main(const char *hw_version);
+void air_main(const char *hw_version, const char *fc_tty);
 
 #endif /* ML_LINKD_H */

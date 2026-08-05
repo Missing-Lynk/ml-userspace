@@ -28,7 +28,7 @@ enum {
 enum osd10k_msg {
     OSD10K_MSG_VERSION  = 0x09,   /* 128-byte payload: hw/fw strings, voltage, link metrics */
     OSD10K_MSG_OSD      = 0x10,   /* variable payload: MSP DisplayPort canvas */
-    OSD10K_MSG_PERIODIC = 0x11,   /* 6-byte payload: voltage only */
+    OSD10K_MSG_PERIODIC = 0x11,   /* 6-byte payload: FC arm/mAh/voltage */
 };
 
 /* Header field offsets (little-endian u32). */
@@ -40,6 +40,8 @@ enum {
 
 /* type 0x11 (periodic) payload: */
 enum {
+    OSD10K_PERIODIC_OFF_ARM_FLAG   = 0,     /* u8 */
+    OSD10K_PERIODIC_OFF_MAH_X10    = 2,     /* u16 */
     OSD10K_PERIODIC_OFF_VOLTAGE_MV = 4,     /* u16 */
 };
 
@@ -61,6 +63,8 @@ typedef struct {
 
 /** @brief Decoded type 0x11 (periodic) frame. */
 typedef struct {
+    uint8_t  arm_flag;
+    uint16_t mah_drawn_x10;
     uint16_t voltage_mV;
 } osd_periodic_t;
 

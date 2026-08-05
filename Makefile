@@ -1,9 +1,10 @@
 # Build orchestrator for the userspace components.
 #
 #   make            everything (daemons, gstreamer + static pipeline, hud)
-#   make daemons    the static musl aarch64 daemons (ml-linkd, ml-ledd) -> build/
+#   make daemons    the static musl aarch64 daemons/tools (ml-linkd, ml-ledd, ...) -> build/
 #   make linkd      just ml-linkd
 #   make ledd       just ml-ledd
+#   make msp-echo   just the passive FC UART test tool
 #   make gst        the gstreamer pipeline/HUD binaries (delegates to gstreamer/src/build.sh)
 #   make gst-static the standalone static ml-pipeline for the rootfs (build-static.sh)
 #   make hud        the LVGL HUD binary (delegates to its CMake build)
@@ -39,10 +40,11 @@ DEV_HAS_FC_LINK  ?= 0
 
 all: daemons gst gst-static hud font
 
-daemons:    $(BUILD)/ml-linkd $(BUILD)/ml-ledd $(BUILD)/ml-rf-bringup
+daemons:    $(BUILD)/ml-linkd $(BUILD)/ml-ledd $(BUILD)/ml-rf-bringup $(BUILD)/ml-msp-echo
 linkd:      $(BUILD)/ml-linkd
 ledd:       $(BUILD)/ml-ledd
 rf-bringup: $(BUILD)/ml-rf-bringup
+msp-echo:   $(BUILD)/ml-msp-echo
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -61,6 +63,12 @@ $(eval $(call daemon_rule,ml-linkd,,-pthread))
 $(BUILD)/ml-linkd: ml-linkd/version.h
 $(eval $(call daemon_rule,ml-ledd,linux-headers,))
 $(eval $(call daemon_rule,ml-rf-bringup,linux-headers,))
+
+$(BUILD)/ml-msp-echo: ml-msp-echo/ml-msp-echo.c ml-linkd/ml-msp.c ml-linkd/ml-msp.h | $(BUILD)
+	docker run --rm --platform linux/arm64 -v $(REPO):/w -w /w \
+	  alpine:3.24 sh -euc 'apk add -q build-base; \
+	    gcc -O2 -Wall -static -o build/ml-msp-echo ml-msp-echo/ml-msp-echo.c ml-linkd/ml-msp.c'
+	@ls -la $@
 
 gst:
 	./gstreamer/src/build.sh
@@ -83,4 +91,4 @@ assets/osd-fonts/font_BTFL_hd.png: assets/osd-fonts/betaflight.mcm assets/osd-fo
 clean:
 	rm -rf $(BUILD) gstreamer/build ml-hud/build assets/osd-fonts/font_BTFL_hd.png
 
-.PHONY: all daemons linkd ledd rf-bringup gst gst-static hud font clean
+.PHONY: all daemons linkd ledd rf-bringup msp-echo gst gst-static hud font clean

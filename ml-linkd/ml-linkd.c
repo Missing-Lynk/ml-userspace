@@ -34,7 +34,7 @@
  * Static binary, runs on a bare slot-B boot.
  *
  * SAFETY: userspace only, sends exactly the frames the vendor stack sends; slot B only.
- * Usage: ml-linkd [-d /dev/artosyn_sdio] [--role air|rx] [--no-gate] [-v]
+ * Usage: ml-linkd [-d /dev/artosyn_sdio] [--role air|rx] [--fc-tty /dev/ttyS1] [--no-gate] [-v]
  */
 #define _GNU_SOURCE                       /* pthread_timedjoin_np */
 #include <stdio.h>
@@ -1714,6 +1714,7 @@ int main(int argc, char **argv)
 {
     const char *node = DEV_NODE;
     const char *hw_version = NULL;
+    const char *fc_tty = NULL;
     pthread_t reader_th, udp_th;
     struct sigaction sa;
     uint8_t frame[64], ff02[19];
@@ -1725,6 +1726,8 @@ int main(int argc, char **argv)
             node = argv[++i];
         } else if (!strcmp(argv[i], "--hw-version") && i + 1 < argc) {
             hw_version = argv[++i];
+        } else if (!strcmp(argv[i], "--fc-tty") && i + 1 < argc) {
+            fc_tty = argv[++i];
         } else if (!strcmp(argv[i], "--no-gate")) {
             g_no_gate = 1;
         } else if (!strcmp(argv[i], "--scan-probe")) {
@@ -1744,7 +1747,7 @@ int main(int argc, char **argv)
         } else {
             fprintf(stderr,
                     "usage: ml-linkd [-d /dev/artosyn_sdio] [--role air|rx] [--hw-version STR] "
-                    "[--no-gate] [--scan-probe] [-v]\n");
+                    "[--fc-tty /dev/ttyS1] [--no-gate] [--scan-probe] [-v]\n");
             return 2;
         }
     }
@@ -1760,7 +1763,7 @@ int main(int argc, char **argv)
 
     /* Air unit (--role air): UDP telemetry TX on sdio0, handled entirely in ml-linkd-air.c. */
     if (g_role_air) {
-        air_main(hw_version);
+        air_main(hw_version, fc_tty);
         return 0;
     }
 
