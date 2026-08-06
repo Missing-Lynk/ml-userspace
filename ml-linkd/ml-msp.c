@@ -16,6 +16,9 @@
 #define MSP_BATTERY_STATE   0x82
 #define MSP_DISPLAYPORT     0xb6
 
+/* Both intervals are the vendor's, from libvtxfc's poller; the battery poll is deliberately 0.2 Hz.
+ * ML_MSP_FRESH_MS is sized against this cadence, so the two move together. Polling faster is a
+ * parked beyond-vendor improvement, see plans/beyond-vendor-backlog.md. */
 #define MSP_STATUS_MS       200
 #define MSP_BATTERY_MS      5000
 
