@@ -42,7 +42,7 @@
  *   ML_AIR_COPY       0|1: feed that tile by copy instead of by sharing the capture buffer,
  *                     so the two encoder instances no longer read one allocation (camera only)
  *   ML_AIR_ENC        encoder element + props     (default v4l2h265enc dmabuf-import, large GOP)
- *   ML_AIR_BITRATE    per-tile encoder bitrate    (default 5000000)
+ *   ML_AIR_BITRATE    per-tile encoder bitrate    (default 4000000, half the vendor total)
  *   ML_AIR_VBV        encoder VBV window in ms    (default derived from bitrate)
  *   ML_AIR_CTRL       live control socket          (default /run/missinglynk/air-video.sock)
  *                     commands: bitrate <bps> [vbv-ms], fps <fps>,
@@ -2009,7 +2009,11 @@ static int air_enc_open(struct air_tile *t, const char *dev, int fps)
     struct v4l2_format f;
     struct v4l2_requestbuffers rb;
     struct v4l2_streamparm sp;
-    int bitrate = t->enc_bitrate > 0 ? t->enc_bitrate : atoi(env_or("ML_AIR_BITRATE", "5000000"));
+    /* Vendor AR_8030_TX_GetBitRate() derives the encoder target from live RF throughput
+     * (throughput * Ar803xThroutputRate, capped at ArMaxBitRate) and returns 8000 kbps when
+     * throughput reads zero. 8000 kbps is the total across both tiles, so half it here. Link
+     * adaptation should drive the live control path rather than move this default. */
+    int bitrate = t->enc_bitrate > 0 ? t->enc_bitrate : atoi(env_or("ML_AIR_BITRATE", "4000000"));
     int vbv = t->enc_vbv > 0 ? t->enc_vbv : atoi(env_or("ML_AIR_VBV", "0"));
     enum v4l2_buf_type otype = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
     enum v4l2_buf_type ctype = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
