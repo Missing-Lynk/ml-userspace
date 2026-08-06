@@ -25,6 +25,20 @@
 #define BTFL_OSD_ROWS 20
 
 /**
+ * @brief Note a glyph that fell outside the grid, reporting the first occurrence.
+ *
+ * Nothing establishes 53x20 on the wire: it is Betaflight-side configuration (osd_canvas_width /
+ * osd_canvas_height), and neither the vendor air unit nor ours ever sends MSP_SET_OSD_CANVAS. An FC
+ * set to a different canvas therefore renders clipped or shrunk into a corner, and dropping those
+ * cells silently makes that look like a rendering bug rather than a grid mismatch. Call this from
+ * every glyph sink's reject path; it logs once and then only counts.
+ *
+ * @param row Row the canvas asked for (may be negative or past the grid).
+ * @param col Column the canvas asked for.
+ */
+void btfl_osd_note_offgrid(int row, int col);
+
+/**
  * @brief Load the BTFL OSD glyph font. If @p font_path is NULL, the HUD_MSP_FONT env override is
  *        tried first, then a built-in search list (repo asset, then device ship paths).
  * @return 0 on success, -1 if no font could be loaded (updates then no-op).

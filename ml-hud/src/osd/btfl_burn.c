@@ -60,6 +60,9 @@ static void grid_sink(void *ctx, int row, int col, int attr, unsigned char glyph
     (void) attr;
     if (row >= 0 && row < BTFL_OSD_ROWS && col >= 0 && col < BTFL_OSD_COLS) {
         g_new[row][col] = glyph;
+    } else {
+        /* Shared with the display path: a mismatch here is baked into DVR recordings. */
+        btfl_osd_note_offgrid(row, col);
     }
 }
 

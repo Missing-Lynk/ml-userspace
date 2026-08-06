@@ -3,6 +3,7 @@
 #include "msp_font.h"
 #include "msp_canvas.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -131,6 +132,37 @@ static void grid_sink(void *ctx, int row, int col, int attr, unsigned char glyph
     (void) attr;
     if (row >= 0 && row < BTFL_OSD_ROWS && col >= 0 && col < BTFL_OSD_COLS) {
         g_new[row][col] = glyph;
+    } else {
+        btfl_osd_note_offgrid(row, col);
+    }
+}
+
+/* See btfl_osd.h. The running maxima are the FC's real grid, observed rather than assumed, which is
+ * the first thing worth knowing when the canvas does not match. */
+void btfl_osd_note_offgrid(int row, int col)
+{
+    static unsigned long dropped;
+    static int max_row = -1;
+    static int max_col = -1;
+    static bool reported;
+
+    dropped++;
+    if (row > max_row) {
+        max_row = row;
+    }
+
+    if (col > max_col) {
+        max_col = col;
+    }
+
+    if (!reported) {
+        reported = true;
+        fprintf(stderr,
+                "btfl-osd: canvas cell (row %d, col %d) is outside the %dx%d grid; the FC's canvas "
+                "does not match. Set osd_canvas_width/osd_canvas_height on the FC to %d/%d. "
+                "Further off-grid cells are counted, not logged (max seen so far row %d, col %d).\n",
+                row, col, BTFL_OSD_COLS, BTFL_OSD_ROWS, BTFL_OSD_COLS, BTFL_OSD_ROWS,
+                max_row, max_col);
     }
 }
 

@@ -175,12 +175,10 @@ static void emit_canvas(struct ml_msp *msp)
 
     for (uint8_t i = 0; i < msp->record_count; i++) {
         uint8_t text_len = msp->records[record_start + 2];
-        uint8_t len = (uint8_t)(3 + text_len);
+        /* Declared length spans the sub-command, row, col, attr and text: 4 + text_len, for every
+         * record including the last. The trailing chain byte is not counted. */
+        uint8_t len = (uint8_t)(4 + text_len);
         size_t next = record_start + 4 + text_len;
-
-        if (i + 1 < msp->record_count) {
-            len++;
-        }
 
         if (p + (i == 0 ? 1 : 0) + 2 + len > sizeof plain) {
             records_clear(msp);
@@ -199,12 +197,7 @@ static void emit_canvas(struct ml_msp *msp)
         memcpy(plain + p, msp->records + record_start + 4, text_len);
         p += text_len;
         if (i + 1 < msp->record_count) {
-            uint8_t next_len = (uint8_t)(3 + msp->records[next + 2]);
-            if (i + 2 < msp->record_count) {
-                next_len++;
-            }
-
-            plain[p++] = next_len;
+            plain[p++] = (uint8_t)(4 + msp->records[next + 2]);
         }
 
         record_start = next;
@@ -262,6 +255,9 @@ static void process_frame(struct ml_msp *msp, uint8_t cmd, const uint8_t *payloa
     }
 }
 
+/* One-shot latch for the MSP v2 sighting below, so a desynced link cannot flood the log. */
+static int g_saw_msp_v2;
+
 static void scan_frames(struct ml_msp *msp, long now_ms)
 {
     size_t pos = 0;
@@ -272,6 +268,19 @@ static void scan_frames(struct ml_msp *msp, long now_ms)
         uint8_t checksum;
 
         if (msp->rx[pos] != '$' || msp->rx[pos + 1] != 'M' || msp->rx[pos + 2] != '>') {
+            /* Everything that is not a v1 reply preamble is discarded a byte at a time. A literal
+             * "$X" is MSP v2, which neither Betaflight nor INAV should ever send us: they push
+             * DisplayPort as v1 unconditionally and answer a request in the version it arrived in,
+             * and we only ever ask in v1. Report it once rather than silently dropping every frame,
+             * because the symptom otherwise is a blank OSD and a frozen voltage, which reads as a
+             * wiring fault. A v1 frame carrying command 255 is V2-over-V1 encapsulation, not this:
+             * it matches the preamble above and is dropped harmlessly by process_frame. */
+            if (msp->rx[pos] == '$' && msp->rx[pos + 1] == 'X' && !g_saw_msp_v2) {
+                g_saw_msp_v2 = 1;
+                fprintf(stderr, "ml-msp: MSP v2 ($X) frame on the FC UART, ignored; "
+                                "this parser is v1 only\n");
+            }
+
             pos++;
             continue;
         }
@@ -334,6 +343,13 @@ void ml_msp_service(struct ml_msp *msp, long now_ms)
 
 int ml_msp_fc_voltage_mv(const struct ml_msp *msp, long now_ms)
 {
+    /* 1800 is the vendor's 0x708, from AR_LOWDELAY_TX_SYSCTRL_GetVoltage. It is an OVERRIDE
+     * THRESHOLD, not a plausibility floor: above it the FC value replaces the SoC ADC reading,
+     * below it the ADC stands. Reading it as a floor is a mistake this project has already made
+     * once and had to correct in the telemetry docs, so do not "fix" it into a clamp.
+     *
+     * The staleness test is ours, not the vendor's: theirs latches the last FC value forever, so a
+     * disconnected FC freezes the displayed voltage instead of falling back. */
     if (msp->status.voltage_mv > 1800 &&
         now_ms - msp->status.last_battery_ms <= ML_MSP_FRESH_MS) {
         return msp->status.voltage_mv;

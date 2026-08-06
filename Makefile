@@ -9,6 +9,7 @@
 #   make gst-static the standalone static ml-pipeline for the rootfs (build-static.sh)
 #   make hud        the LVGL HUD binary (delegates to its CMake build)
 #   make font       generate the BTFL OSD glyph atlas from betaflight.mcm (needs python3 + Pillow)
+#   make check      host-side tests (no device, no docker, no hardware)
 #   make clean      remove all build output (build/, gstreamer/build, ml-hud/build, font atlas)
 #
 # The daemons build into build/ at the repo root. gstreamer and hud own their build
@@ -63,6 +64,18 @@ $(eval $(call daemon_rule,ml-linkd,,-pthread))
 $(BUILD)/ml-linkd: ml-linkd/version.h
 $(eval $(call daemon_rule,ml-ledd,linux-headers,))
 $(eval $(call daemon_rule,ml-rf-bringup,linux-headers,))
+
+# Host tests. Built with the host compiler and run here, not cross-built: they exercise pure logic
+# against checked-in captures, so they need no device, no docker and no hardware.
+CHECK_CFLAGS := -O1 -Wall -Wextra -Werror
+
+.PHONY: check
+check: $(BUILD)/msp-canvas-roundtrip
+	$(BUILD)/msp-canvas-roundtrip
+
+$(BUILD)/msp-canvas-roundtrip: tests/msp-canvas-roundtrip.c ml-linkd/ml-msp.c \
+                               ml-hud/src/osd/msp_canvas.c | $(BUILD)
+	gcc $(CHECK_CFLAGS) -o $@ $^
 
 $(BUILD)/ml-msp-echo: ml-msp-echo/ml-msp-echo.c ml-linkd/ml-msp.c ml-linkd/ml-msp.h | $(BUILD)
 	docker run --rm --platform linux/arm64 -v $(REPO):/w -w /w \
