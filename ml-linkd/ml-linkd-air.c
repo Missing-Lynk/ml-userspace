@@ -4,6 +4,9 @@
  * The air role speaks UDP on sdio0: it reads the battery voltage and SoC temperature over IIO and
  * transmits the vendor's :10000 status frames to the goggle at 10.0.0.1, and answers the goggle's
  * :20001 identity probe. Association is chip-autonomous from the artosyn_sdio insmod config.
+ *
+ * Under --rate-adapt it also runs the encoder rate governor (see the MCS section below), which is
+ * the only part of the role that touches the bb control socket.
  */
 #define _GNU_SOURCE                       /* strnlen (via mp-cmd.h) */
 #include <stdio.h>
@@ -15,10 +18,15 @@
 #include <time.h>
 #include <math.h>
 #include <dirent.h>
+#include <errno.h>
+#include <poll.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 
+#include "bb-cmd.h"
 #include "ml-linkd.h"
 #include "ml-msp.h"
 #include "mp-cmd.h"
@@ -184,6 +192,306 @@ static int air_bind_local(int sock, int port)
     return bind(sock, (struct sockaddr *)&local, sizeof local);
 }
 
+/* ---------------------------------------------------------------------------------------------
+ * MCS-driven encoder rate adaptation.
+ *
+ * The vendor air recomputes its encoder target from the live RF link every time the MCS changes
+ * (AR_FSM_TX_ProcessMcsChange @0x428b88 on a decrease, AR_FSM_TX_ProcessMcsChangeFinished @0x428fc8
+ * on an increase), derives the number in AR_8030_TX_GetBitRate @0x4349b0 and applies it with
+ * AR_LDRT_TX_VENC_SetRcParam. We reproduce the derivation and the drop-fast/rise-slow asymmetry,
+ * poll GET_MCS instead of consuming an FSM event, and apply through ml-air-video's control socket.
+ * Full RE and the offset-to-JSON-key mapping: plans/air-mcs-rate-adaptation.md.
+ * ------------------------------------------------------------------------------------------- */
+
+#define AIR_BB_NODE            "/dev/artosyn_sdio"
+#define AIR_CTRL_SOCK          "/run/missinglynk/air-video.sock"
+
+/* Mirrors of the vendor's cfg_transmedium.json knobs, values as captured from a stock air unit
+ * (archive/out/air-probe/cfg_transmedium.json). Ar803xMinMcs is -1 there and MCS is never negative,
+ * so the low-MCS branch is dead on a stock unit; it is kept because the constant is the switch. */
+#define AIR_RATE_THROUGHPUT_RATE  0.7f      /* Ar803xThroutputRate */
+#define AIR_RATE_LOW_MCS_RATE     0.8f      /* f32Ar803xThroutputRateLowMcs */
+#define AIR_RATE_MAX_KBPS         20000     /* ArMaxBitRate */
+#define AIR_RATE_MIN_MCS          (-1)      /* Ar803xMinMcs */
+#define AIR_RATE_FALLBACK_KBPS    8000      /* the vendor's "use default bitrate 8Mbps" */
+#define AIR_RATE_RATIO_PCT        100       /* runtime ratio; SetThroutputRate's default, never set */
+
+/* The derived rate is a TOTAL across the two tiles the 1080p frame is split into; the control
+ * socket takes a per-tile value. */
+#define AIR_RATE_TILES            2
+
+#define AIR_MCS_POLL_MS       200           /* GET_MCS cadence */
+#define AIR_RATE_RISE_MS      1000          /* a higher MCS must hold this long before it is acted on */
+#define AIR_RATE_OPEN_RETRY_MS 5000         /* bb-socket open retry cadence */
+#define AIR_CTRL_TIMEOUT_MS   200           /* control-socket reply budget */
+#define AIR_PROBE_DUMPS       20            /* raw GET_MCS replies to hexdump before going quiet */
+
+struct air_rate {
+    enum ml_rate_mode mode;
+    int fd;                 /* bb socket, non-blocking; -1 until it opens */
+    uint32_t seq;
+    long last_poll_ms;
+    long last_open_ms;
+    int mcs;                /* last acted-on MCS, -1 = no sample yet */
+    int pending_mcs;        /* higher MCS waiting out the settle window, -1 = none */
+    long pending_since_ms;
+    int applied_bps;        /* per-tile bps last pushed, 0 = none */
+    int warned_open;
+    int warned_ctrl;
+    int probe_dumped;       /* raw reply hexdumps emitted so far (capped, see AIR_PROBE_DUMPS) */
+};
+
+/* The vendor derivation, kept in its original shape: the integer divide by 100 happens BEFORE the
+ * multiply, so the throughput input is quantised to 100 kbps steps. Returns a total in kbps. */
+static int air_rate_total_kbps(int mcs, int throughput_kbps)
+{
+    int kbps;
+
+    if (throughput_kbps < 0) {
+        throughput_kbps = 0;
+    }
+
+    if (AIR_RATE_MIN_MCS < mcs) {
+        kbps = (int)((float)((throughput_kbps / 100) * AIR_RATE_RATIO_PCT)
+                     * AIR_RATE_THROUGHPUT_RATE);
+    } else {
+        kbps = (int)((float)throughput_kbps * AIR_RATE_LOW_MCS_RATE);
+    }
+
+    if (kbps > AIR_RATE_MAX_KBPS) {
+        kbps = AIR_RATE_MAX_KBPS;
+    }
+
+    return kbps != 0 ? kbps : AIR_RATE_FALLBACK_KBPS;
+}
+
+/* Push one per-tile bitrate to ml-air-video. Returns 0 when it answered "ok". */
+static int air_rate_send(int bps_per_tile)
+{
+    const char *path = getenv("ML_AIR_CTRL");
+    struct timeval tv = { .tv_sec = 0, .tv_usec = AIR_CTRL_TIMEOUT_MS * 1000 };
+    struct sockaddr_un addr;
+    char cmd[64];
+    char reply[128];
+    ssize_t n;
+    int len;
+    int fd;
+
+    if (path == NULL || path[0] == '\0') {
+        path = AIR_CTRL_SOCK;
+    }
+
+    if (strlen(path) >= sizeof addr.sun_path) {
+        return -1;
+    }
+
+    fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+        return -1;
+    }
+
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+
+    memset(&addr, 0, sizeof addr);
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, path, sizeof addr.sun_path - 1);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
+        close(fd);
+        return -1;
+    }
+
+    len = snprintf(cmd, sizeof cmd, "bitrate %d\n", bps_per_tile);
+    if (write(fd, cmd, (size_t)len) != len) {
+        close(fd);
+        return -1;
+    }
+
+    n = read(fd, reply, sizeof reply - 1);
+    close(fd);
+    if (n <= 0) {
+        return -1;
+    }
+
+    reply[n] = '\0';
+
+    return strncmp(reply, "ok ", 3) == 0 ? 0 : -1;
+}
+
+/* Derive the target for @p mcs / @p throughput_kbps and apply it, unless it is already applied or
+ * we are only probing. */
+static void air_rate_apply(struct air_rate *r, int mcs, int throughput_kbps, const char *why)
+{
+    int total_kbps = air_rate_total_kbps(mcs, throughput_kbps);
+    int bps = total_kbps * 1000 / AIR_RATE_TILES;
+
+    if (r->mode == ML_RATE_PROBE) {
+        printf(TAG " rate probe: %s mcs=%d throughput=%d kbps -> %d kbps total, %d bps/tile"
+               " (not applied)\n", why, mcs, throughput_kbps, total_kbps, bps);
+        fflush(stdout);
+        return;
+    }
+
+    if (bps == r->applied_bps) {
+        return;
+    }
+
+    if (air_rate_send(bps) != 0) {
+        if (!r->warned_ctrl) {
+            fprintf(stderr, TAG " rate: ml-air-video control socket not answering, retrying\n");
+            r->warned_ctrl = 1;
+        }
+        return;
+    }
+
+    r->warned_ctrl = 0;
+    r->applied_bps = bps;
+    printf(TAG " rate: %s mcs=%d throughput=%d kbps -> %d bps/tile (%d kbps total)\n",
+           why, mcs, throughput_kbps, bps, total_kbps);
+    fflush(stdout);
+}
+
+/* One decoded GET_MCS sample. The first sample seeds the baseline; after that a DROP is acted on
+ * immediately and a RISE only once the higher MCS has held for AIR_RATE_RISE_MS, which is what the
+ * vendor's split between MCS_CHANGE and MCS_CHANGE_FINISHED amounts to. A change in throughput
+ * alone does not move the rate - the vendor recomputes on MCS transitions only. */
+static void air_rate_sample(struct air_rate *r, int mcs, int throughput_kbps, long now)
+{
+    if (g_verbose) {
+        fprintf(stderr, TAG " mcs sample: mcs=%d throughput=%d kbps\n", mcs, throughput_kbps);
+    }
+
+    if (r->mcs < 0) {
+        r->mcs = mcs;
+        air_rate_apply(r, mcs, throughput_kbps, "baseline");
+        return;
+    }
+
+    if (mcs < r->mcs) {
+        r->mcs = mcs;
+        r->pending_mcs = -1;
+        air_rate_apply(r, mcs, throughput_kbps, "mcs drop");
+        return;
+    }
+
+    if (mcs == r->mcs) {
+        r->pending_mcs = -1;
+        return;
+    }
+
+    if (r->pending_mcs != mcs) {
+        r->pending_mcs = mcs;
+        r->pending_since_ms = now;
+        return;
+    }
+
+    if (now - r->pending_since_ms >= AIR_RATE_RISE_MS) {
+        r->mcs = mcs;
+        r->pending_mcs = -1;
+        air_rate_apply(r, mcs, throughput_kbps, "mcs rise");
+    }
+}
+
+/* Drain whatever the bb socket has and feed every GET_MCS reply to the sampler. Frames of any other
+ * class (the ch05 chip log in particular) are discarded: on the air unit nothing else reads this
+ * node. */
+static void air_rate_drain(struct air_rate *r, long now)
+{
+    struct pollfd pfd = { .fd = r->fd, .events = POLLIN };
+    uint8_t buf[4096];
+
+    while (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN) != 0) {
+        ssize_t n = read(r->fd, buf, sizeof buf);
+
+        if (n <= 0) {
+            return;
+        }
+
+        for (ssize_t i = 0; i + 18 < n; i++) {
+            const uint8_t *pay;
+            int plen;
+
+            if (buf[i] != 0xaa) {
+                continue;
+            }
+
+            plen = buf[i + 1] | (buf[i + 2] << 8);
+            if (plen < MCS_OFF_THROUGHPUT + 4 || i + 18 + plen >= n) {
+                continue;
+            }
+
+            if (buf[i + 18 + plen] != 0xbb || buf[i + 5] != BB_GET || buf[i + 8] != GET_MCS) {
+                continue;
+            }
+
+            pay = buf + i + 18;
+
+            if (r->mode == ML_RATE_PROBE && r->probe_dumped < AIR_PROBE_DUMPS) {
+                r->probe_dumped++;
+                printf(TAG " mcs reply (%d B):", plen);
+                for (int k = 0; k < plen; k++) {
+                    printf(" %02x", pay[k]);
+                }
+                printf("\n");
+                fflush(stdout);
+            }
+
+            air_rate_sample(r, (int)pay[MCS_OFF_INDEX] - MCS_INDEX_BIAS,
+                            (int)((uint32_t)pay[MCS_OFF_THROUGHPUT]
+                                  | ((uint32_t)pay[MCS_OFF_THROUGHPUT + 1] << 8)
+                                  | ((uint32_t)pay[MCS_OFF_THROUGHPUT + 2] << 16)
+                                  | ((uint32_t)pay[MCS_OFF_THROUGHPUT + 3] << 24)),
+                            now);
+        }
+    }
+}
+
+/* Service tick: open the bb socket if it is not up yet, poll GET_MCS on cadence, drain replies. */
+static void air_rate_service(struct air_rate *r, long now)
+{
+    uint8_t frame[32];
+    int len;
+
+    if (r->mode == ML_RATE_OFF) {
+        return;
+    }
+
+    if (r->fd < 0) {
+        if (r->last_open_ms != 0 && now - r->last_open_ms < AIR_RATE_OPEN_RETRY_MS) {
+            return;
+        }
+
+        r->last_open_ms = now;
+        r->fd = open(AIR_BB_NODE, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+        if (r->fd < 0) {
+            if (!r->warned_open) {
+                fprintf(stderr, TAG " rate: open(%s): %s, retrying\n",
+                        AIR_BB_NODE, strerror(errno));
+                r->warned_open = 1;
+            }
+            return;
+        }
+
+        printf(TAG " rate: opened %s (%s)\n", AIR_BB_NODE,
+               r->mode == ML_RATE_PROBE ? "probe, sends nothing" : "driving the encoder");
+        fflush(stdout);
+        r->warned_open = 0;
+    }
+
+    if (now - r->last_poll_ms >= AIR_MCS_POLL_MS) {
+        r->last_poll_ms = now;
+        len = bb_get(frame, GET_MCS, r->seq++);
+        if (len > 0 && write(r->fd, frame, (size_t)len) != len) {
+            fprintf(stderr, TAG " rate: GET_MCS write failed (%s), reopening\n", strerror(errno));
+            close(r->fd);
+            r->fd = -1;
+            return;
+        }
+    }
+
+    air_rate_drain(r, now);
+}
+
 /* The air role loop: transmit :10000 status telemetry to the goggle and answer its :20001 probe.
  * Sockets are (re)bound and the IIO providers (re)resolved each tick until sdio0 and the modules
  * are up, so it is safe to start before ml-rf-bringup has finished. */
@@ -211,8 +519,9 @@ static void air_send_canvas(const uint8_t *canvas, size_t len, void *ctx)
            (struct sockaddr *)tx->dst, sizeof *tx->dst);
 }
 
-void air_main(const char *hw_version, const char *fc_tty)
+void air_main(const char *hw_version, const char *fc_tty, enum ml_rate_mode rate_mode)
 {
+    struct air_rate rate = { .mode = rate_mode, .fd = -1, .mcs = -1, .pending_mcs = -1 };
     int status_sock = socket(AF_INET, SOCK_DGRAM, 0);
     int hello_sock = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in goggle_status, goggle_hello;
@@ -282,6 +591,7 @@ void air_main(const char *hw_version, const char *fc_tty)
         clock_gettime(CLOCK_MONOTONIC, &t);
         stamp_us = (uint32_t)(t.tv_sec * 1000000ULL + t.tv_nsec / 1000);
         ml_msp_service(&msp, now);
+        air_rate_service(&rate, now);
 
         /* 0x11 periodic (~6 Hz): FC status fields plus voltage with ADC fallback. */
         if (status_bound && now - last_b >= AIR_STATUS_B_IVL_MS) {
@@ -346,6 +656,10 @@ void air_main(const char *hw_version, const char *fc_tty)
     close(status_sock);
     close(hello_sock);
     ml_msp_close(&msp);
+
+    if (rate.fd >= 0) {
+        close(rate.fd);
+    }
 
     printf(TAG " role=air clean stop\n");
 }

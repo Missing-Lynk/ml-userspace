@@ -4,13 +4,21 @@ RF link daemon for the AR8030 link. One binary, two roles selected by `--role` (
 
 ## Air (TX) role (`--role air`)
 
-On the air unit ml-linkd owns no bb-socket control plane - association is autonomous from the `artosyn_sdio` insmod config, so the air role never opens `/dev/artosyn_sdio`. It speaks only UDP on `sdio0`:
+Association is autonomous from the `artosyn_sdio` insmod config, so by default the air role never opens `/dev/artosyn_sdio` and speaks only UDP on `sdio0` (the one exception is the rate governor below, which is off unless asked for):
 
 - Reads the two SoC sensors over IIO: battery voltage from the SAR ADC (`artosyn-adc`, channel 1, `in_voltage1_input` x the board divider) and the junction temperature from the SoC sensor (`temperature`, `in_temp_scale`). Both are resolved by IIO device name and retried until the modules have coldplugged.
 - Transmits the vendor's `:10000` status frames to the goggle (10.0.0.1): `0x11` periodic (voltage, ~6 Hz) and `0x09` version/info (hw/fw strings + voltage + temperature, ~1 Hz).
 - Answers the goggle's `:20001` identity probe (mirrors the 520-byte type-0 datagram back with `byte[0]=0x01`).
 
 The goggle's RX role republishes the received `0x09`/`0x11` frames on `telemetry.sock` as `MLM_T_STATUS`, so the HUD shows the air unit's voltage and temperature.
+
+### Encoder rate governor (`--rate-adapt`, off by default)
+
+Reproduces the vendor's MCS-driven encoder rate. It polls `GET_MCS` on the bb socket every 200 ms, derives a target from the reply's MCS and link throughput with the vendor's own formula (`quantise100(throughput_kbps) * Ar803xThroutputRate`, capped at `ArMaxBitRate`, 8000 kbps when throughput reads zero), halves it for the per-tile control, and pushes it to `ml-air-video` on `/run/missinglynk/air-video.sock`.
+
+It recomputes on MCS transitions only, not on throughput drift, and keeps the vendor's asymmetry: a drop in MCS is applied at once, a rise only after the higher MCS has held for a second. Frame rate and min QP are left alone - the vendor's shipped config makes both dead on the live path.
+
+`--rate-probe` runs the same poll and logs the raw reply, the decode and the target it *would* send, without touching the encoder. The `GET_MCS` reply layout is transcribed from the vendor's `bb_ioctl` path rather than captured from ours, so use `--rate-probe` on a new unit before `--rate-adapt`. Derivation and RE references: `plans/air-mcs-rate-adaptation.md`.
 
 ## Behavior
 
@@ -71,10 +79,10 @@ make        # everything (daemons, gstreamer, hud)
 ## Usage
 
 ```
-ml-linkd [-d /dev/artosyn_sdio] [--role air|rx] [--no-gate] [-v]
+ml-linkd [-d /dev/artosyn_sdio] [--role air|rx] [--no-gate] [--rate-adapt|--rate-probe] [-v]
 ```
 
-`--role air` runs the air-unit telemetry transmitter (see the Air role section); the default `rx` runs the goggle side documented below.
+`--role air` runs the air-unit telemetry transmitter (see the Air role section); the default `rx` runs the goggle side documented below. `--rate-adapt` / `--rate-probe` apply to the air role only.
 
 Foreground process. SIGINT/SIGTERM stop it cleanly (cadence stops, device closed, `link.sock` unlinked). `-v` logs every transmitted frame.
 

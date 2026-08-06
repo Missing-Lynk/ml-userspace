@@ -22,8 +22,17 @@ extern int g_verbose;                      /* -v */
 /* Monotonic milliseconds. */
 long now_ms(void);
 
+/* MCS-driven encoder rate adaptation on the air role. OFF is the default: the decode of the
+ * GET_MCS reply is transcribed from the vendor and has not been confirmed on our stack, so it must
+ * be observed with PROBE before it is allowed to move a flying encoder. */
+enum ml_rate_mode {
+    ML_RATE_OFF = 0,   /* do not open the bb socket at all */
+    ML_RATE_PROBE,     /* poll and log MCS/throughput/derived rate, send nothing */
+    ML_RATE_ON,        /* drive ml-air-video's control socket */
+};
+
 /* Air (TX) role entry point (--role air); hw_version is the board's hardware version string for the
  * status frame (NULL selects the default). Returns when g_run clears. */
-void air_main(const char *hw_version, const char *fc_tty);
+void air_main(const char *hw_version, const char *fc_tty, enum ml_rate_mode rate_mode);
 
 #endif /* ML_LINKD_H */

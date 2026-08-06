@@ -1715,6 +1715,7 @@ int main(int argc, char **argv)
     const char *node = DEV_NODE;
     const char *hw_version = NULL;
     const char *fc_tty = NULL;
+    enum ml_rate_mode rate_mode = ML_RATE_OFF;
     pthread_t reader_th, udp_th;
     struct sigaction sa;
     uint8_t frame[64], ff02[19];
@@ -1732,6 +1733,10 @@ int main(int argc, char **argv)
             g_no_gate = 1;
         } else if (!strcmp(argv[i], "--scan-probe")) {
             g_scan_probe = 1;
+        } else if (!strcmp(argv[i], "--rate-adapt")) {
+            rate_mode = ML_RATE_ON;
+        } else if (!strcmp(argv[i], "--rate-probe")) {
+            rate_mode = ML_RATE_PROBE;
         } else if (!strcmp(argv[i], "--role") && i + 1 < argc) {
             i++;
             if (!strcmp(argv[i], "air")) {
@@ -1747,7 +1752,8 @@ int main(int argc, char **argv)
         } else {
             fprintf(stderr,
                     "usage: ml-linkd [-d /dev/artosyn_sdio] [--role air|rx] [--hw-version STR] "
-                    "[--fc-tty /dev/ttyS1] [--no-gate] [--scan-probe] [-v]\n");
+                    "[--fc-tty /dev/ttyS1] [--no-gate] [--scan-probe] "
+                    "[--rate-adapt|--rate-probe] [-v]\n");
             return 2;
         }
     }
@@ -1763,7 +1769,7 @@ int main(int argc, char **argv)
 
     /* Air unit (--role air): UDP telemetry TX on sdio0, handled entirely in ml-linkd-air.c. */
     if (g_role_air) {
-        air_main(hw_version, fc_tty);
+        air_main(hw_version, fc_tty, rate_mode);
         return 0;
     }
 

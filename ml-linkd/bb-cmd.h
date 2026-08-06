@@ -43,11 +43,22 @@ enum bb_get_sel {
     GET_DISTANCE      = 0x05,   /* GetDistanceResult; reply u32 at +0 is a 1 kHz tick counter
                                  * (vendor-unused; OSD distance is Get1V1Info +0x08) */
     GET_MCS           = 0x06,   /* GetRxMcs / GetTxMcs / bitrate / framerate */
+                                /* reply layout: see MCS_OFF_* below */
     GET_POWER         = 0x08,   /* GetPower */
     GET_SCAN_RESULT   = 0x0a,   /* GET_ScanResult */
     GET_TIME          = 0x0c,
     GET_1V1INFO       = 0x73,   /* Get1V1Info (link stats) */
 };
+
+/* GET_MCS reply (8 bytes). Byte 0 is the MCS index biased by +2, and a u32 LE at +4 carries the
+ * link throughput in kbps. This is the AIR side's throughput source: the vendor air derives its
+ * encoder bitrate from exactly these two fields (AR_8030_TX_GetBitRate @0x4349b0,
+ * ar_lowdelay-full.txt:25233), while the goggle reads its own throughput from Get1V1Info +0x0c.
+ * Transcribed from the vendor's bb_ioctl path, NOT from a capture of ours - a first run must dump
+ * the raw payload and confirm the decode before anything drives an encoder from it. */
+#define MCS_OFF_INDEX       0x00
+#define MCS_INDEX_BIAS      2
+#define MCS_OFF_THROUGHPUT  0x04
 
 /* SET selectors (channel BB_SET). */
 enum bb_set_sel {
