@@ -1659,35 +1659,53 @@ static void air_enc_ctrl(struct air_tile *t, guint32 id, gint32 val, const char 
     }
 }
 
-static int air_enc_set_bitrate(struct air_tile *t, int bitrate, int vbv)
+/** Set one integer encoder control on a live instance, reporting the failure to the caller. */
+static int air_enc_set_int(struct air_tile *t, guint32 id, gint32 val, const char *name)
 {
     struct v4l2_ext_control c;
     struct v4l2_ext_controls cs;
 
-    if (!t->active || t->enc_fd < 0) {
-        return 0;
-    }
-
-    if (t->enc_bitrate == bitrate) {
-        t->enc_vbv = vbv;
-        return 0;
-    }
-
     memset(&c, 0, sizeof c);
     memset(&cs, 0, sizeof cs);
-    c.id = V4L2_CID_MPEG_VIDEO_BITRATE;
-    c.value = bitrate;
+    c.id = id;
+    c.value = val;
     cs.count = 1;
     cs.controls = &c;
     cs.which = V4L2_CTRL_WHICH_CUR_VAL;
 
     if (ioctl(t->enc_fd, VIDIOC_S_EXT_CTRLS, &cs) != 0) {
-        g_printerr("[ml-air-video] tile %d: live bitrate %d: %s\n",
-                   t->chn, bitrate, strerror(errno));
+        g_printerr("[ml-air-video] tile %d: live %s %d: %s\n",
+                   t->chn, name, val, strerror(errno));
+        return -1;
+    }
+
+    return 0;
+}
+
+static int air_enc_set_bitrate(struct air_tile *t, int bitrate)
+{
+    if (!t->active || t->enc_fd < 0 || t->enc_bitrate == bitrate) {
+        return 0;
+    }
+
+    if (air_enc_set_int(t, V4L2_CID_MPEG_VIDEO_BITRATE, bitrate, "bitrate") != 0) {
         return -1;
     }
 
     t->enc_bitrate = bitrate;
+    return 0;
+}
+
+static int air_enc_set_vbv(struct air_tile *t, int vbv)
+{
+    if (!t->active || t->enc_fd < 0 || t->enc_vbv == vbv) {
+        return 0;
+    }
+
+    if (air_enc_set_int(t, V4L2_CID_MPEG_VIDEO_VBV_SIZE, vbv, "vbv") != 0) {
+        return -1;
+    }
+
     t->enc_vbv = vbv;
     return 0;
 }
@@ -1742,21 +1760,29 @@ static int air_set_bitrate_all(int bitrate, int vbv)
         return -1;
     }
 
+    if (active == 0) {
+        g_printerr("[ml-air-video] live bitrate needs the direct V4L2 encoder path\n");
+        return -1;
+    }
+
     for (int i = 0; i < AIR_NCHN; i++) {
         if (g_tile[i].active && g_tile[i].enc_fd >= 0 &&
-            g_tile[i].enc_bitrate != bitrate) {
+            (g_tile[i].enc_bitrate != bitrate || g_tile[i].enc_vbv != vbv)) {
             changed++;
         }
-        if (air_enc_set_bitrate(&g_tile[i], bitrate, vbv) != 0) {
+        /* Bitrate before the window: going down, the pair is briefly the new low rate against
+         * the old short window, which is the constrained direction. The reverse order would
+         * leave the old high rate against the new long window and permit a burst. */
+        if (air_enc_set_bitrate(&g_tile[i], bitrate) != 0) {
+            ret = -1;
+        }
+        if (air_enc_set_vbv(&g_tile[i], vbv) != 0) {
             ret = -1;
         }
     }
 
-    if (active == 0) {
-        g_printerr("[ml-air-video] live bitrate needs the direct V4L2 encoder path\n");
-        ret = -1;
-    } else if (ret == 0) {
-        g_printerr("[ml-air-video] live bitrate %d bps/tile, vbv %d ms for recovery%s\n",
+    if (ret == 0) {
+        g_printerr("[ml-air-video] live bitrate %d bps/tile, vbv %d ms%s\n",
                    bitrate, vbv, changed == 0 ? " (unchanged)" : "");
     }
 
