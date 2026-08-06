@@ -42,6 +42,11 @@
  *   ML_AIR_COPY       0|1: feed that tile by copy instead of by sharing the capture buffer,
  *                     so the two encoder instances no longer read one allocation (camera only)
  *   ML_AIR_ENC        encoder element + props     (default v4l2h265enc dmabuf-import, large GOP)
+ *   ML_AIR_BITRATE    per-tile encoder bitrate    (default 5000000)
+ *   ML_AIR_VBV        encoder VBV window in ms    (default derived from bitrate)
+ *   ML_AIR_CTRL       live control socket          (default /run/missinglynk/air-video.sock)
+ *                     commands: bitrate <bps> [vbv-ms], fps <fps>,
+ *                     rate <bps> <fps> [vbv-ms]
  *   ML_AIR_HEAP       dma_heap name for tile bufs (default: first non-mmz heap, else any)
  *   ML_AIR_DUMP       prefix: also write <prefix>_tileN.h265
  *   ML_AIR_NOTX       encode (and dump) without transmitting
@@ -101,12 +106,14 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <linux/videodev2.h>
@@ -117,6 +124,7 @@
 #include <gst/video/video.h>
 #include <gst/allocators/gstdmabuf.h>
 #include <glib-unix.h>
+#include <glib/gstdio.h>
 
 #include "vph.h"
 
@@ -157,6 +165,8 @@
 
 /** Send buffer capacity: the largest a single UDP datagram can be (the kernel IP-fragments it). */
 #define AIR_TX_MAX   65507
+#define AIR_VPH_HEADER 36
+#define AIR_VPH_TAIL 4
 
 /* dma-heap allocation + CPU-access sync UAPI (defined locally, as in ml-pipeline). */
 struct dma_heap_allocation_data { guint64 len; guint32 fd; guint32 fd_flags; guint64 heap_flags; };
@@ -203,6 +213,11 @@ struct air_tile {
     guint32 enc_restarts;          /* instance rebuilds performed */
     char enc_node[32];             /* node to re-open on recovery */
     int enc_fps;                   /* rate to re-apply on recovery */
+    int enc_bitrate;               /* bitrate to re-apply on recovery */
+    int enc_vbv;                   /* VBV window to re-apply on recovery */
+    int fps_pending;               /* rate adopted on the next access unit, 0 when none */
+    guint32 ts_base_id;            /* frame_id the VPH timestamp base was taken at */
+    guint32 ts_base_ms;            /* VPH timestamp at ts_base_id */
 
     GstAppSrc *src;                /* encoder input (fed dma-heap I420 buffers) */
     guint8 *tex;                   /* detail tier's shared source texture, built once */
@@ -275,6 +290,8 @@ static int g_bench_fps;            /* pacing rate and PTS base for the feeder */
 static int g_bench_secs;           /* ML_AIR_BENCH_SECS: seconds per tier */
 static char **g_bench_stages;      /* ML_AIR_BENCH split on commas */
 static const char *g_bench_stage;  /* tier currently running, for the rate line */
+static int g_ctrl_fd = -1;
+static char g_ctrl_path[108];
 
 /** Bracket CPU writes to a dma-heap buffer so the encoder's DMA sees them (start=1 before the
  * write, start=0 after to flush to DDR). */
@@ -1345,7 +1362,6 @@ static int air_cap_open(const char *dev, int want)
  * possible drop and keeps the rotation fed. */
 static gpointer air_cap_feed(gpointer user)
 {
-    const gint64 period = g_cap_fps > 0 ? G_USEC_PER_SEC / g_cap_fps : 0;
     struct pollfd pfd[1 + AIR_NCHN];
     int enc_slot[AIR_NCHN];
     gint64 base_us = 0;
@@ -1382,6 +1398,8 @@ static gpointer air_cap_feed(gpointer user)
         struct air_cap_buf *cb;
         GstBuffer *buf[AIR_NCHN] = { NULL, NULL };
         gpointer pool[AIR_NCHN] = { NULL, NULL };
+        int cap_fps;
+        gint64 period;
         gint64 ts_us;
         gint64 now_us;
         int nshare = 0;
@@ -1471,6 +1489,9 @@ static gpointer air_cap_feed(gpointer user)
             base_us = ts_us;
             due_us = ts_us;
         }
+
+        cap_fps = g_atomic_int_get(&g_cap_fps);
+        period = cap_fps > 0 ? G_USEC_PER_SEC / cap_fps : 0;
 
         /* Rate limit against the driver's own timestamps rather than wall clock, so a frame is
          * judged by when it was captured. period is truncated down, so at a request equal to the
@@ -1600,6 +1621,25 @@ static void air_cap_close(void)
 
 static const char *env_or(const char *name, const char *dflt);
 
+static int air_vbv_for_bitrate(int bitrate)
+{
+    guint64 limit = AIR_TX_MAX - AIR_VPH_HEADER - AIR_VPH_TAIL;
+    guint64 vbv;
+
+    if (bitrate <= 0) {
+        return 10;
+    }
+
+    vbv = limit * 8000u * 3u / 4u / (guint64)bitrate;
+    if (vbv < 10) {
+        vbv = 10;
+    } else if (vbv > 3000) {
+        vbv = 3000;
+    }
+
+    return (int)vbv;
+}
+
 /** Set one integer encoder control, reporting but not failing on a control the driver lacks. */
 static void air_enc_ctrl(struct air_tile *t, guint32 id, gint32 val, const char *name)
 {
@@ -1617,6 +1657,269 @@ static void air_enc_ctrl(struct air_tile *t, guint32 id, gint32 val, const char 
     if (ioctl(t->enc_fd, VIDIOC_S_EXT_CTRLS, &cs) != 0) {
         g_printerr("[ml-air-video] tile %d: %s: %s\n", t->chn, name, strerror(errno));
     }
+}
+
+static int air_enc_set_bitrate(struct air_tile *t, int bitrate, int vbv)
+{
+    struct v4l2_ext_control c;
+    struct v4l2_ext_controls cs;
+
+    if (!t->active || t->enc_fd < 0) {
+        return 0;
+    }
+
+    if (t->enc_bitrate == bitrate) {
+        t->enc_vbv = vbv;
+        return 0;
+    }
+
+    memset(&c, 0, sizeof c);
+    memset(&cs, 0, sizeof cs);
+    c.id = V4L2_CID_MPEG_VIDEO_BITRATE;
+    c.value = bitrate;
+    cs.count = 1;
+    cs.controls = &c;
+    cs.which = V4L2_CTRL_WHICH_CUR_VAL;
+
+    if (ioctl(t->enc_fd, VIDIOC_S_EXT_CTRLS, &cs) != 0) {
+        g_printerr("[ml-air-video] tile %d: live bitrate %d: %s\n",
+                   t->chn, bitrate, strerror(errno));
+        return -1;
+    }
+
+    t->enc_bitrate = bitrate;
+    t->enc_vbv = vbv;
+    return 0;
+}
+
+static int air_enc_set_fps(struct air_tile *t, int fps)
+{
+    struct v4l2_streamparm sp;
+
+    if (!t->active || t->enc_fd < 0) {
+        return 0;
+    }
+
+    if (t->enc_fps == fps) {
+        return 0;
+    }
+
+    memset(&sp, 0, sizeof sp);
+    sp.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+    sp.parm.output.timeperframe.numerator = 1;
+    sp.parm.output.timeperframe.denominator = (guint32)fps;
+    if (ioctl(t->enc_fd, VIDIOC_S_PARM, &sp) != 0) {
+        g_printerr("[ml-air-video] tile %d: live fps %d: %s\n",
+                   t->chn, fps, strerror(errno));
+        return -1;
+    }
+
+    t->fps_pending = fps;
+    t->enc_fps = fps;
+    return 0;
+}
+
+static int air_active_encoder_count(void)
+{
+    int count = 0;
+
+    for (int i = 0; i < AIR_NCHN; i++) {
+        if (g_tile[i].active && g_tile[i].enc_fd >= 0) {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+static int air_set_bitrate_all(int bitrate, int vbv)
+{
+    int ret = 0;
+    int active = air_active_encoder_count();
+    int changed = 0;
+
+    if (bitrate < 1 || bitrate > 700000000 || vbv < 10 || vbv > 3000) {
+        return -1;
+    }
+
+    for (int i = 0; i < AIR_NCHN; i++) {
+        if (g_tile[i].active && g_tile[i].enc_fd >= 0 &&
+            g_tile[i].enc_bitrate != bitrate) {
+            changed++;
+        }
+        if (air_enc_set_bitrate(&g_tile[i], bitrate, vbv) != 0) {
+            ret = -1;
+        }
+    }
+
+    if (active == 0) {
+        g_printerr("[ml-air-video] live bitrate needs the direct V4L2 encoder path\n");
+        ret = -1;
+    } else if (ret == 0) {
+        g_printerr("[ml-air-video] live bitrate %d bps/tile, vbv %d ms for recovery%s\n",
+                   bitrate, vbv, changed == 0 ? " (unchanged)" : "");
+    }
+
+    return ret;
+}
+
+static int air_set_fps_all(int fps)
+{
+    int ret = 0;
+    int active = air_active_encoder_count();
+    int changed = 0;
+
+    if (fps < 1 || fps > 240) {
+        return -1;
+    }
+
+    if (active == 0) {
+        g_printerr("[ml-air-video] live fps needs the direct V4L2 encoder path\n");
+        return -1;
+    }
+
+    /* Slow the feeder before telling rate control about the new rate. The encoder budgets
+     * bitrate/fps per picture, so the window where the two disagree either under-spends (feeder
+     * already slow, rate control still on the old high rate) or over-spends. Under-spending is
+     * the safe side of an RF link that is sized for the requested rate. */
+    g_atomic_int_set(&g_cap_fps, fps);
+
+    for (int i = 0; i < AIR_NCHN; i++) {
+        if (g_tile[i].active && g_tile[i].enc_fd >= 0 && g_tile[i].enc_fps != fps) {
+            changed++;
+        }
+        if (air_enc_set_fps(&g_tile[i], fps) != 0) {
+            ret = -1;
+        }
+    }
+
+    if (ret == 0) {
+        g_printerr("[ml-air-video] live fps %d%s\n", fps, changed == 0 ? " (unchanged)" : "");
+    }
+
+    return ret;
+}
+
+static int air_set_rate_all(int bitrate, int fps, int vbv)
+{
+    int ret;
+
+    /* Range-check both halves before applying either, so a rejected fps cannot leave the
+     * encoders running at the new bitrate while the caller is told the command failed. */
+    if (fps < 1 || fps > 240) {
+        return -1;
+    }
+
+    ret = air_set_bitrate_all(bitrate, vbv);
+    if (ret != 0) {
+        return ret;
+    }
+
+    return air_set_fps_all(fps);
+}
+
+static gboolean air_on_ctrl(G_GNUC_UNUSED int fd, G_GNUC_UNUSED GIOCondition cond,
+                            G_GNUC_UNUSED gpointer user)
+{
+    char buf[256];
+    char reply[128];
+    int cfd;
+    struct pollfd pfd;
+    ssize_t n;
+    int bitrate;
+    int fps;
+    int vbv = -1;
+    int ret;
+
+    cfd = accept4(g_ctrl_fd, NULL, NULL, SOCK_CLOEXEC);
+    if (cfd < 0) {
+        return G_SOURCE_CONTINUE;
+    }
+
+    memset(&pfd, 0, sizeof pfd);
+    pfd.fd = cfd;
+    pfd.events = POLLIN;
+    if (poll(&pfd, 1, 100) <= 0) {
+        close(cfd);
+        return G_SOURCE_CONTINUE;
+    }
+
+    n = read(cfd, buf, sizeof buf - 1);
+    if (n <= 0) {
+        close(cfd);
+        return G_SOURCE_CONTINUE;
+    }
+    buf[n] = '\0';
+
+    ret = sscanf(buf, "rate %d %d %d", &bitrate, &fps, &vbv);
+    if (ret >= 2) {
+        if (vbv < 0) {
+            vbv = air_vbv_for_bitrate(bitrate);
+        }
+        ret = air_set_rate_all(bitrate, fps, vbv);
+        snprintf(reply, sizeof reply, "%s bitrate=%d fps=%d vbv=%d\n",
+                 ret == 0 ? "ok" : "err", bitrate, fps, vbv);
+    } else if (sscanf(buf, "bitrate %d %d", &bitrate, &vbv) >= 1) {
+        if (vbv < 0) {
+            vbv = air_vbv_for_bitrate(bitrate);
+        }
+        ret = air_set_bitrate_all(bitrate, vbv);
+        snprintf(reply, sizeof reply, "%s bitrate=%d vbv=%d\n", ret == 0 ? "ok" : "err",
+                 bitrate, vbv);
+    } else if (sscanf(buf, "fps %d", &fps) == 1) {
+        ret = air_set_fps_all(fps);
+        snprintf(reply, sizeof reply, "%s fps=%d\n", ret == 0 ? "ok" : "err", fps);
+    } else {
+        ret = -1;
+        snprintf(reply, sizeof reply,
+                 "err expected: bitrate <bps> [vbv] | fps <fps> | rate <bps> <fps> [vbv]\n");
+    }
+
+    (void)write(cfd, reply, strlen(reply));
+    close(cfd);
+    return G_SOURCE_CONTINUE;
+}
+
+static int air_ctrl_open(const char *path)
+{
+    struct sockaddr_un addr;
+    char *dir;
+
+    if (strlen(path) >= sizeof addr.sun_path) {
+        g_printerr("[ml-air-video] control socket path too long: %s\n", path);
+        return -1;
+    }
+
+    dir = g_path_get_dirname(path);
+    if (dir != NULL && g_mkdir_with_parents(dir, 0755) != 0) {
+        g_printerr("[ml-air-video] mkdir %s: %s\n", dir, strerror(errno));
+        g_free(dir);
+        return -1;
+    }
+    g_free(dir);
+
+    g_ctrl_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (g_ctrl_fd < 0) {
+        g_printerr("[ml-air-video] control socket: %s\n", strerror(errno));
+        return -1;
+    }
+
+    unlink(path);
+    memset(&addr, 0, sizeof addr);
+    addr.sun_family = AF_UNIX;
+    g_strlcpy(addr.sun_path, path, sizeof addr.sun_path);
+    if (bind(g_ctrl_fd, (struct sockaddr *)&addr, sizeof addr) != 0 ||
+        listen(g_ctrl_fd, 4) != 0) {
+        g_printerr("[ml-air-video] bind %s: %s\n", path, strerror(errno));
+        close(g_ctrl_fd);
+        g_ctrl_fd = -1;
+        return -1;
+    }
+
+    g_strlcpy(g_ctrl_path, path, sizeof g_ctrl_path);
+    g_unix_fd_add(g_ctrl_fd, G_IO_IN, air_on_ctrl, NULL);
+    g_printerr("[ml-air-video] control socket %s\n", path);
+    return 0;
 }
 
 /** Find the node that encodes to HEVC, by capability rather than by index.
@@ -1679,6 +1982,9 @@ static int air_enc_open(struct air_tile *t, const char *dev, int fps)
 {
     struct v4l2_format f;
     struct v4l2_requestbuffers rb;
+    struct v4l2_streamparm sp;
+    int bitrate = t->enc_bitrate > 0 ? t->enc_bitrate : atoi(env_or("ML_AIR_BITRATE", "5000000"));
+    int vbv = t->enc_vbv > 0 ? t->enc_vbv : atoi(env_or("ML_AIR_VBV", "0"));
     enum v4l2_buf_type otype = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
     enum v4l2_buf_type ctype = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
     int p;
@@ -1736,6 +2042,18 @@ static int air_enc_open(struct air_tile *t, const char *dev, int fps)
         }
     }
 
+    if (fps > 0) {
+        memset(&sp, 0, sizeof sp);
+        sp.type = otype;
+        sp.parm.output.timeperframe.numerator = 1;
+        sp.parm.output.timeperframe.denominator = (guint32)fps;
+        if (ioctl(t->enc_fd, VIDIOC_S_PARM, &sp) != 0) {
+            g_printerr("[ml-air-video] tile %d: S_PARM %d fps: %s\n",
+                       t->chn, fps, strerror(errno));
+            return -1;
+        }
+    }
+
     memset(&f, 0, sizeof f);
     f.type = ctype;
     f.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_HEVC;
@@ -1748,8 +2066,12 @@ static int air_enc_open(struct air_tile *t, const char *dev, int fps)
         return -1;
     }
 
-    air_enc_ctrl(t, V4L2_CID_MPEG_VIDEO_BITRATE,
-                 atoi(env_or("ML_AIR_BITRATE", "5000000")), "bitrate");
+    if (vbv < 10) {
+        vbv = air_vbv_for_bitrate(bitrate);
+    }
+
+    air_enc_ctrl(t, V4L2_CID_MPEG_VIDEO_BITRATE, bitrate, "bitrate");
+    air_enc_ctrl(t, V4L2_CID_MPEG_VIDEO_VBV_SIZE, vbv, "vbv size");
     air_enc_ctrl(t, V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
                  V4L2_MPEG_VIDEO_BITRATE_MODE_CBR, "bitrate mode");
     air_enc_ctrl(t, V4L2_CID_MPEG_VIDEO_GOP_SIZE,
@@ -1763,8 +2085,6 @@ static int air_enc_open(struct air_tile *t, const char *dev, int fps)
                  atoi(env_or("ML_AIR_MAXQP", "51")), "max qp");
     air_enc_ctrl(t, V4L2_CID_MPEG_VIDEO_HEVC_I_FRAME_QP,
                  atoi(env_or("ML_AIR_IQP", "30")), "i frame qp");
-    (void)fps;
-
     memset(&rb, 0, sizeof rb);
     rb.type = otype;
     rb.memory = V4L2_MEMORY_DMABUF;
@@ -1830,6 +2150,8 @@ static int air_enc_open(struct air_tile *t, const char *dev, int fps)
         g_strlcpy(t->enc_node, dev, sizeof t->enc_node);
     }
     t->enc_fps = fps;
+    t->enc_bitrate = bitrate;
+    t->enc_vbv = vbv;
     t->enc_progress_us = g_get_monotonic_time();
 
     return 0;
@@ -2074,8 +2396,24 @@ static GstFlowReturn air_on_src(GstAppSink *sink, gpointer user)
 static void air_emit_au(struct air_tile *t, const guint8 *data, size_t size,
                         guint32 frame_id, guint32 is_idr)
 {
-    guint32 ts_ms = (guint32)((guint64)frame_id * 1000u / (guint32)t->fps);
+    guint32 ts_ms;
     size_t len;
+
+    /* A live rate change is adopted here rather than in the setter so the timestamp base is
+     * frozen against a frame_id this tile has actually emitted. TimeStap counts elapsed
+     * milliseconds, so the span already sent keeps the rate it was sent at and only the span
+     * from here on uses the new one; recomputing the whole span at the new rate would step the
+     * timestamp by the length of the stream so far. */
+    if (t->fps_pending > 0) {
+        t->ts_base_ms += (guint32)((guint64)(frame_id - t->ts_base_id) * 1000u /
+                                   (guint32)t->fps);
+        t->ts_base_id = frame_id;
+        t->fps = t->fps_pending;
+        t->fps_pending = 0;
+    }
+
+    ts_ms = t->ts_base_ms + (guint32)((guint64)(frame_id - t->ts_base_id) * 1000u /
+                                      (guint32)t->fps);
 
     if (t->dumpfd >= 0) {
         if (write(t->dumpfd, data, size) != (ssize_t)size) {
@@ -2326,6 +2664,7 @@ int main(int argc, char **argv)
                              "v4l2h265enc output-io-mode=dmabuf-import "
                              "extra-controls=\"controls,video_gop_size=65535\"");
     const char *dump = env_or("ML_AIR_DUMP", NULL);
+    const char *ctrl = env_or("ML_AIR_CTRL", "/run/missinglynk/air-video.sock");
     char desc[512];
     GError *err = NULL;
     GstElement *src_pipe;
@@ -2376,6 +2715,9 @@ int main(int argc, char **argv)
     for (int i = 0; i < AIR_NCHN; i++) {
         g_tile[i].enc_fd = -1;
     }
+    /* A control client that gives up before reading its reply (ml-air-ctl under `timeout`) leaves
+     * the reply write to take EPIPE, whose default action would kill the whole video daemon. */
+    signal(SIGPIPE, SIG_IGN);
     gst_init(&argc, &argv);
 
     g_recycle_quark = g_quark_from_static_string("air-recycle");
@@ -2554,6 +2896,7 @@ int main(int argc, char **argv)
     g_unix_signal_add(SIGINT, air_on_signal, NULL);
     g_unix_signal_add(SIGTERM, air_on_signal, NULL);
     g_timeout_add_seconds(1, air_on_tick, NULL);
+    air_ctrl_open(ctrl);
 
     if (bench != NULL) {
         g_printerr("[ml-air-video] bench %s: %dx%d two H.265 tiles, %s, %s, %d s per tier\n",
@@ -2663,6 +3006,12 @@ int main(int argc, char **argv)
         }
     }
     g_main_loop_unref(g_loop);
+    if (g_ctrl_fd >= 0) {
+        close(g_ctrl_fd);
+        if (g_ctrl_path[0] != '\0') {
+            unlink(g_ctrl_path);
+        }
+    }
     close(sock);
     return 0;
 }
