@@ -7,7 +7,7 @@ void crc32_init(void)
 {
     for (guint32 i = 0; i < 256; i++) {
         guint32 c = i;
-        for (int k = 0; k < 8; k++) {
+        for (int j = 0; j < 8; j++) {
             c = (c & 1) ? (0xedb88320u ^ (c >> 1)) : (c >> 1);
         }
         crc32_tab[i] = c;

@@ -26,7 +26,7 @@ uint32_t vph_crc32(const uint8_t *data, size_t n)
 
     for (size_t i = 0; i < n; i++) {
         crc ^= data[i];
-        for (int k = 0; k < 8; k++) {
+        for (int j = 0; j < 8; j++) {
             crc = (crc & 1u) ? (0xedb88320u ^ (crc >> 1)) : (crc >> 1);
         }
     }

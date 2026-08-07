@@ -611,9 +611,9 @@ void *rf_rx(void *arg)
          */
         GstClockTime drain_skew_ns = gst_util_uint64_scale(c->skew_max, GST_SECOND, RF_FPS);
 
-        for (int k = 0; k < 8 && c->t0_nhold > 0
+        for (int i = 0; i < 8 && c->t0_nhold > 0
                         && c->out_pts[0] <= c->out_pts[1] + drain_skew_ns
-                        && gst_app_src_get_current_level_buffers(c->src[0]) <= (guint64)c->inflight_max; k++) {
+                        && gst_app_src_get_current_level_buffers(c->src[0]) <= (guint64)c->inflight_max; i++) {
             push_au(c, 0, c->t0_hold[0]);
             c->t0_nhold--;
             memmove(&c->t0_hold[0], &c->t0_hold[1], c->t0_nhold * sizeof c->t0_hold[0]);

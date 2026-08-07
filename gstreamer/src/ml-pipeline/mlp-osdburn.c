@@ -166,9 +166,9 @@ void osd_burn_cell(struct ctx *c, const guint8 *frame, gssize len)
     GArray *spans = g_array_new(FALSE, FALSE, sizeof(struct osd_span));
     GByteArray *px = g_byte_array_new();
 
-    for (int j = 0; j < h; j++) {
-        row_spans(spans, px, lmask + (gsize) j * w, luma + (gsize) j * w, w,
-                  (guint32) ((y + j) * COMP_LSTRIDE + x));
+    for (int i = 0; i < h; i++) {
+        row_spans(spans, px, lmask + (gsize) i * w, luma + (gsize) i * w, w,
+                  (guint32) ((y + i) * COMP_LSTRIDE + x));
     }
 
     for (int cy = 0; cy < ch; cy++) {
