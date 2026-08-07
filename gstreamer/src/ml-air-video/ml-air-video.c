@@ -46,7 +46,8 @@
  *   ML_AIR_VBV        encoder VBV window in ms    (default derived from bitrate)
  *   ML_AIR_CTRL       live control socket          (default /run/missinglynk/air-video.sock)
  *                     commands: bitrate <bps> [vbv-ms], fps <fps>,
- *                     rate <bps> <fps> [vbv-ms]
+ *                     rate <bps> <fps> [vbv-ms], keyframe
+ *   ML_AIR_ON_DEMAND  hold the encoders closed until the first keyframe request (camera path only)
  *   ML_AIR_HEAP       dma_heap name for tile bufs (default: first non-mmz heap, else any)
  *   ML_AIR_DUMP       prefix: also write <prefix>_tileN.h265
  *   ML_AIR_NOTX       encode (and dump) without transmitting
@@ -272,6 +273,21 @@ static int g_notx;
  * way to state the capture stride. ML_AIR_GST=1 restores the GStreamer path for comparison. */
 static int g_enc_direct;
 
+/* ML_AIR_ON_DEMAND: hold the encoders closed until a receiver asks for a keyframe, instead of
+ * encoding and transmitting from start-up whether or not anyone is listening. The camera still
+ * streams from start-up: ar-cvisp brings the sensor, VIF and ISP up from STREAMON, and deferring
+ * that defers the fragile part of the bring-up. So this holds the VPU, and with no encoder there is
+ * nothing to transmit either.
+ *
+ * The bring-up runs on the capture feeder thread, which owns the encoder fds and its own poll set.
+ * A caller on the main loop asks through air_enc_start_request() and waits for the answer. */
+static int g_on_demand;
+static volatile gint g_enc_up;     /* encoders open and streaming; the only "is it running" flag */
+static GMutex g_enc_start_lock;
+static GCond g_enc_start_cond;
+static int g_enc_start_want;       /* 1 = a bring-up is asked for and not yet finished */
+#define AIR_ENC_START_MS 5000      /* how long a requester waits for the feeder to finish */
+
 /* The direct encoder backend is defined below the capture code but driven from inside it. */
 struct air_cap_buf;
 static int air_enc_queue(struct air_tile *t, struct air_cap_buf *cb);
@@ -279,6 +295,7 @@ static void air_enc_drain(struct air_tile *t);
 static void air_enc_restart(struct air_tile *t);
 static void air_enc_close(struct air_tile *t);
 static int air_enc_held(const struct air_tile *t);
+static int air_enc_open(struct air_tile *t, const char *dev, int fps);
 static void air_emit_au(struct air_tile *t, const guint8 *data, size_t size,
                         guint32 frame_id, guint32 is_idr);
 
@@ -389,6 +406,7 @@ static int air_pool_init(struct air_tile *t, int want)
     if (want < AIR_POOL_MIN) {
         want = AIR_POOL_MIN;
     }
+
     if (want > AIR_POOL_MAX) {
         want = AIR_POOL_MAX;
     }
@@ -1360,6 +1378,93 @@ static int air_cap_open(const char *dev, int want)
 /** Capture thread: dequeue, share into both tiles, push. A frame that is not wanted (rate limit)
  * or cannot be afforded (no credit) goes straight back to the driver, which is the cheapest
  * possible drop and keeps the rotation fed. */
+/** Build the feeder's poll set: the camera first, then whichever encoders are open.
+ *
+ * Called again after an on-demand bring-up, so the set is no longer fixed for the life of the
+ * thread. Only the feeder may call it: it owns both the set and the encoder fds. */
+static int air_cap_poll_build(struct pollfd *pfd, int *enc_slot)
+{
+    int nfd = 1;
+
+    memset(pfd, 0, sizeof *pfd * (1 + AIR_NCHN));
+    pfd[0].fd = g_cap_fd;
+    pfd[0].events = POLLIN;
+
+    for (int i = 0; i < AIR_NCHN; i++) {
+        enc_slot[i] = -1;
+
+        if (g_enc_direct && g_tile[i].active && g_tile[i].enc_fd >= 0) {
+            enc_slot[i] = nfd;
+            pfd[nfd].fd = g_tile[i].enc_fd;
+            pfd[nfd].events = POLLIN | POLLOUT;
+            nfd++;
+        }
+    }
+
+    return nfd;
+}
+
+/** Open every active tile's encoder. Feeder-thread only.
+ *
+ * All or nothing: a tile that fails takes the others down with it, so a later request retries from
+ * a clean state rather than running half a pipeline. The encoder pair gets one clean open per boot,
+ * so this must not be called again once it has succeeded, and nothing tears it down on receiver
+ * loss. */
+static int air_enc_start_all(void)
+{
+    int opened = 0;
+
+    for (int i = 0; i < AIR_NCHN; i++) {
+        if (!g_tile[i].active) {
+            continue;
+        }
+
+        if (g_tile[i].enc_fd < 0 &&
+            air_enc_open(&g_tile[i], g_tile[i].enc_node, g_tile[i].enc_fps) != 0) {
+            for (int j = 0; j < AIR_NCHN; j++) {
+                air_enc_close(&g_tile[j]);
+            }
+
+            return -1;
+        }
+
+        opened++;
+    }
+
+    return opened > 0 ? 0 : -1;
+}
+
+/** Ask the feeder to bring the encoders up, and wait for the answer.
+ *
+ * Called from the main loop (the control socket). Returns 0 once they are streaming. Single-flight:
+ * a second caller arriving mid-bring-up waits on the same attempt rather than starting another. A
+ * failure returns the request to idle so the next one retries, which matters because the receiver
+ * keeps asking. */
+static int air_enc_start_request(void)
+{
+    gint64 deadline;
+    int ret;
+
+    if (g_atomic_int_get(&g_enc_up)) {
+        return 0;
+    }
+
+    g_mutex_lock(&g_enc_start_lock);
+    g_enc_start_want = 1;
+    deadline = g_get_monotonic_time() + (gint64)AIR_ENC_START_MS * 1000;
+
+    while (g_enc_start_want) {
+        if (!g_cond_wait_until(&g_enc_start_cond, &g_enc_start_lock, deadline)) {
+            break;
+        }
+    }
+
+    ret = g_atomic_int_get(&g_enc_up) ? 0 : -1;
+    g_mutex_unlock(&g_enc_start_lock);
+
+    return ret;
+}
+
 static gpointer air_cap_feed(gpointer user)
 {
     struct pollfd pfd[1 + AIR_NCHN];
@@ -1374,23 +1479,9 @@ static gpointer air_cap_feed(gpointer user)
 
     (void)user;
 
-    /* Slot 0 is the camera; the direct path's encoders take the slots after it. The set is fixed
-     * for the life of the thread because a tile cannot become active after start-up. */
-    memset(pfd, 0, sizeof pfd);
-    pfd[0].fd = g_cap_fd;
-    pfd[0].events = POLLIN;
-    nfd = 1;
-
-    for (int i = 0; i < AIR_NCHN; i++) {
-        enc_slot[i] = -1;
-
-        if (g_enc_direct && g_tile[i].active && g_tile[i].enc_fd >= 0) {
-            enc_slot[i] = nfd;
-            pfd[nfd].fd = g_tile[i].enc_fd;
-            pfd[nfd].events = POLLIN | POLLOUT;
-            nfd++;
-        }
-    }
+    /* Slot 0 is the camera; the direct path's encoders take the slots after it. Rebuilt after an
+     * on-demand bring-up, which is the one way a tile gains an fd after start-up. */
+    nfd = air_cap_poll_build(pfd, enc_slot);
 
     while (!g_cap_stop) {
         struct v4l2_plane planes[AIR_CAP_PLANES];
@@ -1404,6 +1495,27 @@ static gpointer air_cap_feed(gpointer user)
         gint64 now_us;
         int nshare = 0;
         int starved = 0;
+
+        /* Serviced before the poll, so a camera producing nothing cannot hold a bring-up. */
+        g_mutex_lock(&g_enc_start_lock);
+        if (g_enc_start_want) {
+            int rc;
+
+            g_mutex_unlock(&g_enc_start_lock);
+            rc = air_enc_start_all();
+            if (rc == 0) {
+                nfd = air_cap_poll_build(pfd, enc_slot);
+                g_atomic_int_set(&g_enc_up, 1);
+                g_printerr("[ml-air-video] encoders up on request\n");
+            } else {
+                g_printerr("[ml-air-video] encoder bring-up failed\n");
+            }
+
+            g_mutex_lock(&g_enc_start_lock);
+            g_enc_start_want = 0;
+            g_cond_broadcast(&g_enc_start_cond);
+        }
+        g_mutex_unlock(&g_enc_start_lock);
 
         for (int i = 0; i < nfd; i++) {
             pfd[i].revents = 0;
@@ -1519,6 +1631,14 @@ static gpointer air_cap_feed(gpointer user)
          * tile's row offset, with no GstBuffer in between. */
         if (g_enc_direct) {
             int nq = 0;
+
+            /* Held for a receiver: the ISP still produces every frame, so hand the buffer straight
+             * back rather than queueing into encoders that are not open. */
+            if (!g_atomic_int_get(&g_enc_up)) {
+                g_cap_skipped++;
+                air_cap_qbuf(cb);
+                continue;
+            }
 
             for (int i = 0; i < AIR_NCHN; i++) {
                 if (g_tile[i].active) {
@@ -1789,19 +1909,33 @@ static int air_set_bitrate_all(int bitrate, int vbv)
     return ret;
 }
 
-/* Force an IDR on every active tile.
+/* Give a receiver a decodable entry point, which is either starting the encoders or forcing an IDR.
  *
  * This stream carries exactly one IDR, at FrameId 0, and P-frames for the rest of the session, so a
  * receiver that was not listening at session start cannot decode and no amount of motion repairs it:
  * the encoder picks intra-vs-inter against its OWN reference, which is correct, so it never notices
  * that the receiver's is not. The vendor covers this with an on-demand keyframe
- * (AR_LOWDELAY_MESSAGE_MEDIA_IDR_REQUEST -> AR_LDRT_TX_PIPELINE_IdrEnable); this is our end of it.
- * V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME is a button control, so the value is ignored.
+ * (AR_LOWDELAY_MESSAGE_MEDIA_IDR_REQUEST -> AR_FSM_TX_ProcessIdrRequest), and that handler branches
+ * on whether it is already streaming: not streaming runs PIPELINE_Start, streaming adds
+ * AR_LDRT_TX_PIPELINE_IdrEnable. Both branches are here, so one request covers both cases.
+ *
+ * Under ML_AIR_ON_DEMAND the first request opens the encoders, and their own first picture is the
+ * session IDR, so nothing extra is forced. V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME is a button control,
+ * so the value is ignored.
  */
 static int air_force_keyframe_all(void)
 {
     int ret = 0;
     int forced = 0;
+
+    if (g_on_demand && !g_atomic_int_get(&g_enc_up)) {
+        if (air_enc_start_request() != 0) {
+            g_printerr("[ml-air-video] keyframe: encoders did not come up\n");
+            return -1;
+        }
+
+        return 0;
+    }
 
     if (air_active_encoder_count() == 0) {
         g_printerr("[ml-air-video] keyframe needs the direct V4L2 encoder path\n");
@@ -2782,13 +2916,19 @@ int main(int argc, char **argv)
     } else {
         pool_want = (pool_env != NULL && *pool_env != '\0') ? atoi(pool_env) : AIR_POOL_DEF;
     }
+
     /* Staggered encoder bring-up is the default: concurrent instance creation while the other
      * encoder has frames in flight races the wave5 firmware (corrupt output or a VCPU watchdog,
      * HW-confirmed). ML_AIR_NO_STAGGER restores the concurrent bring-up for diagnostics. */
     g_stagger = (getenv("ML_AIR_NO_STAGGER") == NULL);
+
     /* Camera mode drives the encoders directly; ML_AIR_GST=1 falls back to GStreamer,
      * which cannot state the capture stride and therefore shears the picture. */
     g_enc_direct = (camera != NULL && getenv("ML_AIR_GST") == NULL);
+
+    /* Only the direct path can defer: the GStreamer encoder is built into a pipeline at start-up,
+     * and the bench feeder has no receiver to wait for. */
+    g_on_demand = (g_enc_direct && getenv("ML_AIR_ON_DEMAND") != NULL);
     for (int i = 0; i < AIR_NCHN; i++) {
         g_tile[i].enc_fd = -1;
     }
@@ -3020,18 +3160,31 @@ int main(int argc, char **argv)
 
             g_print("[ml-air-video] encoder %s\n", enc_node);
 
+            /* Recorded up front either way: the on-demand bring-up runs on the feeder thread and
+             * takes its node and rate from here, the same fields air_enc_restart re-opens from. */
             for (int i = 0; i < AIR_NCHN; i++) {
-                if (!g_tile[i].active) {
-                    continue;
-                }
-                if (air_enc_open(&g_tile[i], enc_node, fps) != 0) {
-                    for (int j = 0; j < AIR_NCHN; j++) {
-                        air_enc_close(&g_tile[j]);
+                g_strlcpy(g_tile[i].enc_node, enc_node, sizeof g_tile[i].enc_node);
+                g_tile[i].enc_fps = fps;
+            }
+
+            if (g_on_demand) {
+                g_print("[ml-air-video] encoders held until a receiver asks for a keyframe\n");
+            } else {
+                for (int i = 0; i < AIR_NCHN; i++) {
+                    if (!g_tile[i].active) {
+                        continue;
                     }
-                    air_cap_close();
-                    close(sock);
-                    return 1;
+                    if (air_enc_open(&g_tile[i], enc_node, fps) != 0) {
+                        for (int j = 0; j < AIR_NCHN; j++) {
+                            air_enc_close(&g_tile[j]);
+                        }
+                        air_cap_close();
+                        close(sock);
+                        return 1;
+                    }
                 }
+
+                g_atomic_int_set(&g_enc_up, 1);
             }
         }
 
@@ -3057,6 +3210,7 @@ int main(int argc, char **argv)
     if (src_pipe != NULL) {
         gst_element_set_state(src_pipe, GST_STATE_NULL);
     }
+
     for (int i = 0; i < AIR_NCHN; i++) {
         if (enc_pipe[i] != NULL) {
             gst_app_src_end_of_stream(g_tile[i].src);
@@ -3077,11 +3231,13 @@ int main(int argc, char **argv)
     if (src_pipe != NULL) {
         gst_object_unref(src_pipe);
     }
+
     for (int i = 0; i < AIR_NCHN; i++) {
         if (enc_pipe[i] != NULL) {
             gst_object_unref(enc_pipe[i]);
         }
     }
+
     g_main_loop_unref(g_loop);
     if (g_ctrl_fd >= 0) {
         close(g_ctrl_fd);
@@ -3089,6 +3245,7 @@ int main(int argc, char **argv)
             unlink(g_ctrl_path);
         }
     }
+
     close(sock);
     return 0;
 }

@@ -5,8 +5,13 @@
 #   make linkd      just ml-linkd
 #   make ledd       just ml-ledd
 #   make msp-echo   just the passive FC UART test tool
-#   make gst        the gstreamer pipeline/HUD binaries (delegates to gstreamer/src/build.sh)
-#   make gst-static the standalone static ml-pipeline for the rootfs (build-static.sh)
+#   make gst        HOST/SD-CARD ONLY: dynamically linked gstreamer binaries (gstreamer/src/build.sh)
+#                   -> gstreamer/build/bin/. These CANNOT run on a device rootfs: there is no
+#                   GStreamer or glib installed there, so they die with "symbol not found".
+#                   Only usable against the /mnt/gst SD squashfs development track.
+#   make gst-static WHAT SHIPS: the standalone static ml-pipeline AND ml-air-video for the rootfs
+#                   (build-static.sh) -> gstreamer/build/static/. ~9.6 MB, self-contained.
+#                   Push THESE to a goggle or air unit.
 #   make hud        the LVGL HUD binary (delegates to its CMake build)
 #   make font       generate the BTFL OSD glyph atlas from betaflight.mcm (needs python3 + Pillow)
 #   make check      host-side tests (no device, no docker, no hardware)

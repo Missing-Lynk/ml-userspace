@@ -4,6 +4,15 @@ The development packaging from `plans/gst-hud-architecture.md`, hardware-validat
 
 **Two build tracks** (`plans/gst-static-rootfs.md`): this SD squashfs is the **development** track - the full dynamic GStreamer with debug logging, fast to iterate against (swap a plugin, re-run, no relink). The **production** track is a single standalone static binary that ships in the rootfs with no SD card at all (see "Production build" below). Same `ml-pipeline` source; different packaging.
 
+> **Deploying to a device? You want `make gst-static`.**
+>
+> | | command | output | runs on a device rootfs |
+> |---|---|---|---|
+> | dynamic | `make gst` | `gstreamer/build/bin/` (~80 KB) | **no** |
+> | static | `make gst-static` | `gstreamer/build/static/` (~9.6 MB) | yes |
+>
+> Both tracks build `ml-pipeline` **and** `ml-air-video` from the same sources, so the two binaries look interchangeable and are not. A device rootfs carries no GStreamer and no glib: the dynamic binary aborts at startup with a wall of `Error relocating ...: symbol not found`, having touched nothing. The dynamic build is only usable against the `/mnt/gst` SD squashfs above. Size is the quick check: 80 KB is the wrong one, 9.6 MB is the right one.
+
 **Validated results (BetaFPV VR04, open kernel #37):**
 - `videotestsrc` -> `kmssink`: works, BGRx and I420 both render correctly. CPU-painted 1080p tops out ~15-30 fps (videotestsrc painting + ~30-45 ms/frame copies into uncached/display memory); that is a CPU limit, not a pipeline defect.
 - H.264/H.265 file -> `v4l2h264dec`/`v4l2h265dec` (wave5) -> `kmssink`: **1080p60 at a measured 60.00 fps, 0 drops, true zero-copy** (decoder dma-bufs PRIME-imported straight to the display plane). Requires `capture-io-mode=dmabuf` + `skip-vsync=true`.
