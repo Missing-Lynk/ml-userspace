@@ -188,7 +188,7 @@ static int g_scan_probe;                    /* --scan-probe: hexdump the raw Get
  * All plain ints/timestamps, single writer per field, so volatile is enough. */
 static volatile int g_steady;               /* FSM reached STEADY */
 static volatile int g_hs_done;              /* :20001 3-way done */
-static volatile int g_params_acked;         /* type3 ACK sent this session */
+static volatile int g_params_acked;         /* the air answered our params poll this session */
 static volatile int g_air_lost;             /* >5 s :10000 silence flagged */
 static volatile int g_ready;                /* consumer READY (heartbeat fresh) */
 static volatile int g_video_confirmed;      /* consumer reported frames_seen after our ACK */
@@ -204,7 +204,6 @@ static int g_rx_counting;                   /* counter has advanced at least onc
 #define MEDIA_STALL_MS 6000                 /* 3 heartbeats of a frozen counter = video is dead */
 static volatile long g_last_telem_ms;       /* last :10000 RX */
 static volatile long g_last_ready_ms;       /* last MLM_T_READY heartbeat */
-static volatile long g_last_ack_ms;         /* last type3 ACK sent */
 
 /* Local baseband link metrics, parsed from the GET replies in the reader thread and published for
  * the HUD's System OSD. Single writer (reader), single reader (main publish); MLM_LINKINFO_NONE
@@ -1489,8 +1488,8 @@ static void *udp_thread(void *arg)
          * poll once the consumer reported frames (g_video_confirmed); that let the air's :10000
          * telemetry go quiet and tripped a FALSE air-loss every ~5 s, so video cut out and re-
          * handshook in a ~10 s loop. Pre-media the poll is READY-gated so the air's first IDR lands
-         * with a bound consumer; once acked it is the ungated keepalive (the air's 0x02 reply then
-         * drives the type-3 ACK below, i.e. the vendor's steady-state 2 s :10000 datagram). */
+         * with a bound consumer; once acked it is the ungated keepalive, and it is also what paces
+         * the IDR request below (which rides the 0x02 reply). */
         if (params_bound && g_hs_done && (g_no_gate || g_ready || g_params_acked)
             && now - last_req >= PARAMS_IVL_MS) {
             uint8_t frame[MP_HDR_LEN];
@@ -1520,7 +1519,7 @@ static void *udp_thread(void *arg)
             }
 
             memcpy(&msg_type, rx, 4);       /* LE u32 msg type, common to both families */
-            if (msg_type == MP_REPLY) {     /* MEDIA_PARAMS reply -> [SetLdCfg] -> type3 ACK, video starts */
+            if (msg_type == MP_REPLY) {     /* MEDIA_PARAMS reply -> [SetLdCfg] -> IDR request, video starts */
                 /* Match the vendor's per-cycle sequence exactly: after the air's 0x02 reply the goggle
                  * sends SetLdCfg (0x0A), THEN the 0x03 ack that starts video (capture: 01 -> 02 -> 0a ->
                  * 03 -> 15). Sending it here - as part of the handshake, before video - is the vendor
@@ -1546,10 +1545,21 @@ static void *udp_thread(void *arg)
                     }
                 }
 
-                uint8_t frame[MP_HDR_LEN];
-                sendto(params_sock, frame, mp_params_ack(frame, stamp_us), MSG_DONTWAIT,
-                       (struct sockaddr *)&air_params, sizeof air_params);
-                g_last_ack_ms = now;
+                /* Ask the air for a keyframe. It streams one IDR at session start and P-frames
+                 * after, so a receiver that was not listening then needs a fresh one to decode
+                 * (mp-cmd.h, mp_idr_request). Sent while video is not confirmed flowing and stopped
+                 * once it is, which keeps the stream from going needlessly intra-heavy. Both the
+                 * air-loss watch and the video-stall watch clear g_video_confirmed, so requests
+                 * resume by themselves whenever video needs repairing. */
+                if (!g_video_confirmed) {
+                    uint8_t frame[MP_HDR_LEN];
+                    sendto(params_sock, frame, mp_idr_request(frame, stamp_us), MSG_DONTWAIT,
+                           (struct sockaddr *)&air_params, sizeof air_params);
+
+                    if (g_verbose) {
+                        fprintf(stderr, TAG " tx MEDIA_IDR_REQUEST\n");
+                    }
+                }
 
                 if (!g_params_acked) {
                     g_params_acked = 1;

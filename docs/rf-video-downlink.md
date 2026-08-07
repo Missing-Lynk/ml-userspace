@@ -24,12 +24,14 @@ How the goggle makes the air unit stream H.265 video to it over the AR8030 link,
 4. **Runtime TX power:** `TX_SET_POWER` (bb_ioctl cmd `0x02000008`, payload `{0x00, dBm}`, 23 dBm) + `SET_POWER_AUTO` (`0x02000009`, `{1}`). Without it the goggle transmits at chip default power, SNR is too low, and the link never reaches `type:8` (the high-bandwidth video profile the chip derives from config + SNR; there is no "set type 8" command). Chip log `cur type:8 req type:8` = good.
 5. **Steady cadence:** `port 0c` ~24 Hz, `port 73` ~6 Hz, `ff02` ~3.4 Hz, forever.
 6. **`:20001` identity handshake (3-way):** goggle sends 520 B type-0 probes (~3 Hz); air answers type-1 (its identity, ONCE); goggle must echo the air's type-1 back with exactly `byte[0]=0x02, byte[5]=0x00` (type-2 ACK). Without the ACK the air retransmits type-1 forever and never advances. The vendor stops the type-0 probe after this completes.
-7. **`:10000` media-params handshake (the actual video trigger):** goggle sends `msg_type=1` MEDIA_PARAMS_REQUEST (24 B, ts@8, len=0) every ~2.0 s; air answers `msg_type=2` MEDIA_PARAMS (24 B header + 72 B body: codec/res/fps); goggle sends `msg_type=3` ACK (24 B, ts@8). The air begins VideoSend on `:10001` right after the type-3 ACK. The type-3 ACK was the final missing piece of the whole investigation.
+7. **`:10000` media-params handshake (the actual video trigger):** goggle sends `msg_type=1` MEDIA_PARAMS_REQUEST (24 B, ts@8, len=0) every ~2.0 s; air answers `msg_type=2` MEDIA_PARAMS (24 B header + 72 B body: codec/res/fps); goggle sends `msg_type=3` MEDIA_IDR_REQUEST (24 B, ts@8). The air begins VideoSend on `:10001` right after the type-3.
+
+   `msg_type=3` is the on-demand keyframe request. The goggle emits it from `AR_FSM_RX_ProcessIdrRequest @0x42de70`, with the same header shape `AR_FSM_RX_ProcessParamsRequest @0x42d8c0` uses for type 1. The air routes it to TX FSM message 8, `AR_FSM_TX_ProcessIdrRequest @0x428938`, which runs `PIPELINE_Start` and, while already streaming, `AR_LDRT_TX_PIPELINE_IdrEnable`. Video begins because the request is answered with an IDR, so the same message also repairs a mid-flight join or a desynced decoder.
 
 ## UDP reliability model (wire-measured on slot A)
 
 - `type=1` request: re-sent every ~2.0 s until answered, then stops. The retry loop is the only reliability mechanism and also how the goggle polls out the air's own readiness gate (the air ignores requests until its VPU/VIN are up).
-- `type=2` reply and `type=3` ACK: fire-once, never retransmitted. A lost type-3 wedges video with no recovery short of a session restart, so a robust client should keep re-eliciting type-2 (via type-1) until it actually sees `:10001` frames.
+- `type=2` reply and `type=3` IDR request: fire-once, never retransmitted. A lost type-3 leaves video off, so a client re-elicits type-2 (via type-1) and re-requests until it sees decoded `:10001` frames. `ml-linkd` sends one type-3 per type-2 reply while video is unconfirmed and stops once the consumer reports composed frames; the air honours at most one forced keyframe per 500 ms, bounding the cost of a stuck requester.
 - Telemetry (`0x09/0x10/0x11`) and video: pure fire-and-forget streams.
 
 ## Driver facts (open `artosyn_sdio`)

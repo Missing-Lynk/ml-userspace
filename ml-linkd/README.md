@@ -9,6 +9,8 @@ Association is autonomous from the `artosyn_sdio` insmod config, so by default t
 - Reads the two SoC sensors over IIO: battery voltage from the SAR ADC (`artosyn-adc`, channel 1, `in_voltage1_input` x the board divider) and the junction temperature from the SoC sensor (`temperature`, `in_temp_scale`). Both are resolved by IIO device name and retried until the modules have coldplugged.
 - Transmits the vendor's `:10000` status frames to the goggle (10.0.0.1): `0x11` periodic (voltage, ~6 Hz) and `0x09` version/info (hw/fw strings + voltage + temperature, ~1 Hz).
 - Answers the goggle's `:20001` identity probe (mirrors the 520-byte type-0 datagram back with `byte[0]=0x01`).
+- Answers the goggle's `:10000` type-1 MEDIA_PARAMS_REQUEST with a type-2 reply. The goggle gates its solid-green LED, its IDR request and its video-stall watch on this reply. The reply is the 24-byte header alone; the vendor's carries a 72-byte codec/resolution body, which the goggle here ignores in favour of `msg_type` dispatch and SetLdCfg geometry.
+- Answers the goggle's `:10000` type-3 MEDIA_IDR_REQUEST by forcing a keyframe through `ml-air-video`'s control socket, matching the vendor's `AR_LDRT_TX_PIPELINE_IdrEnable`. The stream carries one IDR at FrameId 0 and P-frames after, so this request is how a goggle powered on mid-flight, or one whose decoder desynced, gets a decodable entry point. At most one forced keyframe per 500 ms.
 
 The goggle's RX role republishes the received `0x09`/`0x11` frames on `telemetry.sock` as `MLM_T_STATUS`, so the HUD shows the air unit's voltage and temperature.
 
@@ -37,15 +39,15 @@ Port `0x0c` polling must not start before `OPEN`; sending it during association 
 ### UDP (`sdio0`, RX = 10.0.0.1, TX = 10.0.0.100)
 
 - `:20001` - 3-way hello: 520 B type-0 at ~3 Hz; on the TX unit's type-1 identity, reply with the same packet, `byte[0]=0x02`, `byte[5]=0x00`. Hello stops once done.
-- `:10000` - params handshake: 24 B type-1 request every 2 s (timestamp at offset 8); on the TX unit's type-2 reply, send the 24 B type-3 ACK. Video on `:10001` starts only after the ACK.
+- `:10000` - params handshake: 24 B type-1 request every 2 s (timestamp at offset 8); on the TX unit's type-2 reply, send the 24 B type-3 MEDIA_IDR_REQUEST. Video on `:10001` starts after the type-3, which the TX unit answers with a keyframe (`mp-cmd.h`, `mp_idr_request`). Sent while video is unconfirmed; stops once the consumer reports composed frames.
 - `:10000` - telemetry RX (u32 LE message type at offset 0): `0x10` = MSP DisplayPort, `0x09`/`0x11` = binary status. Republished over the IPC sockets below.
 
 ### Consumer-ready gate
 
-The type-1 request is held until a consumer declares READY on `link.sock`. The TX unit emits a single IDR at FrameId 0 immediately after the ACK; the gate guarantees the video consumer is already bound on `:10001` when it arrives.
+The type-1 request is held until a consumer declares READY on `link.sock`. The TX unit emits a single IDR at FrameId 0 and P-frames after, so the gate guarantees the video consumer is already bound on `:10001` when it arrives.
 
 - READY = `MLM_T_READY` heartbeat; consumer liveness window 6 s.
-- The type-1 poll stops when a heartbeat with `frames_seen=1` arrives after the ACK; if none arrives within 6 s of an ACK, polling resumes (a lost type-3 leaves video off with no TX-side retry).
+- `frames_seen` is decode-level (the pipeline's composed-frame count), so it separates "datagrams arriving" from "picture on screen". While it is 0 the type-3 IDR request keeps going out, repairing a late join or a lost keyframe without a session restart.
 - `--no-gate` disables the gate.
 
 ### TX loss

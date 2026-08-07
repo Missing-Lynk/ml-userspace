@@ -23,9 +23,9 @@
 /* :10000 message types (LE u32 at byte 0). Goggle->air are the ones we build below; air->goggle are
  * listed too so the receive-side switch reads from one canonical map. */
 enum mp_type {
-    MP_REQUEST     = 0x01,   /* MEDIA_PARAMS request      (goggle->air) */
-    MP_REPLY       = 0x02,   /* MEDIA_PARAMS reply        (air->goggle) */
-    MP_ACK         = 0x03,   /* MEDIA_PARAMS type-3 ack   (goggle->air) */
+    MP_REQUEST     = 0x01,   /* MEDIA_PARAMS_REQUEST      (goggle->air) */
+    MP_REPLY       = 0x02,   /* MEDIA_PARAMS_REDAY reply  (air->goggle) */
+    MP_IDR_REQUEST = 0x03,   /* MEDIA_IDR_REQUEST         (goggle->air) */
     MP_STATUS_A    = 0x09,   /* air status frame          (air->goggle) */
     MP_SETLDCFG    = 0x0a,   /* low-delay/video config    (goggle->air) */
     MP_SETCAMERA   = 0x0c,   /* camera ISP selector set   (goggle->air) */
@@ -60,15 +60,28 @@ static inline int mp_header_only(uint8_t *frame, enum mp_type type, uint32_t sta
     return MP_HDR_LEN;
 }
 
-/* MEDIA_PARAMS handshake: request (poll for video params) and the type-3 ack that starts video. */
+/* MEDIA_PARAMS handshake: the goggle's poll and the air's reply. The reply is header-only here: the
+ * vendor's carries media params, but our goggle dispatches on msg_type alone (ml-linkd.c) and takes
+ * its video geometry from SetLdCfg, so there is no field to fabricate. */
 static inline int mp_params_request(uint8_t *frame, uint32_t stamp)
 {
     return mp_header_only(frame, MP_REQUEST, stamp);
 }
 
-static inline int mp_params_ack(uint8_t *frame, uint32_t stamp)
+static inline int mp_params_reply(uint8_t *frame, uint32_t stamp)
 {
-    return mp_header_only(frame, MP_ACK, stamp);
+    return mp_header_only(frame, MP_REPLY, stamp);
+}
+
+/* MEDIA_IDR_REQUEST: the receiver asking the air for a keyframe, which is what starts video at
+ * session start and what repairs a late join. RE: the goggle's AR_FSM_RX_ProcessIdrRequest
+ * @0x42de70 pushes a wire message with [0]=3, us-timestamp at +8 and length at +16 - the :10000
+ * header - as AR_FSM_RX_ProcessParamsRequest @0x42d8c0 does with [0]=1. The air routes it to TX FSM
+ * message 8, AR_FSM_TX_ProcessIdrRequest @0x428938, which calls AR_LDRT_TX_PIPELINE_IdrEnable while
+ * already streaming. */
+static inline int mp_idr_request(uint8_t *frame, uint32_t stamp)
+{
+    return mp_header_only(frame, MP_IDR_REQUEST, stamp);
 }
 
 /* STB_EVENT_ACK: the empty-body ack that COMPLETES the air's standby entry. Without it the air holds

@@ -265,16 +265,16 @@ static int air_rate_total_kbps(int mcs, int throughput_kbps)
     return kbps != 0 ? kbps : AIR_RATE_FALLBACK_KBPS;
 }
 
-/* Push one per-tile bitrate to ml-air-video. Returns 0 when it answered "ok". */
-static int air_rate_send(int bps_per_tile)
+/* Send one line to ml-air-video's control socket. Returns 0 when it answered "ok". A fresh connect
+ * per command: the socket is a one-shot request/reply and ml-air-video may not be up yet. */
+static int air_ctrl_send(const char *cmd)
 {
     const char *path = getenv("ML_AIR_CTRL");
     struct timeval tv = { .tv_sec = 0, .tv_usec = AIR_CTRL_TIMEOUT_MS * 1000 };
     struct sockaddr_un addr;
-    char cmd[64];
     char reply[128];
+    size_t len = strlen(cmd);
     ssize_t n;
-    int len;
     int fd;
 
     if (path == NULL || path[0] == '\0') {
@@ -301,8 +301,7 @@ static int air_rate_send(int bps_per_tile)
         return -1;
     }
 
-    len = snprintf(cmd, sizeof cmd, "bitrate %d\n", bps_per_tile);
-    if (write(fd, cmd, (size_t)len) != len) {
+    if (write(fd, cmd, len) != (ssize_t)len) {
         close(fd);
         return -1;
     }
@@ -318,12 +317,54 @@ static int air_rate_send(int bps_per_tile)
     return strncmp(reply, "ok ", 3) == 0 ? 0 : -1;
 }
 
+/* ---------------------------------------------------------------------------------------------
+ * MEDIA_IDR_REQUEST: force a keyframe on demand.
+ *
+ * The stream carries one IDR at FrameId 0 and P-frames after, vendor-exact, so a receiver that was
+ * not listening at session start needs a fresh one to decode at all. This request is the vendor's
+ * repair path: AR_FSM_TX_ProcessIdrRequest @0x428938 calls AR_LDRT_TX_PIPELINE_IdrEnable while
+ * already streaming. ml-air-video's keyframe command is the same thing, and it re-sends VPS/SPS/PPS
+ * with the IDR so a late joiner gets parameter sets too.
+ *
+ * Requests are decoder-driven and therefore rare. Honouring at most one per AIR_IDR_MIN_GAP_MS
+ * bounds what a receiver that keeps asking can cost, and sits well under the goggle's 2 s request
+ * cadence, so a real request is never suppressed.
+ * ------------------------------------------------------------------------------------------- */
+
+#define AIR_IDR_MIN_GAP_MS 500
+
+struct air_idr {
+    long last_ms;           /* when we last forced one, 0 = never */
+    int warned_ctrl;
+};
+
+static void air_idr_request(struct air_idr *s, long now)
+{
+    if (s->last_ms != 0 && now - s->last_ms < AIR_IDR_MIN_GAP_MS) {
+        return;
+    }
+
+    if (air_ctrl_send("keyframe\n") != 0) {
+        if (!s->warned_ctrl) {
+            fprintf(stderr, TAG " idr: ml-air-video control socket not answering, retrying\n");
+            s->warned_ctrl = 1;
+        }
+        return;
+    }
+
+    s->warned_ctrl = 0;
+    s->last_ms = now;
+    printf(TAG " idr: keyframe forced on request\n");
+    fflush(stdout);
+}
+
 /* Derive the target for @p mcs / @p throughput_kbps and apply it, unless it is already applied or
  * we are only probing. */
 static void air_rate_apply(struct air_rate *r, int mcs, int throughput_kbps, const char *why)
 {
     int total_kbps = air_rate_total_kbps(mcs, throughput_kbps);
     int bps = total_kbps * 1000 / AIR_RATE_TILES;
+    char cmd[64];
 
     if (r->mode == ML_RATE_PROBE) {
         printf(TAG " rate probe: %s mcs=%d throughput=%d kbps -> %d kbps total, %d bps/tile"
@@ -336,7 +377,8 @@ static void air_rate_apply(struct air_rate *r, int mcs, int throughput_kbps, con
         return;
     }
 
-    if (air_rate_send(bps) != 0) {
+    snprintf(cmd, sizeof cmd, "bitrate %d\n", bps);
+    if (air_ctrl_send(cmd) != 0) {
         if (!r->warned_ctrl) {
             fprintf(stderr, TAG " rate: ml-air-video control socket not answering, retrying\n");
             r->warned_ctrl = 1;
@@ -522,6 +564,7 @@ static void air_send_canvas(const uint8_t *canvas, size_t len, void *ctx)
 void air_main(const char *hw_version, const char *fc_tty, enum ml_rate_mode rate_mode)
 {
     struct air_rate rate = { .mode = rate_mode, .fd = -1, .mcs = -1, .pending_mcs = -1 };
+    struct air_idr idr = { 0 };
     int status_sock = socket(AF_INET, SOCK_DGRAM, 0);
     int hello_sock = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in goggle_status, goggle_hello;
@@ -563,6 +606,7 @@ void air_main(const char *hw_version, const char *fc_tty, enum ml_rate_mode rate
         uint32_t stamp_us;
         uint8_t frame[MP_STATUS_A_TOTAL];
         uint8_t rx[HELLO_LEN];
+        uint8_t mp_rx[PKT_MAX];
         ssize_t n;
 
         if (!status_bound && air_bind_local(status_sock, PARAMS_PORT) == 0) {
@@ -640,13 +684,33 @@ void air_main(const char *hw_version, const char *fc_tty, enum ml_rate_mode rate
             }
         }
 
-        /* Drain the goggle's :10000 datagrams (params request + config) to keep the receive buffer
-         * clear. */
-        if (status_bound) {
-            uint8_t junk[PKT_MAX];
+        /* Service the goggle's :10000 datagrams. Everything is drained every tick either way, so the
+         * receive buffer stays clear; the two types below are answered. */
+        while (status_bound &&
+               (n = recvfrom(status_sock, mp_rx, sizeof mp_rx, MSG_DONTWAIT, NULL, NULL)) > 0) {
+            uint32_t msg_type;
 
-            while (recvfrom(status_sock, junk, sizeof junk, MSG_DONTWAIT, NULL, NULL) > 0) {
-                /* discard */
+            if ((size_t)n < 4) {
+                continue;
+            }
+
+            memcpy(&msg_type, mp_rx, 4);
+
+            if (msg_type == MP_REQUEST) {
+                /* The goggle gates its whole session on this reply: it drives the IDR request, the
+                 * solid-green LED and the video-stall watch (ml-linkd.c g_params_acked). Answering
+                 * changes no air-side state, matching AR_FSM_TX_ProcessParamsRequest @0x4284e8. */
+                sendto(status_sock, frame, mp_params_reply(frame, stamp_us), MSG_DONTWAIT,
+                       (struct sockaddr *)&goggle_status, sizeof goggle_status);
+
+                if (g_verbose) {
+                    fprintf(stderr, TAG " rx MEDIA_PARAMS_REQUEST -> reply\n");
+                }
+            } else if (msg_type == MP_IDR_REQUEST) {
+                air_idr_request(&idr, now);
+            } else if (g_verbose) {
+                fprintf(stderr, TAG " rx :10000 type 0x%02x (%zd B), ignored\n",
+                        msg_type, (ssize_t)n);
             }
         }
 
