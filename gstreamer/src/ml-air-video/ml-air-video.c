@@ -1789,6 +1789,44 @@ static int air_set_bitrate_all(int bitrate, int vbv)
     return ret;
 }
 
+/* Force an IDR on every active tile.
+ *
+ * This stream carries exactly one IDR, at FrameId 0, and P-frames for the rest of the session, so a
+ * receiver that was not listening at session start cannot decode and no amount of motion repairs it:
+ * the encoder picks intra-vs-inter against its OWN reference, which is correct, so it never notices
+ * that the receiver's is not. The vendor covers this with an on-demand keyframe
+ * (AR_LOWDELAY_MESSAGE_MEDIA_IDR_REQUEST -> AR_LDRT_TX_PIPELINE_IdrEnable); this is our end of it.
+ * V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME is a button control, so the value is ignored.
+ */
+static int air_force_keyframe_all(void)
+{
+    int ret = 0;
+    int forced = 0;
+
+    if (air_active_encoder_count() == 0) {
+        g_printerr("[ml-air-video] keyframe needs the direct V4L2 encoder path\n");
+        return -1;
+    }
+
+    for (int i = 0; i < AIR_NCHN; i++) {
+        if (!g_tile[i].active || g_tile[i].enc_fd < 0) {
+            continue;
+        }
+
+        if (air_enc_set_int(&g_tile[i], V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 0, "keyframe") != 0) {
+            ret = -1;
+        } else {
+            forced++;
+        }
+    }
+
+    if (ret == 0) {
+        g_printerr("[ml-air-video] forced a keyframe on %d tile(s)\n", forced);
+    }
+
+    return ret;
+}
+
 static int air_set_fps_all(int fps)
 {
     int ret = 0;
@@ -1895,10 +1933,14 @@ static gboolean air_on_ctrl(G_GNUC_UNUSED int fd, G_GNUC_UNUSED GIOCondition con
     } else if (sscanf(buf, "fps %d", &fps) == 1) {
         ret = air_set_fps_all(fps);
         snprintf(reply, sizeof reply, "%s fps=%d\n", ret == 0 ? "ok" : "err", fps);
+    } else if (strncmp(buf, "keyframe", 8) == 0) {
+        ret = air_force_keyframe_all();
+        snprintf(reply, sizeof reply, "%s keyframe\n", ret == 0 ? "ok" : "err");
     } else {
         ret = -1;
         snprintf(reply, sizeof reply,
-                 "err expected: bitrate <bps> [vbv] | fps <fps> | rate <bps> <fps> [vbv]\n");
+                 "err expected: bitrate <bps> [vbv] | fps <fps> | rate <bps> <fps> [vbv]"
+                 " | keyframe\n");
     }
 
     (void)write(cfd, reply, strlen(reply));
@@ -2106,6 +2148,11 @@ static int air_enc_open(struct air_tile *t, const char *dev, int fps)
                  V4L2_MPEG_VIDEO_BITRATE_MODE_CBR, "bitrate mode");
     air_enc_ctrl(t, V4L2_CID_MPEG_VIDEO_GOP_SIZE,
                  atoi(env_or("ML_AIR_GOP", "0")), "gop size");
+    /* Repeat VPS/SPS/PPS on every IDR. The stream carries one IDR at session start and parameter
+     * sets are sent once, so a receiver that joins later has neither - a forced keyframe on its own
+     * gives it a picture it cannot configure a decoder for. Seq-init parameter, so it has to be set
+     * before streaming starts, not alongside the keyframe request. */
+    air_enc_ctrl(t, V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR, 1, "prepend sps/pps to idr");
     air_enc_ctrl(t, V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE, 1, "frame rc");
     air_enc_ctrl(t, V4L2_CID_MPEG_VIDEO_MB_RC_ENABLE,
                  atoi(env_or("ML_AIR_MBRC", "1")), "mb rc");

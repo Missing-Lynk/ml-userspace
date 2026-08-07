@@ -29,17 +29,22 @@ int main(int argc, char **argv)
         arg = 2;
     }
 
-    if (argc - arg < 2 ||
+    /* keyframe is the only command that takes no argument of its own. */
+    if (argc - arg < 1 ||
+        (argc - arg < 2 && strcmp(argv[arg], "keyframe") != 0) ||
         (strcmp(argv[arg], "bitrate") != 0 && strcmp(argv[arg], "fps") != 0 &&
-         strcmp(argv[arg], "rate") != 0)) {
+         strcmp(argv[arg], "rate") != 0 && strcmp(argv[arg], "keyframe") != 0)) {
         fprintf(stderr,
                 "usage: ml-air-ctl [socket] bitrate <bps-per-tile> [vbv-ms]\n"
                 "       ml-air-ctl [socket] fps <fps>\n"
-                "       ml-air-ctl [socket] rate <bps-per-tile> <fps> [vbv-ms]\n");
+                "       ml-air-ctl [socket] rate <bps-per-tile> <fps> [vbv-ms]\n"
+                "       ml-air-ctl [socket] keyframe\n");
         return 2;
     }
 
-    if (strcmp(argv[arg], "rate") == 0 && argc - arg >= 4) {
+    if (strcmp(argv[arg], "keyframe") == 0) {
+        snprintf(cmd, sizeof cmd, "keyframe\n");
+    } else if (strcmp(argv[arg], "rate") == 0 && argc - arg >= 4) {
         snprintf(cmd, sizeof cmd, "rate %s %s %s\n", argv[arg + 1], argv[arg + 2],
                  argv[arg + 3]);
     } else if (strcmp(argv[arg], "rate") == 0 && argc - arg >= 3) {
