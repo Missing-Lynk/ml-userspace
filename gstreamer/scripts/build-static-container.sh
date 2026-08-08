@@ -133,7 +133,8 @@ echo "=== linking standalone ml-air-video against gstreamer-full-1.0 ==="
 # (it only links gstreamer-1.0 + gstreamer-app-1.0). vph-test.c is excluded: it has its own main().
 gcc -O2 -Wall -static -o "$OUT/ml-air-video.debug" \
     $(pkg-config --cflags gstreamer-full-1.0) \
-    /w/gstreamer/src/ml-air-video/ml-air-video.c /w/gstreamer/src/ml-air-video/vph.c \
+    /w/gstreamer/src/ml-air-video/ml-air-video.c /w/gstreamer/src/ml-air-video/mav-*.c \
+    /w/gstreamer/src/ml-air-video/vph.c \
     -Wl,--start-group $(pkg-config --libs --static gstreamer-full-1.0) -leconf -Wl,--end-group \
     -lpthread || { echo "LINK FAILED - see errors above"; exit 1; }
 
