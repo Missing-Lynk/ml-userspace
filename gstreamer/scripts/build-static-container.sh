@@ -39,7 +39,7 @@ if [ ! -f "$PREFIX/lib/libeconf.a" ]; then
     cd "libeconf-${LIBECONF_VER}"
     gcc -O2 -Iinclude -c lib/*.c
     mkdir -p "$PREFIX/lib"
-    ar rcs "$PREFIX/lib/libeconf.a" *.o
+    ar rcs "$PREFIX/lib/libeconf.a" ./*.o
 fi
 
 # Persist the clone + build tree in the (gitignored) build/ dir so re-runs reconfigure
@@ -118,6 +118,7 @@ export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
 pkg-config --exists gstreamer-full-1.0 && echo "have gstreamer-full-1.0" || echo "NO gstreamer-full-1.0 .pc"
 # gst static libs are mutually circular -> --start-group/--end-group. --undefined (in the full .pc
 # Libs.private) pulls the static plugin registration.
+# shellcheck disable=SC2046  # pkg-config output is a flag list and must word-split
 gcc -O2 -Wall -static -o "$OUT/ml-pipeline.debug" \
     $(pkg-config --cflags gstreamer-full-1.0 gstreamer-rtsp-server-1.0) \
     /w/gstreamer/src/ml-pipeline/*.c \
@@ -131,6 +132,7 @@ strip --strip-all "$OUT/ml-pipeline"
 echo "=== linking standalone ml-air-video against gstreamer-full-1.0 ==="
 # The air-unit synthetic-video TX. Same static gst-full closure as ml-pipeline, minus rtsp-server
 # (it only links gstreamer-1.0 + gstreamer-app-1.0). vph-test.c is excluded: it has its own main().
+# shellcheck disable=SC2046  # pkg-config output is a flag list and must word-split
 gcc -O2 -Wall -static -o "$OUT/ml-air-video.debug" \
     $(pkg-config --cflags gstreamer-full-1.0) \
     /w/gstreamer/src/ml-air-video/ml-air-video.c /w/gstreamer/src/ml-air-video/mav-*.c \

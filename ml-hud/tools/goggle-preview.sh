@@ -25,6 +25,7 @@ DRM_SOCK=/run/missinglynk/drm.sock
 # pattern from matching the grep itself. SIGTERM only (never -9 for the HUD: it must free its DRM
 # buffer, a -9 leaks it into the broker's shared drm_file).
 kill_by() {
+    # shellcheck disable=SC2009  # busybox pkill -x is unreliable here, see above
     ps w | grep "$1" | awk '{print $1}' | while read -r pid; do
         kill "$pid" 2>/dev/null
     done
@@ -72,9 +73,12 @@ sleep 1
 nohup "$ML/osd-replay" "$ML/btfl-osd-10000.pcap" --loop >"$ML/replay.log" 2>&1 </dev/null &
 sleep 2
 
+# shellcheck disable=SC2009  # busybox pkill -x is unreliable here, see kill_by
+alive() { ps w | grep -q "$1"; }
+
 echo "=== alive? ==="
-ps w | grep -q "[m]l-drmfd"      && echo "ml-drmfd:   RUNNING" || echo "ml-drmfd:   dead"
-ps w | grep -q "[/]${ML#/}/osd-replay" && echo "osd-replay: RUNNING" || echo "osd-replay: dead"
-ps w | grep -q "[/]${ML#/}/hud"  && echo "hud:        RUNNING" || echo "hud:        dead"
+alive "[m]l-drmfd"             && echo "ml-drmfd:   RUNNING" || echo "ml-drmfd:   dead"
+alive "[/]${ML#/}/osd-replay"  && echo "osd-replay: RUNNING" || echo "osd-replay: dead"
+alive "[/]${ML#/}/hud"         && echo "hud:        RUNNING" || echo "hud:        dead"
 echo "=== hud.log ==="; cat "$ML/hud.log"
 echo "=== replay.log ==="; cat "$ML/replay.log"

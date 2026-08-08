@@ -47,12 +47,14 @@ sshg "cat > /tmp/artosyn_vo.ko" < "$KBASE/ml-modules/rootfs/lib/modules/${KERNEL
 # rebuilt decoder (e.g. the multi-instance RESULT_NOT_READY retry fix) reaches the device
 # without re-pushing the squashfs. Only takes effect on a FRESH boot (wave5 will not warm-reload).
 sshg "cat > /tmp/wave5.ko" < "$KBASE/ml-modules/rootfs/lib/modules/${KERNEL_VERSION}/kernel/wave5.ko"
+# shellcheck disable=SC2016  # remote command string: expands on the device, not here
 sshg 'for ko in artosyn_gpio dw_mci-artosyn; do
         name="$(echo "$ko" | tr - _)"
         grep -q "^$name " /proc/modules || insmod /tmp/$ko.ko
       done'
 
 echo "[*] mounting SD card ..."
+# shellcheck disable=SC2016  # remote command string: expands on the device, not here
 sshg 'for i in 1 2 3 4 5 6 7 8; do [ -b /dev/mmcblk0 ] || [ -b /dev/mmcblk1 ] && break; sleep 2; done
       SD=/dev/mmcblk1; [ -b /dev/mmcblk1 ] || SD=/dev/mmcblk0
       mkdir -p /mnt/sdcard && { grep -q " /mnt/sdcard " /proc/mounts || mount -t exfat "$SD" /mnt/sdcard; } && mkdir -p /mnt/sdcard/missinglynk'

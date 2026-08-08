@@ -10,6 +10,7 @@
 # port run ml-rf-replay against the same socket.
 set -e
 GSTP="${GSTP:-/mnt/gst}"
+# shellcheck source=/dev/null  # resolved on the device under $GSTP, not in the repo
 . "$GSTP/missinglynk/bin/gst-env.sh"
 
 # Warm plugin registry (gst-env.sh persists it on the SD; a fresh SD may still cold-scan once ~19s).
