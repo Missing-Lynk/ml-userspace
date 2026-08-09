@@ -1,6 +1,6 @@
 # ml-linkd
 
-RF link daemon for the AR8030 link. One binary, two roles selected by `--role` (default `rx`): the goggle (RX) side brings the link up, keeps it up, and starts the transmitter's video stream when a consumer is ready; the air unit (`--role air`) side transmits telemetry to the goggle. Static binary, no external dependencies, single C file.
+RF link daemon for the AR8030 link. One binary, two roles selected by `--role` (default `rx`): the goggle (RX) side brings the link up, keeps it up, and starts the transmitter's video stream when a consumer is ready; the air unit (`--role air`) side transmits telemetry to the goggle. Static binary, no external dependencies.
 
 ## Air (TX) role (`--role air`)
 
