@@ -65,7 +65,7 @@ $(BUILD)/$(1): $(wildcard $(1)/*.c) $(wildcard $(1)/*.h) ml-shared/mlm.h | $(BUI
 	    gcc -O2 -Wall -static $(3) -o build/$(1) $(1)/*.c'
 	@ls -la $$@
 endef
-$(eval $(call daemon_rule,ml-linkd,,-pthread))
+$(eval $(call daemon_rule,ml-linkd,linux-headers,-pthread))
 $(BUILD)/ml-linkd: ml-linkd/version.h
 $(eval $(call daemon_rule,ml-ledd,linux-headers,))
 $(eval $(call daemon_rule,ml-rf-bringup,linux-headers,))

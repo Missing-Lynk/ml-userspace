@@ -949,7 +949,7 @@ static void bind_run(uint8_t *frame, uint32_t *seq_link)
     }
 
     link_event(MLM_LINK_BINDING, "pair mode on, waiting for an air unit in bind mode");
-    send_frame(frame, bb_pair_mode(frame, 1, (*seq_link)++), "pair-on");
+    send_frame(frame, bb_pair_mode(frame, 1, 0, (*seq_link)++), "pair-on");
 
     for (t0 = now_ms(); g_run && now_ms() - t0 < BIND_WINDOW_MS && hits < BIND_HITS; ) {
         uint8_t poll[19];
@@ -976,7 +976,7 @@ static void bind_run(uint8_t *frame, uint32_t *seq_link)
         usleep(BIND_POLL_US);
     }
 
-    send_frame(frame, bb_pair_mode(frame, 0, (*seq_link)++), "pair-off");
+    send_frame(frame, bb_pair_mode(frame, 0, 0, (*seq_link)++), "pair-off");
 
     if (hits >= BIND_HITS) {
         char what[96];

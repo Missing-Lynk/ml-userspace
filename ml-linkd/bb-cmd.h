@@ -63,6 +63,7 @@ enum bb_get_sel {
 /* SET selectors (channel BB_SET). */
 enum bb_set_sel {
     SET_PAIR_MODE  = 0x02,
+    SET_AP_MAC     = 0x03,   /* DEV role: the peer (goggle) MAC this unit binds to */
     SET_PAIR_LOCK  = 0x04,
     SET_CHNMODE    = 0x05,
     SET_CHNIDX     = 0x06,
@@ -310,15 +311,28 @@ static inline int bb_set_bandwidth(uint8_t *frame, uint8_t bandwidth, uint32_t s
     return bb_build_cmd(frame, BB_SET, SET_BANDWIDTH, payload, sizeof payload, seq);
 }
 
-/* DECODED: enter (enable = 1) / exit (enable = 0) the chip's pair mode for slot 0. Byte 0 is the
- * enable flag, byte 1 the slot bitmask (bit 0 = slot 0); bb_build_cmd zero-pads to the command's
+/* DECODED: enter (enable = 1) / exit (enable = 0) the chip's pair mode for @p slot. Byte 0 is the
+ * enable flag, byte 1 the slot bitmask (bit n = slot n); bb_build_cmd zero-pads to the command's
  * 14-byte wire length. While pair mode is on the chip broadcasts/answers pairing over the air
- * autonomously; the host polls GET_PAIR for a candidate (AR_AR8030_RX_BbPair @0x462ea8). */
-static inline int bb_pair_mode(uint8_t *frame, uint8_t enable, uint32_t seq)
+ * autonomously; the host polls GET_PAIR for a candidate (AR_AR8030_RX_BbPair @0x462ea8).
+ *
+ * The AP role pairs on a fixed slot 0. The DEV role takes its slot from the GET_PAIR bitmask, so
+ * the exit must carry the same bit the candidate arrived on (AR_AR8030_TX_BbPair @0x4331f0). */
+static inline int bb_pair_mode(uint8_t *frame, uint8_t enable, uint8_t slot, uint32_t seq)
 {
-    const uint8_t payload[2] = { enable ? 1 : 0, 0x01 };
+    const uint8_t payload[2] = { enable ? 1 : 0, (uint8_t)(1u << (slot & 7)) };
 
     return bb_build_cmd(frame, BB_SET, SET_PAIR_MODE, payload, sizeof payload, seq);
+}
+
+/* DECODED: set the peer MAC this unit binds to. @p mac is 4 bytes in wire order, exactly as read
+ * from the GET_PAIR reply and NOT byte-swapped; 0xFFFFFFFF is the broadcast the DEV role writes
+ * before entering pair mode. The DEV role writes this outside pair mode twice, before entry and
+ * after exit, and checks both returns (AR_AR8030_TX_BbPair @0x4331f0), so a rejection outside pair
+ * mode is an AP-role rule and does not apply here. */
+static inline int bb_set_ap_mac(uint8_t *frame, const uint8_t mac[4], uint32_t seq)
+{
+    return bb_build_cmd(frame, BB_SET, SET_AP_MAC, mac, 4, seq);
 }
 
 /* DECODED: lock the pairing to @p mac (4 bytes, exactly as read from the GET_PAIR reply, NOT

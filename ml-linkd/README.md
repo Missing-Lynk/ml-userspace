@@ -4,23 +4,56 @@ RF link daemon for the AR8030 link. One binary, two roles selected by `--role` (
 
 ## Air (TX) role (`--role air`)
 
-Association is autonomous from the `artosyn_sdio` insmod config, so by default the air role never opens `/dev/artosyn_sdio` and speaks only UDP on `sdio0` (the one exception is the rate governor below, which is off unless asked for):
+Association is autonomous from the `artosyn_sdio` insmod config, so in the steady state the air role speaks only UDP on `sdio0`. Two paths open `/dev/artosyn_sdio`: the rate governor, off unless asked for, and the pair window, only while it is open. The fd is shared and reference-counted, because two opens of that node in one process wedge the RF chip.
 
 - Reads the two SoC sensors over IIO: battery voltage from the SAR ADC (`artosyn-adc`, channel 1, `in_voltage1_input` x the board divider) and the junction temperature from the SoC sensor (`temperature`, `in_temp_scale`). Both are resolved by IIO device name and retried until the modules have coldplugged.
-- Transmits the vendor's `:10000` status frames to the goggle (10.0.0.1): `0x11` periodic (voltage, ~6 Hz) and `0x09` version/info (hw/fw strings + voltage + temperature, ~1 Hz).
+- Transmits the `:10000` status frames to the goggle (10.0.0.1): `0x11` periodic (voltage, ~6 Hz) and `0x09` version/info (hw/fw strings + voltage + temperature, ~1 Hz).
 - Answers the goggle's `:20001` identity probe (mirrors the 520-byte type-0 datagram back with `byte[0]=0x01`).
-- Answers the goggle's `:10000` type-1 MEDIA_PARAMS_REQUEST with a type-2 reply. The goggle gates its solid-green LED, its IDR request and its video-stall watch on this reply. The reply is the 24-byte header alone; the vendor's carries a 72-byte codec/resolution body, which the goggle here ignores in favour of `msg_type` dispatch and SetLdCfg geometry.
-- Answers the goggle's `:10000` type-3 MEDIA_IDR_REQUEST by forcing a keyframe through `ml-air-video`'s control socket, matching the vendor's `AR_LDRT_TX_PIPELINE_IdrEnable`. The stream carries one IDR at FrameId 0 and P-frames after, so this request is how a goggle powered on mid-flight, or one whose decoder desynced, gets a decodable entry point. At most one forced keyframe per 500 ms.
+- Answers the goggle's `:10000` type-1 MEDIA_PARAMS_REQUEST with a type-2 reply. The goggle gates its solid-green LED, its IDR request and its video-stall watch on this reply. The reply is the 24-byte header alone.
+- Answers the goggle's `:10000` type-3 MEDIA_IDR_REQUEST by forcing a keyframe through `ml-air-video`'s control socket. The stream carries one IDR at FrameId 0 and P-frames after, so this is how a receiver that joined later gets a decodable entry point. At most one forced keyframe per 500 ms.
+
+- Watches the bind button and runs a 30 s pair window on a press held 2 s or less. The window blinks the red indicator, holds the green power LED off, and binds to whichever peer answers.
 
 The goggle's RX role republishes the received `0x09`/`0x11` frames on `telemetry.sock` as `MLM_T_STATUS`, so the HUD shows the air unit's voltage and temperature.
 
+### Pair window (DEV role)
+
+A press held at most 2 s runs the pair sequence; a longer hold does nothing. The window is 30 s.
+
+1. Refuse if a link is up. `GET_MCS` throughput reads 0 with no peer associated and the link rate once associated, so link state is read from the chip. A chip that does not answer within 300 ms also refuses.
+2. Save the current `ap_mac`, taken from `"ap_mac"` in `/usrdata/missinglynk/bb_config_air.json` when present, otherwise `/lib/firmware/bb_config_air.json`.
+3. Write `ap_mac` = `ffffffff`. On failure the window does not open and nothing is undone, since pair mode was never entered.
+4. Enter pair mode on slot 0. On failure the saved `ap_mac` is written back and the window does not open.
+5. Poll `GET_PAIR` every 20 ms. Byte 0 of the reply is the candidate bitmask; the lowest set bit becomes the slot, and the peer MAC follows at `1 + slot*4` in wire order. Hits accumulate and are not reset by a zero read.
+6. On the 6th hit, exit pair mode on the discovered slot, then write `ap_mac` = the peer MAC on the following tick, byte order unchanged.
+7. On expiry, exit pair mode and write the saved `ap_mac` back, retried for up to `AIR_BIND_RESTORE_TRIES` ticks.
+8. After a committed peer, `ml-rf-persist --air` writes it to the config.
+
+A commit the chip rejects is not persisted: the sequence moves to step 7 instead, so a persisted binding is one the chip holds.
+
+The window is a state machine across ticks, not a blocking call, because `ml_msp_service()` drains the FC UART every tick and a 30 s block overruns that tty at 115200 with MSP DisplayPort active. The tick shortens to 20 ms while the window is open. Periodic transmits are gated on elapsed milliseconds, so the tick change does not move their rates.
+
+The chip re-reads its config at insmod and there is no host apply command, so a committed peer survives a power cycle only through the persisted file: `ml-rf-persist --air` sets `baseband.basic.dev.ap_mac` in a `/usrdata/missinglynk` copy, minified, and `ml-air-link` exports `ML_RF_FW_PATH=/usrdata/missinglynk` so `ml-rf-bringup` puts that directory on the kernel firmware search path ahead of `/lib/firmware`.
+
+### Bind button
+
+The button is a `gpio-keys-polled` device at a 50 ms `poll-interval`, since `artosyn_gpio` registers no irqchip. The kernel emits an evdev event on a level change, so every measured hold carries a 50 ms quantisation.
+
+The device is resolved by matching `EVIOCGNAME` against `ml-bind-button` across `/dev/input/event*`, retried every 5 s until it appears. Events are drained non-blocking once per tick, up to `AIR_BIND_EV_BURST_MAX`; the kernel queues anything arriving between ticks. Hold time is the difference of two `ev.time` stamps. Those are `CLOCK_REALTIME` while the window deadline is `CLOCK_MONOTONIC`; the two are never mixed, and a negative hold is rejected.
+
+The blink is the kernel `timer` trigger at `delay_on` = `delay_off` = 40 ms. `delay_on`/`delay_off` exist only once the trigger is selected, so the trigger is written first. The green LED is set to 0 for the duration of the window and restored to its sampled brightness after: the two lines share one series resistor, so lighting green starves the red. LED writes fail silently, the nodes being absent until `artosyn_gpio` binds.
+
+### Service loop
+
+Both roles run a fixed-tick loop: each service routine runs in turn, every fd is checked non-blocking, and the tick ends in `usleep()`. The air role ticks at 50 ms, and 20 ms while a pair window is open. Periodic transmits are gated on elapsed milliseconds rather than tick counts. Every drain is bounded per tick, so no socket or input queue can hold the loop.
+
 ### Encoder rate governor (`--rate-adapt`, off by default)
 
-Reproduces the vendor's MCS-driven encoder rate. It polls `GET_MCS` on the bb socket every 200 ms, derives a target from the reply's MCS and link throughput with the vendor's own formula (`quantise100(throughput_kbps) * Ar803xThroutputRate`, capped at `ArMaxBitRate`, 8000 kbps when throughput reads zero), halves it for the per-tile control, and pushes it to `ml-air-video` on `/run/missinglynk/air-video.sock`.
+Polls `GET_MCS` on the bb socket every 200 ms and derives an encoder target from the reply: `(throughput_kbps / 100) * 100 * 0.7`, capped at 20000 kbps, and 8000 kbps when throughput reads zero. The integer divide happens before the multiply, so the input is quantised to 100 kbps steps. The result is a total across both tiles; it is halved for the per-tile control and pushed to `ml-air-video` on `/run/missinglynk/air-video.sock`.
 
-It recomputes on MCS transitions only, not on throughput drift, and keeps the vendor's asymmetry: a drop in MCS is applied at once, a rise only after the higher MCS has held for a second. Frame rate and min QP are left alone - the vendor's shipped config makes both dead on the live path.
+It recomputes on MCS transitions only, not on throughput drift, and the response is asymmetric: a drop in MCS is applied at once, a rise only after the higher MCS has held for a second. Frame rate and min QP are not touched.
 
-`--rate-probe` runs the same poll and logs the raw reply, the decode and the target it *would* send, without touching the encoder. The `GET_MCS` reply layout is transcribed from the vendor's `bb_ioctl` path rather than captured from ours, so use `--rate-probe` on a new unit before `--rate-adapt`. Derivation and RE references: `plans/air-mcs-rate-adaptation.md`.
+`--rate-probe` runs the same poll and logs the raw reply, the decode and the target it would send, without touching the encoder. The reply is 8 bytes: MCS index at +0 biased by 2, link throughput as a u32 LE in kbps at +4. Measured values are `19 00 00 00 00 00 00 00` unassociated (MCS 23, 0 kbps) and `0c 00 00 00 be 51 00 00` associated (MCS 10, 20926 kbps), so throughput is the field that distinguishes the two states and the idle MCS reading is the higher one.
 
 ## Behavior
 
@@ -91,4 +124,4 @@ Foreground process. SIGINT/SIGTERM stop it cleanly (cadence stops, device closed
 ## Known limitations
 
 - The gate's `frames_seen` confirmation is only as good as the consumer's report; a consumer reporting a cumulative counter can confirm from a previous session after a restart, stopping the type-1 poll early.
-- Binding a new TX unit is not implemented; the daemon only associates with an already-bound peer.
+- If `/lib/firmware/bb_config_air.json` cannot be read, a pair window still opens but has no `ap_mac` to restore, so a window that finds no peer leaves the unit broadcast-bound until a power cycle. It logs this at window open.
