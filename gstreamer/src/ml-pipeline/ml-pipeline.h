@@ -498,6 +498,12 @@ static inline void pipe_wake(int fd)
     } while (n < 0 && errno == EINTR);
 }
 
+/* Setup breadcrumbs (heap choice, pool geometry, input-gate bounds) are debug-grade: a healthy boot
+ * writes none of them. ML_VERBOSE=1 turns them back on. Failures stay unconditional. ml-pipeline
+ * takes only positional arguments, so this knob is env-only, unlike the -v the other daemons carry.
+ */
+extern int g_verbose;
+
 /* cross-file prototypes; file-local helpers stay static in their .c */
 /* util */
 void crc32_init(void);

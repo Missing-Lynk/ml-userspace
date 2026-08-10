@@ -58,7 +58,7 @@ int ml_heap_alloc(gsize len)
 
     {
         static int logged;
-        if (!logged++) {
+        if (g_verbose && !logged++) {
             fprintf(stderr, "ml-pipeline: composite heap = %s\n", path);
         }
     }
@@ -146,8 +146,10 @@ gboolean comp_pool_init(struct ctx *c)
         g_async_queue_push(c->comp_free, GINT_TO_POINTER(i + 1));   /* +1: 0 == queue-empty */
         c->comp_n++;
     }
-    fprintf(stderr, "ml-pipeline: composite pool = %d x %d KiB (%d MiB)\n",
-            c->comp_n, COMP_SIZE / 1024, c->comp_n * COMP_SIZE / (1024 * 1024));
+    if (g_verbose) {
+        fprintf(stderr, "ml-pipeline: composite pool = %d x %d KiB (%d MiB)\n",
+                c->comp_n, COMP_SIZE / 1024, c->comp_n * COMP_SIZE / (1024 * 1024));
+    }
 
     /* Derive the input-gate bounds from the actual yield: the display side holds up to 4
      * buffers (prev/front/pending/next), the rest is the pairing window; split it between
@@ -161,8 +163,10 @@ gboolean comp_pool_init(struct ctx *c)
 
         c->skew_max = window / 2;
         c->inflight_max = window - c->skew_max;
-        fprintf(stderr, "ml-pipeline: input gate: skew_max=%d inflight_max=%d\n",
-                c->skew_max, c->inflight_max);
+        if (g_verbose) {
+            fprintf(stderr, "ml-pipeline: input gate: skew_max=%d inflight_max=%d\n",
+                    c->skew_max, c->inflight_max);
+        }
     }
 
     return c->comp_n >= COMP_MIN;

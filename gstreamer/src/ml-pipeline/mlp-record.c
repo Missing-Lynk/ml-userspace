@@ -208,8 +208,10 @@ gboolean rec_hw_init(struct ctx *c)
             c->rec_pool_n++;
         }
 
-        fprintf(stderr, "ml-pipeline: DVR scale pool = %d x %d KiB\n",
-                c->rec_pool_n, (int) (bufsize / 1024));
+        if (g_verbose) {
+            fprintf(stderr, "ml-pipeline: DVR scale pool = %d x %d KiB\n",
+                    c->rec_pool_n, (int) (bufsize / 1024));
+        }
     }
 
     return c->rec_pool_n >= 2;          /* one for the encoder + one to scale into, minimum */

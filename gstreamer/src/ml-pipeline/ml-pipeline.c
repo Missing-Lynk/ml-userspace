@@ -30,6 +30,8 @@
  */
 #include "ml-pipeline.h"
 
+int g_verbose;
+
 
 /* file mode's per-decoded-frame FRAMESTATS probe (unchanged). */
 GstPadProbeReturn on_frame(GstPad *pad, GstPadProbeInfo *info, gpointer u)
@@ -541,8 +543,13 @@ static int run_file(struct ctx *c, const char *file, int plane, int drm_fd)
 }
 
 /* Death instrumentation: the pipeline has been observed dying silently (no log line, no
- * kernel fault trace). Log fatal signals and plain exits so the log always shows HOW an
- * instance ended. async-signal-safe: write(2) only.
+ * kernel fault trace). Log fatal signals so the log always shows HOW an instance ended.
+ * async-signal-safe: write(2) only.
+ *
+ * Crash signals only. SIGTERM/SIGINT are a stop request, not a death: rf_main/file_main hand them
+ * to on_signal via g_unix_signal_add, which quits the main loop and runs the shutdown path. That
+ * install happens after this one and overrides it, so listing them here only affected the window
+ * before the main loop exists, where the default action is the honest outcome.
  */
 static void fatal_sig(int sig)
 {
@@ -554,6 +561,10 @@ static void fatal_sig(int sig)
     _exit(128 + sig);
 }
 
+/* A normal exit() is unremarkable, so the note is opt-in (ML_EXITLOG=1). Turn it on when chasing a
+ * silent death: it distinguishes "returned from main / exit() somewhere" from a signal kill, which
+ * leaves no line at all.
+ */
 static void exit_note(void)
 {
     static const char msg[] = "ml-pipeline: exit()\n";
@@ -563,7 +574,7 @@ static void exit_note(void)
 
 int main(int argc, char **argv)
 {
-    static const int sigs[] = { SIGSEGV, SIGBUS, SIGABRT, SIGILL, SIGFPE, SIGTERM, SIGINT };
+    static const int sigs[] = { SIGSEGV, SIGBUS, SIGABRT, SIGILL, SIGFPE };
 
     for (unsigned i = 0; i < sizeof sigs / sizeof sigs[0]; i++) {
         struct sigaction sa = { .sa_handler = fatal_sig };
@@ -571,7 +582,12 @@ int main(int argc, char **argv)
         sigaction(sigs[i], &sa, NULL);
     }
 
-    atexit(exit_note);
+    if (getenv("ML_EXITLOG") != NULL) {
+        atexit(exit_note);
+    }
+
+    g_verbose = (getenv("ML_VERBOSE") != NULL);
+
     setvbuf(stdout, NULL, _IOLBF, 0);   /* line-buffered: logs reach the service log promptly */
     gst_init(&argc, &argv);
     crc32_init();

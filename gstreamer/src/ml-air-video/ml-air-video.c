@@ -51,7 +51,7 @@
  *   ML_AIR_HEAP       dma_heap name for tile bufs (default: first non-mmz heap, else any)
  *   ML_AIR_DUMP       prefix: also write <prefix>_tileN.h265
  *   ML_AIR_NOTX       encode (and dump) without transmitting
- *   ML_AIR_VERBOSE    log one line per second when set
+ *   ML_AIR_VERBOSE    log one line per second when set (same as -v / --verbose)
  *   ML_AIR_ONLY       0|1: encode only that tile (single encoder instance, diagnostic)
  *   ML_AIR_FULL       encode one full 1920x1080 frame instead of tiles (diagnostic)
  *   ML_AIR_SAMEH      run both tiles at 560 rows (diagnostic)
@@ -374,6 +374,16 @@ int main(int argc, char **argv)
      * the reply write to take EPIPE, whose default action would kill the whole video daemon. */
     signal(SIGPIPE, SIG_IGN);
     gst_init(&argc, &argv);
+
+    /* Every other long-running daemon takes -v as well as its env knob; accept it here so the
+     * convention holds. Scanned after gst_init so its own options are already consumed. Unknown
+     * arguments stay ignored: this tool is configured through ML_AIR_* and has no other operands.
+     */
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-v") || !strcmp(argv[i], "--verbose")) {
+            g_verbose = 1;
+        }
+    }
 
     g_recycle_quark = g_quark_from_static_string("air-recycle");
     g_dmabuf_alloc = gst_dmabuf_allocator_new();
