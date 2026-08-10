@@ -344,6 +344,15 @@ void ml_msp_service(struct ml_msp *msp, long now_ms)
     }
 }
 
+/* Whether an FC is talking to us right now. `arm_flag` is only meaningful while this holds: with no
+ * FC attached it reads 0, which is indistinguishable from a real disarm, so a caller that gates on
+ * arm state has to know the difference. `last_rx_ms` is stamped by any MSP reply, so this covers
+ * both a unit that never had an FC and one whose FC has gone away mid-session. */
+int ml_msp_fc_present(const struct ml_msp *msp, long now_ms)
+{
+    return msp->status.last_rx_ms != 0 && now_ms - msp->status.last_rx_ms <= ML_MSP_FRESH_MS;
+}
+
 int ml_msp_fc_voltage_mv(const struct ml_msp *msp, long now_ms)
 {
     /* 1800 is the vendor's 0x708, from AR_LOWDELAY_TX_SYSCTRL_GetVoltage. It is an OVERRIDE

@@ -40,7 +40,7 @@ static void air_enc_ctrl(struct air_tile *tile, guint32 id, gint32 val, const ch
     cs.which = V4L2_CTRL_WHICH_CUR_VAL;
 
     if (ioctl(tile->enc_fd, VIDIOC_S_EXT_CTRLS, &cs) != 0) {
-        g_printerr("[ml-air-video] tile %d: %s: %s\n", tile->chn, name, strerror(errno));
+        g_printerr(TAG " tile %d: %s: %s\n", tile->chn, name, strerror(errno));
     }
 }
 
@@ -59,7 +59,7 @@ int air_enc_set_int(struct air_tile *tile, guint32 id, gint32 val, const char *n
     cs.which = V4L2_CTRL_WHICH_CUR_VAL;
 
     if (ioctl(tile->enc_fd, VIDIOC_S_EXT_CTRLS, &cs) != 0) {
-        g_printerr("[ml-air-video] tile %d: live %s %d: %s\n",
+        g_printerr(TAG " tile %d: live %s %d: %s\n",
                    tile->chn, name, val, strerror(errno));
         return -1;
     }
@@ -112,7 +112,7 @@ int air_enc_set_fps(struct air_tile *tile, int fps)
     sp.parm.output.timeperframe.numerator = 1;
     sp.parm.output.timeperframe.denominator = (guint32)fps;
     if (ioctl(tile->enc_fd, VIDIOC_S_PARM, &sp) != 0) {
-        g_printerr("[ml-air-video] tile %d: live fps %d: %s\n",
+        g_printerr(TAG " tile %d: live fps %d: %s\n",
                    tile->chn, fps, strerror(errno));
         return -1;
     }
@@ -168,7 +168,7 @@ int air_enc_find_node(const char *camera, char *out, size_t len)
         }
     }
 
-    g_printerr("[ml-air-video] no node offers HEVC on its capture queue\n");
+    g_printerr(TAG " no node offers HEVC on its capture queue\n");
     return -1;
 }
 
@@ -200,7 +200,7 @@ int air_enc_open(struct air_tile *tile, const char *dev, int fps)
      * fails, which on a blocking fd never happens. */
     tile->enc_fd = open(dev, O_RDWR | O_NONBLOCK | O_CLOEXEC);
     if (tile->enc_fd < 0) {
-        g_printerr("[ml-air-video] tile %d: open %s: %s\n", tile->chn, dev, strerror(errno));
+        g_printerr(TAG " tile %d: open %s: %s\n", tile->chn, dev, strerror(errno));
         return -1;
     }
 
@@ -217,13 +217,13 @@ int air_enc_open(struct air_tile *tile, const char *dev, int fps)
     }
 
     if (ioctl(tile->enc_fd, VIDIOC_S_FMT, &f) != 0) {
-        g_printerr("[ml-air-video] tile %d: S_FMT OUTPUT: %s\n", tile->chn, strerror(errno));
+        g_printerr(TAG " tile %d: S_FMT OUTPUT: %s\n", tile->chn, strerror(errno));
         return -1;
     }
 
     if (f.fmt.pix_mp.pixelformat != V4L2_PIX_FMT_YUV420M ||
         f.fmt.pix_mp.num_planes != AIR_CAP_PLANES) {
-        g_printerr("[ml-air-video] tile %d: encoder substituted the source format\n", tile->chn);
+        g_printerr(TAG " tile %d: encoder substituted the source format\n", tile->chn);
         return -1;
     }
 
@@ -231,19 +231,19 @@ int air_enc_open(struct air_tile *tile, const char *dev, int fps)
         guint32 bpl = f.fmt.pix_mp.plane_fmt[plane].bytesperline;
         guint32 want = g_cap_stride[plane];
 
-        g_printerr("[ml-air-video] tile %d: enc plane %d bytesperline %u (asked %u), "
+        g_printerr(TAG " tile %d: enc plane %d bytesperline %u (asked %u), "
                    "sizeimage %u (buffer has %zu)\n",
                    tile->chn, plane, bpl, want, f.fmt.pix_mp.plane_fmt[plane].sizeimage,
                    air_cap_len(tile, plane));
 
         if (bpl != want) {
-            g_printerr("[ml-air-video] tile %d: encoder rewrote the source stride; "
+            g_printerr(TAG " tile %d: encoder rewrote the source stride; "
                        "refusing to encode a sheared picture\n", tile->chn);
             return -1;
         }
 
         if (f.fmt.pix_mp.plane_fmt[plane].sizeimage > air_cap_len(tile, plane)) {
-            g_printerr("[ml-air-video] tile %d: encoder demands more than the capture "
+            g_printerr(TAG " tile %d: encoder demands more than the capture "
                        "buffer holds on plane %d\n", tile->chn, plane);
             return -1;
         }
@@ -255,7 +255,7 @@ int air_enc_open(struct air_tile *tile, const char *dev, int fps)
         sp.parm.output.timeperframe.numerator = 1;
         sp.parm.output.timeperframe.denominator = (guint32)fps;
         if (ioctl(tile->enc_fd, VIDIOC_S_PARM, &sp) != 0) {
-            g_printerr("[ml-air-video] tile %d: S_PARM %d fps: %s\n",
+            g_printerr(TAG " tile %d: S_PARM %d fps: %s\n",
                        tile->chn, fps, strerror(errno));
             return -1;
         }
@@ -270,7 +270,7 @@ int air_enc_open(struct air_tile *tile, const char *dev, int fps)
     f.fmt.pix_mp.num_planes = 1;
 
     if (ioctl(tile->enc_fd, VIDIOC_S_FMT, &f) != 0) {
-        g_printerr("[ml-air-video] tile %d: S_FMT CAPTURE HEVC: %s\n", tile->chn, strerror(errno));
+        g_printerr(TAG " tile %d: S_FMT CAPTURE HEVC: %s\n", tile->chn, strerror(errno));
         return -1;
     }
 
@@ -304,7 +304,7 @@ int air_enc_open(struct air_tile *tile, const char *dev, int fps)
     rb.memory = V4L2_MEMORY_DMABUF;
     rb.count = AIR_ENC_OUT_BUFS;
     if (ioctl(tile->enc_fd, VIDIOC_REQBUFS, &rb) != 0) {
-        g_printerr("[ml-air-video] tile %d: REQBUFS OUTPUT: %s\n", tile->chn, strerror(errno));
+        g_printerr(TAG " tile %d: REQBUFS OUTPUT: %s\n", tile->chn, strerror(errno));
         return -1;
     }
     tile->enc_out_n = (int)rb.count;
@@ -314,7 +314,7 @@ int air_enc_open(struct air_tile *tile, const char *dev, int fps)
     rb.memory = V4L2_MEMORY_MMAP;
     rb.count = AIR_ENC_CAP_BUFS;
     if (ioctl(tile->enc_fd, VIDIOC_REQBUFS, &rb) != 0) {
-        g_printerr("[ml-air-video] tile %d: REQBUFS CAPTURE: %s\n", tile->chn, strerror(errno));
+        g_printerr(TAG " tile %d: REQBUFS CAPTURE: %s\n", tile->chn, strerror(errno));
         return -1;
     }
 
@@ -331,7 +331,7 @@ int air_enc_open(struct air_tile *tile, const char *dev, int fps)
         b.length = 1;
         b.m.planes = &pl;
         if (ioctl(tile->enc_fd, VIDIOC_QUERYBUF, &b) != 0) {
-            g_printerr("[ml-air-video] tile %d: QUERYBUF %d: %s\n", tile->chn, i, strerror(errno));
+            g_printerr(TAG " tile %d: QUERYBUF %d: %s\n", tile->chn, i, strerror(errno));
             return -1;
         }
 
@@ -340,13 +340,13 @@ int air_enc_open(struct air_tile *tile, const char *dev, int fps)
                                  (off_t)pl.m.mem_offset);
         if (tile->enc_cap_map[i] == MAP_FAILED) {
             tile->enc_cap_map[i] = NULL;
-            g_printerr("[ml-air-video] tile %d: mmap capture %d: %s\n",
+            g_printerr(TAG " tile %d: mmap capture %d: %s\n",
                        tile->chn, i, strerror(errno));
             return -1;
         }
 
         if (ioctl(tile->enc_fd, VIDIOC_QBUF, &b) != 0) {
-            g_printerr("[ml-air-video] tile %d: QBUF capture %d: %s\n",
+            g_printerr(TAG " tile %d: QBUF capture %d: %s\n",
                        tile->chn, i, strerror(errno));
             return -1;
         }
@@ -354,7 +354,7 @@ int air_enc_open(struct air_tile *tile, const char *dev, int fps)
 
     if (ioctl(tile->enc_fd, VIDIOC_STREAMON, &otype) != 0 ||
         ioctl(tile->enc_fd, VIDIOC_STREAMON, &ctype) != 0) {
-        g_printerr("[ml-air-video] tile %d: STREAMON: %s\n", tile->chn, strerror(errno));
+        g_printerr(TAG " tile %d: STREAMON: %s\n", tile->chn, strerror(errno));
         return -1;
     }
 
@@ -461,7 +461,7 @@ void air_enc_drain(struct air_tile *tile)
         }
 
         if (ioctl(tile->enc_fd, VIDIOC_QBUF, &b) != 0) {
-            g_printerr("[ml-air-video] tile %d: requeue capture %u: %s\n",
+            g_printerr(TAG " tile %d: requeue capture %u: %s\n",
                        tile->chn, b.index, strerror(errno));
             break;
         }
@@ -503,7 +503,7 @@ int air_enc_held(const struct air_tile *tile)
 void air_enc_restart(struct air_tile *tile)
 {
     if (tile->enc_restarts >= AIR_ENC_MAX_RESTARTS) {
-        g_printerr("[ml-air-video] tile %d: %u recoveries, retiring the tile\n",
+        g_printerr(TAG " tile %d: %u recoveries, retiring the tile\n",
                    tile->chn, tile->enc_restarts);
         air_enc_close(tile);
         tile->active = 0;
@@ -514,7 +514,7 @@ void air_enc_restart(struct air_tile *tile)
     air_enc_close(tile);
 
     if (air_enc_open(tile, tile->enc_node, tile->enc_fps) != 0) {
-        g_printerr("[ml-air-video] tile %d: recovery re-open failed, retiring the tile\n",
+        g_printerr(TAG " tile %d: recovery re-open failed, retiring the tile\n",
                    tile->chn);
         air_enc_close(tile);
         tile->active = 0;

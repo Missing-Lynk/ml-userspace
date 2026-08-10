@@ -4,7 +4,7 @@ RF link daemon for the AR8030 link. One binary, two roles selected by `--role` (
 
 ## Air (TX) role (`--role air`)
 
-Association is autonomous from the `artosyn_sdio` insmod config, so in the steady state the air role speaks only UDP on `sdio0`. Two paths open `/dev/artosyn_sdio`: the rate governor, off unless asked for, and the pair window, only while it is open. The fd is shared and reference-counted, because two opens of that node in one process wedge the RF chip.
+Association is autonomous from the `artosyn_sdio` insmod config, so in the steady state the air role speaks only UDP on `sdio0`. Three paths open `/dev/artosyn_sdio`: the rate governor and the TX power control, both off unless asked for, and the pair window, only while it is open. The fd is shared and reference-counted, because two opens of that node in one process wedge the RF chip.
 
 - Reads the two SoC sensors over IIO: battery voltage from the SAR ADC (`artosyn-adc`, channel 1, `in_voltage1_input` x the board divider) and the junction temperature from the SoC sensor (`temperature`, `in_temp_scale`). Both are resolved by IIO device name and retried until the modules have coldplugged.
 - Transmits the `:10000` status frames to the goggle (10.0.0.1): `0x11` periodic (voltage, ~6 Hz) and `0x09` version/info (hw/fw strings + voltage + temperature, ~1 Hz).
@@ -12,6 +12,7 @@ Association is autonomous from the `artosyn_sdio` insmod config, so in the stead
 - Answers the goggle's `:10000` type-1 MEDIA_PARAMS_REQUEST with a type-2 reply. The goggle gates its solid-green LED, its IDR request and its video-stall watch on this reply. The reply is the 24-byte header alone.
 - Answers the goggle's `:10000` type-3 MEDIA_IDR_REQUEST by forcing a keyframe through `ml-air-video`'s control socket. The stream carries one IDR at FrameId 0 and P-frames after, so this is how a receiver that joined later gets a decodable entry point. At most one forced keyframe per 500 ms.
 
+- Reads the TX power and standby-arm the goggle commands in `:10000` SetTranParm (`0x0d`) and SetLdCfg (`0x0a`), and answers its StbAck (`0x1b`). Off unless `--power-adapt` or `--power-probe` is passed; without either, all three are drained and discarded.
 - Watches the bind button and runs a 30 s pair window on a press held 2 s or less. The window blinks the red indicator, holds the green power LED off, and binds to whichever peer answers.
 
 The goggle's RX role republishes the received `0x09`/`0x11` frames on `telemetry.sock` as `MLM_T_STATUS`, so the HUD shows the air unit's voltage and temperature.
@@ -54,6 +55,36 @@ Polls `GET_MCS` on the bb socket every 200 ms and derives an encoder target from
 It recomputes on MCS transitions only, not on throughput drift, and the response is asymmetric: a drop in MCS is applied at once, a rise only after the higher MCS has held for a second. Frame rate and min QP are not touched.
 
 `--rate-probe` runs the same poll and logs the raw reply, the decode and the target it would send, without touching the encoder. The reply is 8 bytes: MCS index at +0 biased by 2, link throughput as a u32 LE in kbps at +4. Measured values are `19 00 00 00 00 00 00 00` unassociated (MCS 23, 0 kbps) and `0c 00 00 00 be 51 00 00` associated (MCS 10, 20926 kbps), so throughput is the field that distinguishes the two states and the idle MCS reading is the higher one.
+
+### TX power and standby (`--power-adapt`, off by default)
+
+Two independent gates: **radiated power follows the FC arm state, frame rate follows the goggle's standby arm.** Arming means flying, so it takes both to full.
+
+| FC | armed | standby | frame rate | power |
+|---|---|---|---|---|
+| absent | - | no | 60 | goggle commands |
+| absent | - | yes | 15 | goggle commands |
+| present | no | no | 60 | **minimum (5 dBm)** |
+| present | no | yes | 15 | **minimum (5 dBm)** |
+| present | yes | either | 60 | goggle commands |
+
+**An absent FC is "arm unknown", not "disarmed".** `arm_flag` reads 0 with no FC attached, which is indistinguishable from a real disarm, so the arm gate applies only while `ml_msp_fc_present()` holds (MSP seen within `ML_MSP_FRESH_MS`). Otherwise a bench unit with no FC would sit at the minimum forever and look like a fault.
+
+Arming also cancels a commanded standby in the reported work mode, so the goggle is never shown a standby the air is not honouring. Standby itself no longer moves power: a disarmed aircraft is already at the minimum, and an armed one is flying.
+
+Both `:10000` messages carrying the two fields are read, and only those two fields: SetTranParm (`0x0d`, body\[0\] dBm, body\[8\] standby arm) arrives on a ~2 s cadence and is the live lever, SetLdCfg (`0x0a`, struct offsets 0x68 and 0x70) arrives once per association and is the durable one. The remaining 190 bytes of SetLdCfg are undecoded vendor state and are not read.
+
+A value outside the chip's `pwr_range` of \[5, 23\] dBm is rejected rather than clamped, and leaves both the previous commanded value and the standby bit alone. A power that has not changed is not re-written, so the 2 s command cadence does not become a 2 s write cadence on the bb socket. Honouring a commanded power and letting the chip adjust it are mutually exclusive, so the first write turns the chip's self-adjust off and it stays off.
+
+The air reports its work mode in a `0x12` on every change and re-reports an unacked standby entry every 500 ms; **the frame rate does not drop until the goggle's `0x1b` ack arrives**, so the receiver always knows before the stream changes under it. Leaving standby does not wait for anything. Transmit duty, the third vendor standby lever, is driven by the AP and is not touched here.
+
+The frame-rate half is pushed on `ml-air-video`'s control socket as **`capfps`, not `fps`**, and the difference is the point. `capfps` moves the capture feeder alone and leaves the encoders' declared frame rate where it is; their rate control budgets bits per picture from that declared rate, so feeding fewer pictures makes the emitted bitrate fall in proportion. `fps` would move both, keeping bits-per-picture consistent and holding the bitrate at the configured bits per second — measured flat at ~1015 kB/s across 60 and 15 fps. So standby is a bitrate drop as well as a frame-rate drop, and the airtime saving comes from the feeder half rather than the power half.
+
+After 5 s of `:10000` silence the commanded state is discarded and the radio is handed back to the chip's closed loop at full frame rate, so a goggle that disappears mid-standby cannot leave the air pinned at the minimum.
+
+`--power-probe` polls the read-back and logs the target it would apply, writing nothing to the radio and sending nothing on the wire. `GET_POWER` is polled at 1 Hz in both modes; its 2-byte reply is read as the `{dir, dBm}` pair `SET_POWER` writes, a decode transcribed from the SET payload shape rather than captured, which is what the probe's raw hexdump is for.
+
+The startup power is not set here. It comes from `baseband.basic.power` (`auto_init` / `manu_init`) in `bb_config_air.json` at insmod and governs the pre-association window, which is the window that decides whether the link comes up at all.
 
 ## Behavior
 
@@ -114,10 +145,11 @@ make        # everything (daemons, gstreamer, hud)
 ## Usage
 
 ```
-ml-linkd [-d /dev/artosyn_sdio] [--role air|rx] [--no-gate] [--rate-adapt|--rate-probe] [-v]
+ml-linkd [-d /dev/artosyn_sdio] [--role air|rx] [--no-gate] [--rate-adapt|--rate-probe]
+         [--power-adapt|--power-probe] [-v]
 ```
 
-`--role air` runs the air-unit telemetry transmitter (see the Air role section); the default `rx` runs the goggle side documented below. `--rate-adapt` / `--rate-probe` apply to the air role only.
+`--role air` runs the air-unit telemetry transmitter (see the Air role section); the default `rx` runs the goggle side documented below. `--rate-adapt` / `--rate-probe` and `--power-adapt` / `--power-probe` apply to the air role only.
 
 Foreground process. SIGINT/SIGTERM stop it cleanly (cadence stops, device closed, `link.sock` unlinked). `-v` logs every transmitted frame.
 

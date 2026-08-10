@@ -112,6 +112,23 @@ static inline int mp_status_periodic(uint8_t *frame, uint8_t arm_flag, uint16_t 
     return MP_STATUS_B_TOTAL;
 }
 
+/* 0x12 SetStandyMode: the air's live work mode, a LE u32 at body offset 0. The air sends one on
+ * every change; the goggle latches it for the HUD icon and answers a standby report with the 0x1b
+ * ack that gates the air's fps and power drop. Work mode 0 = normal, 1 = standby; the goggle also
+ * decodes 2 (airscrew/armed), which belongs to the FC-gated behaviour this stack does not
+ * implement, so only 0 and 1 are ever sent.
+ */
+#define MP_STANDBY_TOTAL   (MP_OFF_BODY + 4 + MP_TRAILER_LEN)   /* 36 */
+#define MP_STANDBY_NORMAL  0
+#define MP_STANDBY_ON      1
+static inline int mp_standby_report(uint8_t *frame, uint32_t work_mode, uint32_t stamp)
+{
+    mp_stamp(frame, MP_STANDBY_TOTAL, MP_STANDBY, stamp, 4);
+    memcpy(frame + MP_OFF_BODY, &work_mode, sizeof work_mode);
+
+    return MP_STANDBY_TOTAL;
+}
+
 /* 0x10 MSP DisplayPort canvas frame. `canvas` is the vendor-packed body generated from the FC's
  * MSP_DISPLAYPORT drawScreen update. */
 static inline int mp_msp_canvas(uint8_t *frame, const uint8_t *canvas, uint8_t canvas_len,
@@ -147,14 +164,16 @@ static inline int mp_status_version(uint8_t *frame, const char *hw, const char *
 /* SetTranParm (0x0D): TX power + standby-arm. 34-byte frame, 10-byte body at offset 20: body[0]=dBm,
  * body[1]=0x04 (const in every captured frame), body[8]=u8StandbyModeEn. Only power and standby are
  * varied; the rest is the HW-confirmed vendor tuple. See plans/rf-air-config.md. */
-#define MP_STP_LEN       34
-#define MP_STP_BODY_LEN  0x0a
+#define MP_STP_LEN           34
+#define MP_STP_BODY_LEN      0x0a
+#define MP_STP_OFF_DBM       (MP_OFF_BODY + 0)   /* TX power dBm */
+#define MP_STP_OFF_STANDBY   (MP_OFF_BODY + 8)   /* u8StandbyModeEn (0/1) */
 static inline int mp_set_tran_parm(uint8_t *frame, uint8_t dbm, uint8_t standby, uint32_t stamp)
 {
     mp_stamp(frame, MP_STP_LEN, MP_SETTRANPARM, stamp, MP_STP_BODY_LEN);
-    frame[MP_OFF_BODY + 0] = dbm;       /* body[0]: TX power dBm */
+    frame[MP_STP_OFF_DBM] = dbm;
     frame[MP_OFF_BODY + 1] = 0x04;      /* body[1]: const */
-    frame[MP_OFF_BODY + 8] = standby;   /* body[8]: u8StandbyModeEn (0/1) */
+    frame[MP_STP_OFF_STANDBY] = standby;
     return MP_STP_LEN;
 }
 

@@ -34,7 +34,7 @@ int air_set_bitrate_all(int bitrate, int vbv)
     }
 
     if (active == 0) {
-        g_printerr("[ml-air-video] live bitrate needs the direct V4L2 encoder path\n");
+        g_printerr(TAG " live bitrate needs the direct V4L2 encoder path\n");
         return -1;
     }
 
@@ -57,7 +57,7 @@ int air_set_bitrate_all(int bitrate, int vbv)
     }
 
     if (ret == 0) {
-        g_printerr("[ml-air-video] live bitrate %d bps/tile, vbv %d ms%s\n",
+        g_printerr(TAG " live bitrate %d bps/tile, vbv %d ms%s\n",
                    bitrate, vbv, changed == 0 ? " (unchanged)" : "");
     }
 
@@ -85,7 +85,7 @@ int air_force_keyframe_all(void)
 
     if (g_on_demand && !g_atomic_int_get(&g_enc_up)) {
         if (air_enc_start_request() != 0) {
-            g_printerr("[ml-air-video] keyframe: encoders did not come up\n");
+            g_printerr(TAG " keyframe: encoders did not come up\n");
             return -1;
         }
 
@@ -93,7 +93,7 @@ int air_force_keyframe_all(void)
     }
 
     if (air_active_encoder_count() == 0) {
-        g_printerr("[ml-air-video] keyframe needs the direct V4L2 encoder path\n");
+        g_printerr(TAG " keyframe needs the direct V4L2 encoder path\n");
         return -1;
     }
 
@@ -110,10 +110,30 @@ int air_force_keyframe_all(void)
     }
 
     if (ret == 0) {
-        g_printerr("[ml-air-video] forced a keyframe on %d tile(s)\n", forced);
+        g_printerr(TAG " forced a keyframe on %d tile(s)\n", forced);
     }
 
     return ret;
+}
+
+/* Feeder decimation ONLY: change how many captured frames reach the encoders without telling rate
+ * control about it, leaving the encoders budgeting bits for whatever rate they were last given.
+ *
+ * air_set_fps_all keeps the two in step deliberately; this deliberately does not. A per-picture
+ * budget fed fewer pictures than it is sized for under-spends, so the emitted bitrate falls by
+ * roughly the ratio of the two rates. That is the effect this exists to measure. 0 restores
+ * "take every frame the node gives".
+ */
+int air_set_cap_fps(int fps)
+{
+    if (fps < 0 || fps > 240) {
+        return -1;
+    }
+
+    g_atomic_int_set(&g_cap_fps, fps);
+    g_printerr(TAG " capture feeder at %d fps, encoder rate control untouched\n", fps);
+
+    return 0;
 }
 
 int air_set_fps_all(int fps)
@@ -127,7 +147,7 @@ int air_set_fps_all(int fps)
     }
 
     if (active == 0) {
-        g_printerr("[ml-air-video] live fps needs the direct V4L2 encoder path\n");
+        g_printerr(TAG " live fps needs the direct V4L2 encoder path\n");
         return -1;
     }
 
@@ -148,7 +168,7 @@ int air_set_fps_all(int fps)
     }
 
     if (ret == 0) {
-        g_printerr("[ml-air-video] live fps %d%s\n", fps, changed == 0 ? " (unchanged)" : "");
+        g_printerr(TAG " live fps %d%s\n", fps, changed == 0 ? " (unchanged)" : "");
     }
 
     return ret;
@@ -223,14 +243,17 @@ gboolean air_on_ctrl(G_GNUC_UNUSED int fd, G_GNUC_UNUSED GIOCondition cond,
     } else if (sscanf(buf, "fps %d", &fps) == 1) {
         ret = air_set_fps_all(fps);
         snprintf(reply, sizeof reply, "%s fps=%d\n", ret == 0 ? "ok" : "err", fps);
+    } else if (sscanf(buf, "capfps %d", &fps) == 1) {
+        ret = air_set_cap_fps(fps);
+        snprintf(reply, sizeof reply, "%s capfps=%d\n", ret == 0 ? "ok" : "err", fps);
     } else if (strncmp(buf, "keyframe", 8) == 0) {
         ret = air_force_keyframe_all();
         snprintf(reply, sizeof reply, "%s keyframe\n", ret == 0 ? "ok" : "err");
     } else {
         ret = -1;
         snprintf(reply, sizeof reply,
-                 "err expected: bitrate <bps> [vbv] | fps <fps> | rate <bps> <fps> [vbv]"
-                 " | keyframe\n");
+                 "err expected: bitrate <bps> [vbv] | fps <fps> | capfps <fps> |"
+                 " rate <bps> <fps> [vbv] | keyframe\n");
     }
 
     (void)write(cfd, reply, strlen(reply));
@@ -245,13 +268,13 @@ int air_ctrl_open(const char *path)
     char *dir;
 
     if (strlen(path) >= sizeof addr.sun_path) {
-        g_printerr("[ml-air-video] control socket path too long: %s\n", path);
+        g_printerr(TAG " control socket path too long: %s\n", path);
         return -1;
     }
 
     dir = g_path_get_dirname(path);
     if (dir != NULL && g_mkdir_with_parents(dir, 0755) != 0) {
-        g_printerr("[ml-air-video] mkdir %s: %s\n", dir, strerror(errno));
+        g_printerr(TAG " mkdir %s: %s\n", dir, strerror(errno));
         g_free(dir);
         return -1;
     }
@@ -259,7 +282,7 @@ int air_ctrl_open(const char *path)
 
     g_ctrl_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (g_ctrl_fd < 0) {
-        g_printerr("[ml-air-video] control socket: %s\n", strerror(errno));
+        g_printerr(TAG " control socket: %s\n", strerror(errno));
         return -1;
     }
 
@@ -269,7 +292,7 @@ int air_ctrl_open(const char *path)
     g_strlcpy(addr.sun_path, path, sizeof addr.sun_path);
     if (bind(g_ctrl_fd, (struct sockaddr *)&addr, sizeof addr) != 0 ||
         listen(g_ctrl_fd, 4) != 0) {
-        g_printerr("[ml-air-video] bind %s: %s\n", path, strerror(errno));
+        g_printerr(TAG " bind %s: %s\n", path, strerror(errno));
         close(g_ctrl_fd);
         g_ctrl_fd = -1;
 
@@ -278,7 +301,7 @@ int air_ctrl_open(const char *path)
 
     g_strlcpy(g_ctrl_path, path, sizeof g_ctrl_path);
     g_unix_fd_add(g_ctrl_fd, G_IO_IN, air_on_ctrl, NULL);
-    g_printerr("[ml-air-video] control socket %s\n", path);
+    g_printerr(TAG " control socket %s\n", path);
 
     return 0;
 }

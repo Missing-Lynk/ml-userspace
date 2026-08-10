@@ -79,11 +79,15 @@ $(eval $(call daemon_rule,ml-rfcmd,linux-headers,))
 CHECK_CFLAGS := -O1 -Wall -Wextra -Werror
 
 .PHONY: check
-check: $(BUILD)/msp-canvas-roundtrip
+check: $(BUILD)/msp-canvas-roundtrip $(BUILD)/air-power-standby
 	$(BUILD)/msp-canvas-roundtrip
+	$(BUILD)/air-power-standby
 
 $(BUILD)/msp-canvas-roundtrip: tests/msp-canvas-roundtrip.c ml-linkd/ml-msp.c \
                                ml-hud/src/osd/msp_canvas.c | $(BUILD)
+	gcc $(CHECK_CFLAGS) -o $@ $^
+
+$(BUILD)/air-power-standby: tests/air-power-standby.c ml-linkd/ml-air-power.c | $(BUILD)
 	gcc $(CHECK_CFLAGS) -o $@ $^
 
 $(BUILD)/ml-msp-echo: ml-msp-echo/ml-msp-echo.c ml-linkd/ml-msp.c ml-linkd/ml-msp.h | $(BUILD)

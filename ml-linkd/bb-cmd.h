@@ -33,6 +33,12 @@ enum bb_class {
     BB_LINK      = 0xff,   /* link-management pings */
 };
 
+/* BB_ASSOC selectors. Only the one the reply drain has to recognise is named: this selector carries
+ * chip-log text, so it is absorbed alongside the BB_LOG channel rather than treated as a reply. */
+enum bb_assoc_sel {
+    ASSOC_SEL_LOG = 0x06,
+};
+
 /* GET selectors (channel BB_GET). ml-linkd's steady cadence polls GET_1V1INFO + GET_TIME. */
 enum bb_get_sel {
     GET_STATUS        = 0x00,   /* GetStatus */
@@ -60,6 +66,13 @@ enum bb_get_sel {
 #define MCS_INDEX_BIAS      2
 #define MCS_OFF_THROUGHPUT  0x04
 
+/* GET_POWER request (1 byte) and reply (2 bytes), read as the {dir, dBm} pair SET_POWER writes.
+ * Transcribed from the SET payload shape, NOT from a capture of ours - a first run must dump the
+ * raw reply and confirm the decode before anything is driven from it.
+ */
+#define POWER_OFF_DIR       0x00
+#define POWER_OFF_DBM       0x01
+
 /* SET selectors (channel BB_SET). */
 enum bb_set_sel {
     SET_PAIR_MODE  = 0x02,
@@ -81,6 +94,17 @@ enum rf_dir {
     RF_TX = 0x00,   /* transmit chain (uplink) */
     RF_RX = 0x08,   /* receive chain */
 };
+
+/* Wire frame layout, shared by the builders below and by the two reply drains (ml-rx-reader.c on
+ * the goggle, ml-air-bb.c on the air), which pick these bytes out of a raw read. */
+#define BB_OFF_MAGIC      0    /* 0xaa */
+#define BB_OFF_PLEN       1    /* payload length, u16 LE */
+#define BB_OFF_CLASS      5    /* enum bb_class */
+#define BB_OFF_OPCODE     6
+#define BB_OFF_SLOT       7
+#define BB_OFF_SELECTOR   8    /* the GET/SET selector the reply came in on */
+#define BB_OFF_PAYLOAD    18
+#define BB_FRAME_EXTRA    19   /* bytes a frame adds to its payload: header + trailing 0xbb */
 
 /* Pack one bb-socket frame:
  *   AA | plen(u16 LE) | 00 00 | channel | opcode | slot | port | seq(4 BE) | reserved(4, 0) |
@@ -284,6 +308,16 @@ static inline int bb_set_power(uint8_t *frame, enum rf_dir dir, uint8_t dbm, uin
     const uint8_t payload[2] = { dir, dbm };
 
     return bb_build_cmd(frame, BB_SET, SET_POWER, payload, sizeof payload, seq);
+}
+
+/* DECODED: read back the local output power for one chain. The request carries the direction byte
+ * SET_POWER writes; the reply is decoded at POWER_OFF_*.
+ */
+static inline int bb_get_power(uint8_t *frame, enum rf_dir dir, uint32_t seq)
+{
+    const uint8_t payload[1] = { dir };
+
+    return bb_build_cmd(frame, BB_GET, GET_POWER, payload, sizeof payload, seq);
 }
 
 /* PROVEN: enable the chip's power self-adjust. */

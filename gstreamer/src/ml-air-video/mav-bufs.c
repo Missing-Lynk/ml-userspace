@@ -258,7 +258,7 @@ void air_push_frame(GstBuffer **buf)
                 g_usleep(10000);
             }
 
-            g_printerr("[ml-air-video] stagger: tile %d first output %s\n",
+            g_printerr(TAG " stagger: tile %d first output %s\n",
                        tile->chn, tile->done >= 1 ? "OK" : "TIMEOUT");
         }
 

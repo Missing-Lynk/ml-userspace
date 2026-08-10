@@ -31,8 +31,20 @@ enum ml_rate_mode {
     ML_RATE_ON,        /* drive ml-air-video's control socket */
 };
 
+/* TX power and standby on the air role. OFF is the default: honouring a commanded power takes the
+ * chip's closed loop out of the link-margin loop, and the GET_POWER read-back decode is transcribed
+ * from the vendor's SET_POWER payload shape rather than confirmed on our stack. PROBE observes both
+ * before either is allowed to move a flying radio.
+ */
+enum ml_power_mode {
+    ML_POWER_OFF = 0,   /* do not open the bb socket at all */
+    ML_POWER_PROBE,     /* poll GET_POWER and log the derived target, write nothing */
+    ML_POWER_ON,        /* apply the goggle's commanded power and standby */
+};
+
 /* Air (TX) role entry point (--role air); hw_version is the board's hardware version string for the
  * status frame (NULL selects the default). Returns when g_run clears. */
-void air_main(const char *hw_version, const char *fc_tty, enum ml_rate_mode rate_mode);
+void air_main(const char *hw_version, const char *fc_tty, enum ml_rate_mode rate_mode,
+              enum ml_power_mode power_mode);
 
 #endif /* ML_LINKD_H */

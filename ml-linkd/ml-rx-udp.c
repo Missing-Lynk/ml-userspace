@@ -242,6 +242,66 @@ static void socks_bind(struct udp_socks *socks, long now)
     }
 }
 
+/* Record one camera selector into the cached ISP state. Only the HW-captured selectors are
+ * accepted and values are bounds-checked: an ISP value is not an RF byte, but garbage still has no
+ * business on the wire. @return 1 when the selector is known and the value in range, else 0 with
+ * g_cam left untouched. */
+static int rx_set_camera(unsigned sel, unsigned value)
+{
+    switch (sel) {
+        case MLM_CAM_EXPOSURE: {
+            /* 0 = auto; else manual with the exposure time in us (down to 1/10000,
+             * up to 1/30 - the stock page never leaves that range) */
+            if (!(value == 0 || (value >= 100 && value <= 33333))) {
+                return 0;
+            }
+
+            g_cam.exposure_manual = value != 0;
+            if (value != 0) {
+                g_cam.exposure_time = (uint16_t) value;
+            }
+        } break;
+
+        case MLM_CAM_SATURATION: {
+            if (value > 100) {
+                return 0;
+            }
+
+            g_cam.saturation = (uint16_t) value;
+        } break;
+
+        case MLM_CAM_SHARPNESS: {
+            if (value > 100) {
+                return 0;
+            }
+
+            g_cam.sharpness = (uint16_t) value;
+        } break;
+
+        case MLM_CAM_ROTATION: {
+            if (value > 1) {
+                return 0;
+            }
+
+            g_cam.rotation = (uint16_t) value;
+        } break;
+
+        case MLM_CAM_NR3D: {
+            if (value > 1) {
+                return 0;
+            }
+
+            g_cam.nr3d_en = (uint16_t) value;
+        } break;
+
+        default: {
+            return 0;
+        } break;
+    }
+
+    return 1;
+}
+
 /* One HUD command off link.sock. The levers this records are pushed to the air by the cadence in
  * the thread below; the bb-socket work (a retune, a sweep, a bind) is queued for the bb-socket TX
  * owner, because issuing it here would race the steady poll and get lost. */
@@ -290,69 +350,22 @@ static void handle_rfcmd(const struct mlm_rfcmd *rfcmd, long now)
         } break;
 
         case MLM_RF_SET_CAMERA: {
-            /* arg = (MLM_CAM_* selector << 16) | u16 value. Only the HW-captured selectors
-             * are accepted; values are bounds-checked (an ISP value is not an RF byte, but
-             * garbage still has no business on the wire). Applied by push_camera_scale. */
+            /* arg = (MLM_CAM_* selector << 16) | u16 value. Applied by push_camera_scale. */
             unsigned sel = rfcmd->arg >> 16;
             unsigned value = rfcmd->arg & 0xffffu;
-            int ok = 1;
 
-            switch (sel) {
-                case MLM_CAM_EXPOSURE: {
-                    /* 0 = auto; else manual with the exposure time in us (down to 1/10000,
-                     * up to 1/30 - the stock page never leaves that range) */
-                    ok = value == 0 || (value >= 100 && value <= 33333);
-                    if (ok) {
-                        g_cam.exposure_manual = value != 0;
-                        if (value != 0) {
-                            g_cam.exposure_time = (uint16_t) value;
-                        }
-                    }
-                } break;
-
-                case MLM_CAM_SATURATION: {
-                    ok = value <= 100;
-                    if (ok) {
-                        g_cam.saturation = (uint16_t) value;
-                    }
-                } break;
-
-                case MLM_CAM_SHARPNESS: {
-                    ok = value <= 100;
-                    if (ok) {
-                        g_cam.sharpness = (uint16_t) value;
-                    }
-                } break;
-
-                case MLM_CAM_ROTATION: {
-                    ok = value <= 1;
-                    if (ok) {
-                        g_cam.rotation = (uint16_t) value;
-                    }
-                } break;
-
-                case MLM_CAM_NR3D: {
-                    ok = value <= 1;
-                    if (ok) {
-                        g_cam.nr3d_en = (uint16_t) value;
-                    }
-                } break;
-
-                default: {
-                    ok = 0;
-                } break;
-            }
-
-            if (!ok) {
+            if (!rx_set_camera(sel, value)) {
                 fprintf(stderr, TAG " rfcmd: ignoring bad camera sel=%u value=%u\n",
                         sel, value);
-            } else {
-                g_cam_commanded |= 1u << sel;
-                g_cam_pending |= 1u << sel;
-                if (g_verbose) {
-                    printf(TAG " rfcmd: camera sel=%u value=%u\n", sel, value);
-                    fflush(stdout);
-                }
+                break;
+            }
+
+            g_cam_commanded |= 1u << sel;
+            g_cam_pending |= 1u << sel;
+
+            if (g_verbose) {
+                printf(TAG " rfcmd: camera sel=%u value=%u\n", sel, value);
+                fflush(stdout);
             }
         } break;
 

@@ -411,6 +411,7 @@ int main(int argc, char **argv)
     const char *hw_version = NULL;
     const char *fc_tty = NULL;
     enum ml_rate_mode rate_mode = ML_RATE_OFF;
+    enum ml_power_mode power_mode = ML_POWER_OFF;
     struct sigaction sa;
 
     for (int i = 1; i < argc; i++) {
@@ -428,6 +429,10 @@ int main(int argc, char **argv)
             rate_mode = ML_RATE_ON;
         } else if (!strcmp(argv[i], "--rate-probe")) {
             rate_mode = ML_RATE_PROBE;
+        } else if (!strcmp(argv[i], "--power-adapt")) {
+            power_mode = ML_POWER_ON;
+        } else if (!strcmp(argv[i], "--power-probe")) {
+            power_mode = ML_POWER_PROBE;
         } else if (!strcmp(argv[i], "--role") && i + 1 < argc) {
             i++;
             if (!strcmp(argv[i], "air")) {
@@ -444,7 +449,7 @@ int main(int argc, char **argv)
             fprintf(stderr,
                     "usage: ml-linkd [-d /dev/artosyn_sdio] [--role air|rx] [--hw-version STR] "
                     "[--fc-tty /dev/ttyS1] [--no-gate] [--scan-probe] "
-                    "[--rate-adapt|--rate-probe] [-v]\n");
+                    "[--rate-adapt|--rate-probe] [--power-adapt|--power-probe] [-v]\n");
             return 2;
         }
     }
@@ -459,7 +464,7 @@ int main(int argc, char **argv)
 
     /* Air unit (--role air): UDP telemetry TX on sdio0, handled entirely in ml-linkd-air.c. */
     if (g_role_air) {
-        air_main(hw_version, fc_tty, rate_mode);
+        air_main(hw_version, fc_tty, rate_mode, power_mode);
         return 0;
     }
 

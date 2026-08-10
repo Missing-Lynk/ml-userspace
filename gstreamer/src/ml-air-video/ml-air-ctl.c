@@ -7,6 +7,8 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#define PROG "ml-air-ctl"
+
 static const char *env_or(const char *name, const char *dflt)
 {
     const char *v = getenv(name);
@@ -30,15 +32,19 @@ int main(int argc, char **argv)
     }
 
     /* keyframe is the only command that takes no argument of its own. */
-    if (argc - arg < 1 ||
+    if (
+        argc - arg < 1 ||
         (argc - arg < 2 && strcmp(argv[arg], "keyframe") != 0) ||
         (strcmp(argv[arg], "bitrate") != 0 && strcmp(argv[arg], "fps") != 0 &&
-         strcmp(argv[arg], "rate") != 0 && strcmp(argv[arg], "keyframe") != 0)) {
+        strcmp(argv[arg], "capfps") != 0 &&
+        strcmp(argv[arg], "rate") != 0 && strcmp(argv[arg], "keyframe") != 0)
+    ) {
         fprintf(stderr,
-                "usage: ml-air-ctl [socket] bitrate <bps-per-tile> [vbv-ms]\n"
-                "       ml-air-ctl [socket] fps <fps>\n"
-                "       ml-air-ctl [socket] rate <bps-per-tile> <fps> [vbv-ms]\n"
-                "       ml-air-ctl [socket] keyframe\n");
+                "usage: " PROG " [socket] bitrate <bps-per-tile> [vbv-ms]\n"
+                "       " PROG " [socket] fps <fps>\n"
+                "       " PROG " [socket] capfps <fps>   (feeder only, rate control untouched)\n"
+                "       " PROG " [socket] rate <bps-per-tile> <fps> [vbv-ms]\n"
+                "       " PROG " [socket] keyframe\n");
         return 2;
     }
 

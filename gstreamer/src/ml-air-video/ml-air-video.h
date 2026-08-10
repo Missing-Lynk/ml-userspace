@@ -49,6 +49,9 @@
 
 #include "vph.h"
 
+/* Log prefix for every message this daemon emits, so the name is spelled once. */
+#define TAG "[ml-air-video]"
+
 /** Composite frame geometry (both tiles report this Resolution). */
 #define AIR_COMP_W   1920
 #define AIR_COMP_H   1080
@@ -300,6 +303,7 @@ int air_vbv_for_bitrate(int bitrate);
 /* mav-ctrl.c */
 int air_ctrl_open(const char *path);
 void air_ctrl_close(void);
+int air_set_cap_fps(int fps);
 
 /* mav-tx.c */
 void air_emit_au(struct air_tile *tile, const guint8 *data, size_t size,

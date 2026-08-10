@@ -58,7 +58,7 @@ static void air_cap_qbuf(struct air_cap_buf *capbuf)
     b.m.planes = planes;
 
     if (ioctl(g_cap_fd, VIDIOC_QBUF, &b) != 0) {
-        perror("[ml-air-video] capture QBUF");
+        perror(TAG " capture QBUF");
     }
 }
 
@@ -153,7 +153,7 @@ static GstBuffer *air_cap_share(struct air_tile *tile, struct air_cap_buf *capbu
     align.padding_right = g_cap_stride[0] - AIR_COMP_W;
     align.padding_bottom = (guint)(tile->alloc_h - tile->height);
     if (!gst_video_meta_set_alignment(meta, align)) {
-        g_printerr("[ml-air-video] tile %d: video meta rejected padding %u right %u bottom\n",
+        g_printerr(TAG " tile %d: video meta rejected padding %u right %u bottom\n",
                    tile->chn, align.padding_right, align.padding_bottom);
     }
 
@@ -212,7 +212,7 @@ int air_cap_open(const char *dev, int want)
 
     g_cap_fd = open(dev, O_RDWR | O_CLOEXEC);
     if (g_cap_fd < 0) {
-        g_printerr("[ml-air-video] open %s: %s\n", dev, strerror(errno));
+        g_printerr(TAG " open %s: %s\n", dev, strerror(errno));
         return -1;
     }
 
@@ -222,13 +222,13 @@ int air_cap_open(const char *dev, int want)
     memset(&fmt, 0, sizeof fmt);
     fmt.type = type;
     if (ioctl(g_cap_fd, VIDIOC_G_FMT, &fmt) != 0) {
-        g_printerr("[ml-air-video] %s G_FMT: %s\n", dev, strerror(errno));
+        g_printerr(TAG " %s G_FMT: %s\n", dev, strerror(errno));
         return -1;
     }
 
     if (fmt.fmt.pix_mp.num_planes != AIR_CAP_PLANES ||
         fmt.fmt.pix_mp.width != AIR_COMP_W || fmt.fmt.pix_mp.height != AIR_COMP_H) {
-        g_printerr("[ml-air-video] %s is %ux%u in %u planes, expected %dx%d in %d\n",
+        g_printerr(TAG " %s is %ux%u in %u planes, expected %dx%d in %d\n",
                    dev, fmt.fmt.pix_mp.width, fmt.fmt.pix_mp.height,
                    fmt.fmt.pix_mp.num_planes, AIR_COMP_W, AIR_COMP_H, AIR_CAP_PLANES);
         return -1;
@@ -243,7 +243,7 @@ int air_cap_open(const char *dev, int want)
     req.type = type;
     req.memory = V4L2_MEMORY_MMAP;
     if (ioctl(g_cap_fd, VIDIOC_REQBUFS, &req) != 0) {
-        g_printerr("[ml-air-video] %s REQBUFS %d: %s\n", dev, want, strerror(errno));
+        g_printerr(TAG " %s REQBUFS %d: %s\n", dev, want, strerror(errno));
         return -1;
     }
 
@@ -265,7 +265,7 @@ int air_cap_open(const char *dev, int want)
         b.length = AIR_CAP_PLANES;
         b.m.planes = planes;
         if (ioctl(g_cap_fd, VIDIOC_QUERYBUF, &b) != 0) {
-            g_printerr("[ml-air-video] QUERYBUF %d: %s\n", i, strerror(errno));
+            g_printerr(TAG " QUERYBUF %d: %s\n", i, strerror(errno));
             return -1;
         }
 
@@ -279,7 +279,7 @@ int air_cap_open(const char *dev, int want)
             exp.plane = (unsigned int)plane;
             exp.flags = O_RDWR | O_CLOEXEC;
             if (ioctl(g_cap_fd, VIDIOC_EXPBUF, &exp) != 0) {
-                g_printerr("[ml-air-video] EXPBUF %d plane %d: %s\n", i, plane, strerror(errno));
+                g_printerr(TAG " EXPBUF %d plane %d: %s\n", i, plane, strerror(errno));
                 return -1;
             }
 
@@ -289,7 +289,7 @@ int air_cap_open(const char *dev, int want)
             capbuf->mem[plane] = gst_dmabuf_allocator_alloc(g_dmabuf_alloc, exp.fd,
                                                             capbuf->len[plane]);
             if (capbuf->fd[plane] < 0) {
-                g_printerr("[ml-air-video] dup(dmabuf) %d plane %d: %s\n",
+                g_printerr(TAG " dup(dmabuf) %d plane %d: %s\n",
                            i, plane, strerror(errno));
                 return -1;
             }
@@ -318,13 +318,13 @@ int air_cap_open(const char *dev, int want)
 
         for (int plane = 0; plane < AIR_CAP_PLANES; plane++) {
             if (tile->copy && g_cap[0].map[plane] == NULL) {
-                g_printerr("[ml-air-video] tile %d is ML_AIR_COPY but plane %d did not mmap\n",
+                g_printerr(TAG " tile %d is ML_AIR_COPY but plane %d did not mmap\n",
                            tile->chn, plane);
                 return -1;
             }
 
             if (air_cap_off(tile, plane) + air_cap_len(tile, plane) > g_cap[0].len[plane]) {
-                g_printerr("[ml-air-video] tile %d plane %d: rows %d..%d at stride %u needs "
+                g_printerr(TAG " tile %d plane %d: rows %d..%d at stride %u needs "
                            "%" G_GSIZE_FORMAT " B of a %" G_GSIZE_FORMAT " B plane\n",
                            tile->chn, plane, tile->crop_y, tile->crop_y + tile->height,
                            g_cap_stride[plane],
@@ -336,11 +336,11 @@ int air_cap_open(const char *dev, int want)
     }
 
     if (ioctl(g_cap_fd, VIDIOC_STREAMON, &type) != 0) {
-        g_printerr("[ml-air-video] STREAMON: %s\n", strerror(errno));
+        g_printerr(TAG " STREAMON: %s\n", strerror(errno));
         return -1;
     }
 
-    g_printerr("[ml-air-video] camera %s: %d buffers, strides %u/%u/%u, up to %d in flight\n",
+    g_printerr(TAG " camera %s: %d buffers, strides %u/%u/%u, up to %d in flight\n",
                dev, g_cap_n, g_cap_stride[0], g_cap_stride[1], g_cap_stride[2],
                g_cap_inflight_max);
     return 0;
@@ -483,9 +483,9 @@ gpointer air_cap_feed(gpointer user)
             if (rc == 0) {
                 nfd = air_cap_poll_build(pfd, enc_slot);
                 g_atomic_int_set(&g_enc_up, 1);
-                g_printerr("[ml-air-video] encoders up on request\n");
+                g_printerr(TAG " encoders up on request\n");
             } else {
-                g_printerr("[ml-air-video] encoder bring-up failed\n");
+                g_printerr(TAG " encoder bring-up failed\n");
             }
 
             g_mutex_lock(&g_enc_start_lock);
@@ -529,13 +529,13 @@ gpointer air_cap_feed(gpointer user)
              * alternative is worse than a glitch, because the frames it holds are capture
              * frames and g_cap_inflight cannot fall until they are back. */
             if (pfd[enc_slot[i]].revents & (POLLERR | POLLNVAL)) {
-                g_printerr("[ml-air-video] tile %d: encoder poll 0x%x, recovering\n",
+                g_printerr(TAG " tile %d: encoder poll 0x%x, recovering\n",
                            tile->chn, pfd[enc_slot[i]].revents);
                 air_enc_restart(tile);
             } else if (air_enc_held(tile) > 0 &&
                        now_us - tile->enc_progress_us > AIR_ENC_STALL_US &&
                        now_us - last_cap_us < AIR_ENC_STALL_US) {
-                g_printerr("[ml-air-video] tile %d: encoder silent for %" G_GINT64_FORMAT " ms "
+                g_printerr(TAG " tile %d: encoder silent for %" G_GINT64_FORMAT " ms "
                            "holding %d frames, recovering\n",
                            tile->chn, (now_us - tile->enc_progress_us) / 1000, air_enc_held(tile));
                 air_enc_restart(tile);
@@ -564,7 +564,7 @@ gpointer air_cap_feed(gpointer user)
         if (ioctl(g_cap_fd, VIDIOC_DQBUF, &b) != 0) {
             if (errno != EINTR && now_us - cap_err_us > G_USEC_PER_SEC) {
                 cap_err_us = now_us;
-                g_printerr("[ml-air-video] capture DQBUF: %s\n", strerror(errno));
+                g_printerr(TAG " capture DQBUF: %s\n", strerror(errno));
             }
 
             continue;

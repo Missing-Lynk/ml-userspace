@@ -316,7 +316,7 @@ gpointer air_bench_feed(gpointer user)
             }
         }
 
-        g_printerr("[ml-air-video] bench: tier %s for %d s%s\n", g_bench_stage, g_bench_secs,
+        g_printerr(TAG " bench: tier %s for %d s%s\n", g_bench_stage, g_bench_secs,
                    scroll ? " (visual tier: renders every frame, not a rate measurement)" : "");
 
         while (!g_bench_stop && g_get_monotonic_time() < until) {
@@ -414,7 +414,7 @@ gpointer air_bench_feed(gpointer user)
 
             for (int j = 0; j < AIR_NCHN; j++) {
                 if (g_tile[j].active) {
-                    g_printerr("[ml-air-video] bench: tier %s tile %d: %" G_GUINT64_FORMAT
+                    g_printerr(TAG " bench: tier %s tile %d: %" G_GUINT64_FORMAT
                                " frames, %" G_GUINT64_FORMAT " oversize, %" G_GUINT64_FORMAT
                                " tx errors, %" G_GUINT64_FORMAT " lost, largest AU %u B%s\n",
                                g_bench_stage, j, g_tile[j].done - at_start[j],
@@ -424,7 +424,7 @@ gpointer air_bench_feed(gpointer user)
             }
 
             if (idle > 2.0) {
-                g_printerr("[ml-air-video] bench: tier %s produced no output for %.1f s: FAIL\n",
+                g_printerr(TAG " bench: tier %s produced no output for %.1f s: FAIL\n",
                            g_bench_stage, idle);
             }
         }

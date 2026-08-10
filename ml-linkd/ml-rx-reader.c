@@ -52,6 +52,33 @@ static void hexdump_frame(const char *what, const uint8_t *frame, int n)
     fflush(stdout);
 }
 
+/* Accumulate one chip-log frame into g_chiplog, emitting a line at each newline. The chip log is a
+ * verbose RF-debug stream - a down link spews it fast enough to fill the log tmpfs - so it is
+ * forwarded only under -v, but it is always consumed so the socket cannot back up. Anything outside
+ * printable ASCII is dropped, and the buffer never overruns: the fill stops one byte short. */
+static void chiplog_absorb(const uint8_t *payload, int plen)
+{
+    for (int k = 0; k < plen && g_chiplog_n < (int)sizeof(g_chiplog) - 1; k++) {
+        char ch = (char)payload[k];
+
+        if (ch == '\n' || ch == '\r') {
+            if (g_chiplog_n) {
+                g_chiplog[g_chiplog_n] = 0;
+
+                if (g_verbose) {
+                    printf("[chip] %s\n", g_chiplog);
+                }
+
+                g_chiplog_n = 0;
+            }
+        } else if (ch >= 32 && ch < 127) {
+            g_chiplog[g_chiplog_n++] = ch;
+        }
+    }
+
+    fflush(stdout);
+}
+
 void *rx_reader_thread(void *arg)
 {
     uint8_t buf[8192];
@@ -85,42 +112,44 @@ void *rx_reader_thread(void *arg)
                 continue;
             }
 
-            const uint8_t *payload = buf + i + 18;
+            const uint8_t *payload = buf + i + BB_OFF_PAYLOAD;
+            uint8_t cls = buf[i + BB_OFF_CLASS];
+            uint8_t selector = buf[i + BB_OFF_SELECTOR];
 
-            if (buf[i + 5] == 0x05 || (buf[i + 5] == 0x03 && buf[i + 8] == 0x06)) {
-                for (int k = 0; k < plen && g_chiplog_n < (int)sizeof(g_chiplog) - 1; k++) {
-                    char ch = buf[i + 18 + k];
-
-                    if (ch == '\n' || ch == '\r') {
-                        if (g_chiplog_n) {
-                            g_chiplog[g_chiplog_n] = 0;
-                            /* ch05 chip log is a verbose RF-debug stream (a down link spews it fast
-                             * enough to fill the log tmpfs), so forward it only under -v. */
-                            if (g_verbose) {
-                                printf("[chip] %s\n", g_chiplog);
-                            }
-                            g_chiplog_n = 0;
-                        }
-                    } else if (ch >= 32 && ch < 127) {
-                        g_chiplog[g_chiplog_n++] = ch;
+            if (cls == BB_LOG || (cls == BB_ASSOC && selector == ASSOC_SEL_LOG)) {
+                chiplog_absorb(payload, plen);
+            } else if (cls == REPLY_CH) {
+                switch (selector) {
+                    case GET_1V1INFO: {
+                        rx_chan_on_1v1(payload, plen);
                     }
-                }
-                fflush(stdout);
-            } else if (buf[i + 5] == REPLY_CH && buf[i + 8] == GET_1V1INFO) {
-                rx_chan_on_1v1(payload, plen);
-            } else if (buf[i + 5] == REPLY_CH && buf[i + 8] == GET_PAIR) {
-                rx_bind_on_pair(payload, plen);
-            } else if (buf[i + 5] == REPLY_CH && buf[i + 8] == GET_SCAN_RESULT) {
-                /* Seed the channel table for the sweep; --scan-probe also dumps the raw frame so the
-                 * reply envelope can be re-checked on the bench (e.g. normal-mode layout). */
-                if (g_scan_probe) {
-                    hexdump_frame("get-scan reply", buf + i, 19 + plen);
-                }
+                    break;
 
-                rx_chan_on_scan_result(payload, plen);
+                    case GET_PAIR: {
+                        rx_bind_on_pair(payload, plen);
+                    }
+                    break;
+
+                    case GET_SCAN_RESULT: {
+                        /* Seed the channel table for the sweep; --scan-probe also dumps the raw
+                         * frame so the reply envelope can be re-checked on the bench (e.g.
+                         * normal-mode layout). */
+                        if (g_scan_probe) {
+                            hexdump_frame("get-scan reply", buf + i, BB_FRAME_EXTRA + plen);
+                        }
+
+                        rx_chan_on_scan_result(payload, plen);
+                    }
+                    break;
+
+                    default: {
+                        /* every other reply selector is drained and dropped */
+                    }
+                    break;
+                }
             }
 
-            i += 18 + plen;
+            i += BB_OFF_PAYLOAD + plen;
         }
     }
 

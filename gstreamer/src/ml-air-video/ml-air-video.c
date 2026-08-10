@@ -163,12 +163,12 @@ gboolean air_on_tick(gpointer user)
             /* tx is reported only when transmitting: with no peer it reads zero while the
              * encoder is healthy, and printing it beside done invites reading it as a fault. */
             if (g_notx) {
-                g_printerr("[ml-air-video] bench %s tile %d: pushed %" G_GUINT64_FORMAT "/s"
+                g_printerr(TAG " bench %s tile %d: pushed %" G_GUINT64_FORMAT "/s"
                            " done %" G_GUINT64_FORMAT "/s %.2f Mbit/s"
                            " dropped %" G_GUINT64_FORMAT "/s\n",
                            bench, i, dp, dd, (double)db * 8.0 / 1e6, dx);
             } else {
-                g_printerr("[ml-air-video] bench %s tile %d: pushed %" G_GUINT64_FORMAT "/s"
+                g_printerr(TAG " bench %s tile %d: pushed %" G_GUINT64_FORMAT "/s"
                            " done %" G_GUINT64_FORMAT "/s tx %" G_GUINT64_FORMAT "/s"
                            " %.2f Mbit/s dropped %" G_GUINT64_FORMAT "/s"
                            " oversize %" G_GUINT64_FORMAT " txerr %" G_GUINT64_FORMAT
@@ -186,7 +186,7 @@ gboolean air_on_tick(gpointer user)
             last_dropped[i] = g_tile[i].dropped;
         }
     } else if (g_verbose) {
-        g_printerr("[ml-air-video] tx chn0=%" G_GUINT64_FORMAT " chn1=%" G_GUINT64_FORMAT
+        g_printerr(TAG " tx chn0=%" G_GUINT64_FORMAT " chn1=%" G_GUINT64_FORMAT
                    " dropped=%" G_GUINT64_FORMAT "\n",
                    g_tile[0].sent, g_tile[1].sent, g_tile[0].dropped);
 
@@ -197,7 +197,7 @@ gboolean air_on_tick(gpointer user)
             static guint64 last_cap;
             static guint64 last_skip;
 
-            g_printerr("[ml-air-video] cam cap=%" G_GUINT64_FORMAT "/s skip=%" G_GUINT64_FORMAT
+            g_printerr(TAG " cam cap=%" G_GUINT64_FORMAT "/s skip=%" G_GUINT64_FORMAT
                        "/s inflight=%d enc=%" G_GUINT64_FORMAT "/%" G_GUINT64_FORMAT "/s\n",
                        g_cap_frames - last_cap, g_cap_skipped - last_skip,
                        g_atomic_int_get(&g_cap_inflight),
@@ -232,9 +232,9 @@ gboolean air_on_bus(GstBus *bus, GstMessage *msg, gpointer user)
         gchar *dbg = NULL;
 
         gst_message_parse_error(msg, &err, &dbg);
-        g_printerr("[ml-air-video] error from %s: %s\n", GST_OBJECT_NAME(msg->src), err->message);
+        g_printerr(TAG " error from %s: %s\n", GST_OBJECT_NAME(msg->src), err->message);
         if (dbg != NULL) {
-            g_printerr("[ml-air-video] debug: %s\n", dbg);
+            g_printerr(TAG " debug: %s\n", dbg);
         }
 
         g_error_free(err);
@@ -243,7 +243,7 @@ gboolean air_on_bus(GstBus *bus, GstMessage *msg, gpointer user)
     } break;
 
     case GST_MESSAGE_EOS: {
-        g_printerr("[ml-air-video] end of stream\n");
+        g_printerr(TAG " end of stream\n");
         g_main_loop_quit(g_loop);
     } break;
 
@@ -273,7 +273,7 @@ GstElement *air_build_encoder(struct air_tile *tile, const char *enc, int fps, G
 
     pipe = gst_parse_launch(desc, &err);
     if (pipe == NULL) {
-        g_printerr("[ml-air-video] encoder %d build failed: %s\n",
+        g_printerr(TAG " encoder %d build failed: %s\n",
                    tile->chn, err ? err->message : "?");
         if (err != NULL) {
             g_error_free(err);
@@ -393,13 +393,13 @@ int main(int argc, char **argv)
     dstaddr.sin_family = AF_INET;
     dstaddr.sin_port = htons((uint16_t)port);
     if (inet_pton(AF_INET, dst, &dstaddr.sin_addr) != 1) {
-        g_printerr("[ml-air-video] bad destination address: %s\n", dst);
+        g_printerr(TAG " bad destination address: %s\n", dst);
         return 1;
     }
 
     sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
-        perror("[ml-air-video] socket");
+        perror(TAG " socket");
         return 1;
     }
 
@@ -475,7 +475,7 @@ int main(int argc, char **argv)
          * the whole mmz pool stays with the two encoder instances. A tile named by ML_AIR_COPY is
          * the exception: it is fed by copy and needs its pool back. */
         if ((camera == NULL || tile->copy) && air_pool_init(tile, pool_want) < AIR_POOL_MIN) {
-            g_printerr("[ml-air-video] tile %d: dma-heap pool alloc failed (need %d, got %d)\n",
+            g_printerr(TAG " tile %d: dma-heap pool alloc failed (need %d, got %d)\n",
                        i, AIR_POOL_MIN, tile->pool_n);
             return 1;
         }
@@ -486,7 +486,7 @@ int main(int argc, char **argv)
             snprintf(path, sizeof path, "%s_tile%d.h265", dump, i);
             tile->dumpfd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
             if (tile->dumpfd >= 0) {
-                g_printerr("[ml-air-video] dumping tile %d -> %s\n", i, path);
+                g_printerr(TAG " dumping tile %d -> %s\n", i, path);
             }
         }
 
@@ -494,7 +494,7 @@ int main(int argc, char **argv)
          * shuffling: no source element, no copy, no CPU pass over a pixel. */
         if (bench != NULL) {
             air_render_ring(tile, g_bench_stages[0]);
-            g_printerr("[ml-air-video] bench: tile %d ring of %d rendered as %s\n",
+            g_printerr(TAG " bench: tile %d ring of %d rendered as %s\n",
                        i, tile->pool_n, g_bench_stages[0]);
         }
     }
@@ -541,7 +541,7 @@ int main(int argc, char **argv)
 
         src_pipe = gst_parse_launch(desc, &err);
         if (src_pipe == NULL) {
-            g_printerr("[ml-air-video] source build failed: %s\n", err ? err->message : "?");
+            g_printerr(TAG " source build failed: %s\n", err ? err->message : "?");
             close(sock);
             return 1;
         }
@@ -564,16 +564,16 @@ int main(int argc, char **argv)
     air_ctrl_open(ctrl);
 
     if (bench != NULL) {
-        g_printerr("[ml-air-video] bench %s: %dx%d two H.265 tiles, %s, %s, %d s per tier\n",
+        g_printerr(TAG " bench %s: %dx%d two H.265 tiles, %s, %s, %d s per tier\n",
                    bench, AIR_COMP_W, AIR_COMP_H,
                    g_bench_free ? "unpaced" : "paced to ML_AIR_FPS",
                    g_notx ? "encode-only (no transmit)" : "transmitting", g_bench_secs);
     } else if (g_notx) {
-        g_printerr("[ml-air-video] %dx%d @ %d fps from %s, two H.265 tiles, "
+        g_printerr(TAG " %dx%d @ %d fps from %s, two H.265 tiles, "
                    "encode-only (no transmit)\n",
                    AIR_COMP_W, AIR_COMP_H, fps, camera != NULL ? camera : "videotestsrc");
     } else {
-        g_printerr("[ml-air-video] %dx%d @ %d fps from %s, two H.265 tiles -> %s:%d\n",
+        g_printerr(TAG " %dx%d @ %d fps from %s, two H.265 tiles -> %s:%d\n",
                    AIR_COMP_W, AIR_COMP_H, fps, camera != NULL ? camera : "videotestsrc",
                    dst, port);
     }
@@ -606,7 +606,7 @@ int main(int argc, char **argv)
                 return 1;
             }
 
-            g_print("[ml-air-video] encoder %s\n", enc_node);
+            g_print(TAG " encoder %s\n", enc_node);
 
             /* Recorded up front either way: the on-demand bring-up runs on the feeder thread and
              * takes its node and rate from here, the same fields air_enc_restart re-opens from. */
@@ -616,7 +616,7 @@ int main(int argc, char **argv)
             }
 
             if (g_on_demand) {
-                g_print("[ml-air-video] encoders held until a receiver asks for a keyframe\n");
+                g_print(TAG " encoders held until a receiver asks for a keyframe\n");
             } else {
                 for (int i = 0; i < AIR_NCHN; i++) {
                     if (!g_tile[i].active) {
@@ -668,7 +668,7 @@ int main(int argc, char **argv)
         }
     }
 
-    g_printerr("[ml-air-video] stopped (chn0=%" G_GUINT64_FORMAT " chn1=%" G_GUINT64_FORMAT
+    g_printerr(TAG " stopped (chn0=%" G_GUINT64_FORMAT " chn1=%" G_GUINT64_FORMAT
                ", oversize %" G_GUINT64_FORMAT "/%" G_GUINT64_FORMAT
                ", lost %" G_GUINT64_FORMAT "/%" G_GUINT64_FORMAT
                ", src lost %" G_GUINT64_FORMAT

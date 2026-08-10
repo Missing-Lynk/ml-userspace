@@ -40,5 +40,6 @@ int ml_msp_open(struct ml_msp *msp, const char *path);
 void ml_msp_close(struct ml_msp *msp);
 void ml_msp_service(struct ml_msp *msp, long now_ms);
 int ml_msp_fc_voltage_mv(const struct ml_msp *msp, long now_ms);
+int ml_msp_fc_present(const struct ml_msp *msp, long now_ms);
 
 #endif /* ML_MSP_H */
