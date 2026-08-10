@@ -381,13 +381,17 @@ void rx_chan_open(uint8_t *frame, uint32_t *seq_link)
         return;
     }
 
+    /* The fallback is operator-actionable (the saved channel no longer belongs to this band), so it
+     * stays unconditional; opening on the expected channel is routine.
+     */
     if (saved >= 0 && target != saved) {
         printf(TAG " band: saved ch%d outside valid_bmp=0x%08x, opening on first valid ch%d\n",
                saved, g_scan.valid_bmp, target);
-    } else {
+        fflush(stdout);
+    } else if (g_verbose) {
         printf(TAG " band: opening on ch%d (valid_bmp=0x%08x)\n", target, g_scan.valid_bmp);
+        fflush(stdout);
     }
-    fflush(stdout);
 
     send_frame(frame, bb_select_channel(frame, (uint8_t)target, (*seq_link)++), "open-chn");
     g_cur_chnidx = target;
@@ -661,8 +665,10 @@ void rx_chan_service(uint8_t *frame, uint32_t *seq_link)
         g_pending_chnidx = -1;
         send_frame(frame, bb_select_channel(frame, (uint8_t)chnidx, (*seq_link)++), "select-chn");
         g_cur_chnidx = chnidx;
-        printf(TAG " selected channel %d\n", chnidx);
-        fflush(stdout);
+        if (g_verbose) {
+            printf(TAG " selected channel %d\n", chnidx);
+            fflush(stdout);
+        }
     }
 
     if (g_pending_scan) {

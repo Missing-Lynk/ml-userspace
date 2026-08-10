@@ -393,15 +393,19 @@ static void handle_ready(const struct mlm_ready *ready, long now)
 {
     if (!g_ready) {
         g_ready = 1;
-        printf(TAG " consumer READY\n");
-        fflush(stdout);
+        if (g_verbose) {
+            printf(TAG " consumer READY\n");
+            fflush(stdout);
+        }
     }
 
     g_last_ready_ms = now;
     if (ready->frames_seen && g_params_acked && !g_video_confirmed) {
         g_video_confirmed = 1;
-        printf(TAG " consumer confirms frames arriving\n");
-        fflush(stdout);
+        if (g_verbose) {
+            printf(TAG " consumer confirms frames arriving\n");
+            fflush(stdout);
+        }
     }
 
     /* feed the video-stall watch: note every advance of the consumer's datagram counter */

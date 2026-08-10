@@ -635,16 +635,15 @@ gboolean rf_ready_tick(gpointer u)
     sendto(c->lsock, &rec, sizeof rec, MSG_DONTWAIT,
            (struct sockaddr *)&c->laddr, sizeof c->laddr);
 
-    /* The stats line is debug-grade and this tick runs every 2s, so throttle the log to a ~30s
-     * heartbeat (the READY sendto above stays at full cadence). ML_STATS=1 restores every-tick.
+    /* The stats line is debug-grade, so it is opt-in: ML_STATS=1 prints it every tick (2s). The
+     * READY sendto above stays at full cadence either way.
      */
-    static unsigned stats_tick;
-    static int stats_every = -1;
-    if (stats_every < 0) {
-        stats_every = (getenv("ML_STATS") != NULL) ? 1 : 15;
+    static int stats_on = -1;
+    if (stats_on < 0) {
+        stats_on = (getenv("ML_STATS") != NULL);
     }
 
-    if ((stats_tick++ % stats_every) != 0) {
+    if (!stats_on) {
         return G_SOURCE_CONTINUE;
     }
 

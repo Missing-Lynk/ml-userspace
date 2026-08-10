@@ -35,6 +35,7 @@
 #include "../../ml-shared/mlm.h"
 
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -55,6 +56,25 @@
 #define TEMPWARN_CHIRP_MS  2000 /* overheat chirp interval while the banner is latched */
 
 static volatile sig_atomic_t g_stop;
+
+/* Routine interaction traces (menu open/close, bind gesture) are debug-grade: a healthy session
+ * writes none of them. -v / HUD_VERBOSE=1 turns them back on. Failures and degraded-mode notices
+ * never pass through here.
+ */
+static int g_verbose;
+
+static void vlog(const char *fmt, ...)
+{
+    if (!g_verbose) {
+        return;
+    }
+
+    va_list ap;
+
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+}
 
 static void on_sigint(int s)
 {
@@ -257,7 +277,7 @@ static void on_button(void *ctx, hud_button_t button, hud_button_edge_t edge)
     if (!menu_is_open()) {
         if (button == HUD_BTN_CENTER && edge == HUD_EDGE_DOWN) {
             menu_open();
-            fprintf(stderr, "hud: menu open\n");
+            vlog("hud: menu open\n");
         }
 
         return;
@@ -691,7 +711,7 @@ static void back_longpress_tick(hud_ctx_t *h)
         && now_ms() - h->back_down_ms >= LONGPRESS_MS) {
         menu_close_all();
         h->back_fired = 1;
-        fprintf(stderr, "hud: menu close (long back)\n");
+        vlog("hud: menu close (long back)\n");
     }
 }
 
@@ -709,7 +729,7 @@ static void bind_arm_tick(hud_ctx_t *h, uint32_t now)
     if (!linkstate_is_airunit_connected() && !linkstate_is_binding()) {
         tone_beep();
         linkcmd_bind();
-        fprintf(stderr, "hud: bind requested (held)\n");
+        vlog("hud: bind requested (held)\n");
     }
 }
 
@@ -732,7 +752,7 @@ static void menu_state_sync(hud_ctx_t *h)
         h->state = HUD_MENU_CLOSED;
         btfl_osd_invalidate();   /* the menu overwrote the surface: full OSD redraw next */
         sysosd_invalidate();     /* and repaint the bar over the coming full BTFL present */
-        fprintf(stderr, "hud: menu closed\n");
+        vlog("hud: menu closed\n");
     }
 
     h->prev_menu_open = open_now;
@@ -747,7 +767,8 @@ static void usage(const char *p)
         "  --drm [PLANE]     present on the DRM overlay plane via ml-drmfd (default plane 38)\n"
         "  --menu-open       start with the menu OPEN\n"
         "  --frames N        exit after N OSD frames (default: run until idle/signal)\n"
-        "  --idle-ms N       exit after N ms with no datagram, menu closed (default 3000; 0 = never)\n",
+        "  --idle-ms N       exit after N ms with no datagram, menu closed (default 3000; 0 = never)\n"
+        "  -v, --verbose     log routine interaction traces (also HUD_VERBOSE=1)\n",
         p);
 }
 
@@ -761,6 +782,8 @@ int main(int argc, char **argv)
     int start_open = 0;
     long max_frames = 0;
     int idle_ms = 3000;
+
+    g_verbose = (getenv("HUD_VERBOSE") != NULL);
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--btfl-font") && i + 1 < argc) {
@@ -778,6 +801,8 @@ int main(int argc, char **argv)
             max_frames = atol(argv[++i]);
         } else if (!strcmp(argv[i], "--idle-ms") && i + 1 < argc) {
             idle_ms = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "-v") || !strcmp(argv[i], "--verbose")) {
+            g_verbose = 1;
         } else {
             usage(argv[0]);
             return 2;
