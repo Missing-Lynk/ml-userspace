@@ -5,6 +5,7 @@
 #   make linkd      just ml-linkd
 #   make ledd       just ml-ledd
 #   make msp-echo   just the passive FC UART test tool
+#   make rfcmd      just the RF command sender (drives ml-linkd's link.sock from a shell)
 #   make gst        HOST/SD-CARD ONLY: dynamically linked gstreamer binaries (gstreamer/src/build.sh)
 #                   -> gstreamer/build/bin/. These CANNOT run on a device rootfs: there is no
 #                   GStreamer or glib installed there, so they die with "symbol not found".
@@ -46,11 +47,13 @@ DEV_HAS_FC_LINK  ?= 0
 
 all: daemons gst gst-static hud font
 
-daemons:    $(BUILD)/ml-linkd $(BUILD)/ml-ledd $(BUILD)/ml-rf-bringup $(BUILD)/ml-msp-echo
+daemons:    $(BUILD)/ml-linkd $(BUILD)/ml-ledd $(BUILD)/ml-rf-bringup $(BUILD)/ml-msp-echo \
+            $(BUILD)/ml-rfcmd
 linkd:      $(BUILD)/ml-linkd
 ledd:       $(BUILD)/ml-ledd
 rf-bringup: $(BUILD)/ml-rf-bringup
 msp-echo:   $(BUILD)/ml-msp-echo
+rfcmd:      $(BUILD)/ml-rfcmd
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -69,6 +72,7 @@ $(eval $(call daemon_rule,ml-linkd,linux-headers,-pthread))
 $(BUILD)/ml-linkd: ml-linkd/version.h
 $(eval $(call daemon_rule,ml-ledd,linux-headers,))
 $(eval $(call daemon_rule,ml-rf-bringup,linux-headers,))
+$(eval $(call daemon_rule,ml-rfcmd,linux-headers,))
 
 # Host tests. Built with the host compiler and run here, not cross-built: they exercise pure logic
 # against checked-in captures, so they need no device, no docker and no hardware.
