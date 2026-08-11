@@ -329,8 +329,8 @@ int main(int argc, char **argv)
     const char *cfg = argv[2];
 
     if (module_is_loaded(RF_MODULE)) {
-        fprintf(stderr, PROG ": %s already loaded; nothing to do\n", RF_MODULE);
-        return 0;
+        fprintf(stderr, PROG ": %s already loaded; verifying %s\n", RF_MODULE, SDIO_IFACE);
+        return configure_sdio0() == 0 ? 0 : 1;
     }
 
     if (release_reset() != 0) {
