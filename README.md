@@ -7,7 +7,7 @@ The open user-space stack for Artosyn Proxima-9311 + AR8030 devices: the video p
 | Component | What it is |
 |---|---|
 | `gstreamer/` | The video pipeline: RF-feed decode-to-display (zero-copy DRM/KMS at 1080p60), the two-process pipeline/HUD split, and DVR recording on the wave5 encoder. Two packaging tracks (SD squashfs for development, a static binary for the rootfs); see `gstreamer/README.md`. |
-| `hud/` | The LVGL menu and OSD stack (Betaflight OSD, system OSD, settings menu), drawn on a DRM overlay plane. Static aarch64, third-party deps via CMake FetchContent. |
+| `ml-hud/` | The LVGL menu and OSD stack (Betaflight OSD, system OSD, settings menu), drawn on a DRM overlay plane. Static aarch64, third-party deps via CMake FetchContent. |
 | `ml-linkd/` | The RF link daemon: AR8030 association and steady cadence, the READY-gated `:10000`/`:20001` handshakes, telemetry published over the mlm seams. |
 | `ml-ledd/` | The status-LED daemon: renders off/solid/breathe/blink on the WS2812 chain; a command sink any producer can drive. |
 | `ml-shared/` | `mlm.h`, the MissingLynk Messaging (MLM) wire contract every component includes. |

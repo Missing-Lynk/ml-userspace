@@ -26,6 +26,42 @@ How the goggle makes the air unit stream H.265 video to it over the AR8030 link,
 6. **`:20001` identity handshake (3-way):** goggle sends 520 B type-0 probes (~3 Hz); air answers type-1 (its identity, ONCE); goggle must echo the air's type-1 back with exactly `byte[0]=0x02, byte[5]=0x00` (type-2 ACK). Without the ACK the air retransmits type-1 forever and never advances. The vendor stops the type-0 probe after this completes.
 7. **`:10000` media-params handshake (the actual video trigger):** goggle sends `msg_type=1` MEDIA_PARAMS_REQUEST (24 B, ts@8, len=0) every ~2.0 s; air answers `msg_type=2` MEDIA_PARAMS (24 B header + 72 B body: codec/res/fps); goggle sends `msg_type=3` MEDIA_IDR_REQUEST (24 B, ts@8). The air begins VideoSend on `:10001` right after the type-3.
 
+   **The 72-byte body is mandatory, and its length is checked.** The receiver's dispatch arm
+   (`AR_FSM_RX_CommonMessageProcessThread`, `archive/re/ghidra/out/ar_lowdelay-full.txt:21814`)
+   compares the declared length at offset 16 against `0x48` before anything else and drops the
+   datagram with `receive params size[%d] error , really size[72]!!` on a mismatch - so a
+   header-only reply never raises PARAMS_RECEIVED and video never starts. It then copies the body
+   into `g_stRxParams` and pulls the frame rate out of it for
+   `AR_LOWDELAY_RX_SYSCTRL_SetCurInputFps`.
+
+   Field map, offsets absolute into the datagram, recovered from the consumer's stores (`:21921`)
+   and its readers in `AR_FSM_RX_RealTimeInit` (`:18752`). `mp_params_reply` in
+   `ml-linkd/mp-cmd.h` writes exactly these:
+
+   | offset | type | meaning |
+   |---|---|---|
+   | 16 | u32 | body length, must be `0x48` |
+   | 28 | u32 | source ready. **Non-zero is mandatory:** `RealTimeInit` refuses with `RealTime Pipeline Init Error, Tx Sns Is Not Ready...` while it is 0, so a correctly sized body of zeros fails one rung later rather than working. The vendor sets it on HDMI connect (`:15365`), clears it on disconnect (`:15442`). |
+   | 32 | u32 | set to 1 alongside it on the vendor's format-change path (`:15479`) |
+   | 44 | f32 | frame rate, high precision. 0.0 is tolerated - the receiver substitutes its own configured rate (`:18882`) |
+   | 48 | u32 | width. `0x780` = 1920, `0x500` = 1280, `0x2d0` = 720 |
+   | 52 | u32 | height. The 48/52 pair is decoded into `720P60` and friends at `:23182` |
+   | 56 | u32 | frame rate, whole. Drives `SetCurInputFps` |
+
+   Offsets 20/24 are a flag/value pair the receiver forwards to its pipeline create when the flag
+   reads 1 (`:18783`); 36, 40 and 60..91 are unidentified. All are sent as zero, which is the
+   receiver's own "off" path for the pair. Offset 40 does reach the decoder create (`:18880`), so it
+   is the first field to suspect if a vendor receiver accepts the reply and then fails to bring its
+   pipeline up.
+
+   Our own goggle ignores all of it - `ml-rx-udp.c` dispatches on `msg_type` and takes geometry from
+   SetLdCfg - so the body matters only for vendor receivers. The producer side, for recovering real
+   values rather than the zeros above, is `AR_FSM_TX_ProcessParamsRequest` (`:15581`), which fills
+   the same 72 bytes from `g_stTxParams` plus the globals `DAT_00510f20..0x510f58`.
+
+   **Untested against vendor software.** Every offset above is read off the RE; `make check` asserts
+   our bytes match that reading, not that the reading is right.
+
    `msg_type=3` is the on-demand keyframe request. The goggle emits it from `AR_FSM_RX_ProcessIdrRequest @0x42de70`, with the same header shape `AR_FSM_RX_ProcessParamsRequest @0x42d8c0` uses for type 1. The air routes it to TX FSM message 8, `AR_FSM_TX_ProcessIdrRequest @0x428938`, which runs `PIPELINE_Start` and, while already streaming, `AR_LDRT_TX_PIPELINE_IdrEnable`. Video begins because the request is answered with an IDR, so the same message also repairs a mid-flight join or a desynced decoder.
 
 ## UDP reliability model (wire-measured on slot A)
