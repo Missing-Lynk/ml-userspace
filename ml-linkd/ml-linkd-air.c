@@ -320,6 +320,19 @@ static int air_send_standby(uint32_t work_mode, void *ctx)
                   (struct sockaddr *)tx->dst, sizeof *tx->dst) < 0 ? -1 : 0;
 }
 
+/* The video this air unit transmits, as reported in the MEDIA_PARAMS reply. Fixed rather than
+ * queried: ml-air-video owns the pipeline in a separate process, and these are the geometry and
+ * rate its service configures (rootfs devices/betafpv-vr04-air/overlay/etc/init.d/ml-air-camera:
+ * FPS=60 over the CVISP node's fixed 1920x1080). A receiver that acts on the reply - a vendor
+ * goggle does, ours does not - would be told the wrong thing if the service and these diverge, so
+ * change them together.
+ *
+ * The height is the FULL frame, not the 540-line tile: the two tiles reassemble into one 1080-line
+ * picture at the receiver, and what it is being told here is what it will end up displaying. */
+#define AIR_VIDEO_WIDTH   1920
+#define AIR_VIDEO_HEIGHT  1080
+#define AIR_VIDEO_FPS     60
+
 /* Everything one :10000 datagram may need to act on. */
 struct air_msg_ctx {
     struct air_udp_tx *tx;
@@ -334,7 +347,7 @@ struct air_msg_ctx {
  * is not goggle contact and does not refresh the power module's liveness. */
 static void air_on_params(const struct air_msg_ctx *c, const uint8_t *dgram, ssize_t n)
 {
-    uint8_t frame[MP_HDR_LEN];
+    uint8_t frame[MP_PARAMS_TOTAL];
     uint32_t msg_type;
 
     if (n < 4) {
@@ -349,8 +362,10 @@ static void air_on_params(const struct air_msg_ctx *c, const uint8_t *dgram, ssi
             /* The goggle gates its whole session on this reply: it drives the IDR request, the
              * solid-green LED and the video-stall watch (ml-linkd.c g_params_acked). Answering
              * changes no air-side state, matching AR_FSM_TX_ProcessParamsRequest @0x4284e8. */
-            sendto(c->tx->sock, frame, mp_params_reply(frame, c->stamp_us), MSG_DONTWAIT,
-                   (struct sockaddr *)c->tx->dst, sizeof *c->tx->dst);
+            sendto(c->tx->sock, frame,
+                   mp_params_reply(frame, AIR_VIDEO_WIDTH, AIR_VIDEO_HEIGHT, AIR_VIDEO_FPS,
+                                   c->stamp_us),
+                   MSG_DONTWAIT, (struct sockaddr *)c->tx->dst, sizeof *c->tx->dst);
 
             if (g_verbose) {
                 fprintf(stderr, TAG " rx MEDIA_PARAMS_REQUEST -> reply\n");

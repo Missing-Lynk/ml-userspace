@@ -79,9 +79,10 @@ $(eval $(call daemon_rule,ml-rfcmd,linux-headers,))
 CHECK_CFLAGS := -O1 -Wall -Wextra -Werror
 
 .PHONY: check
-check: $(BUILD)/msp-canvas-roundtrip $(BUILD)/air-power-standby
+check: $(BUILD)/msp-canvas-roundtrip $(BUILD)/air-power-standby $(BUILD)/mp-params-reply
 	$(BUILD)/msp-canvas-roundtrip
 	$(BUILD)/air-power-standby
+	$(BUILD)/mp-params-reply
 
 $(BUILD)/msp-canvas-roundtrip: tests/msp-canvas-roundtrip.c ml-linkd/ml-msp.c \
                                ml-hud/src/osd/msp_canvas.c | $(BUILD)
@@ -89,6 +90,10 @@ $(BUILD)/msp-canvas-roundtrip: tests/msp-canvas-roundtrip.c ml-linkd/ml-msp.c \
 
 $(BUILD)/air-power-standby: tests/air-power-standby.c ml-linkd/ml-air-power.c | $(BUILD)
 	gcc $(CHECK_CFLAGS) -o $@ $^
+
+# Header-only: mp-cmd.h is all inline, so the test needs no other translation unit.
+$(BUILD)/mp-params-reply: tests/mp-params-reply.c ml-linkd/mp-cmd.h | $(BUILD)
+	gcc $(CHECK_CFLAGS) -o $@ tests/mp-params-reply.c
 
 $(BUILD)/ml-msp-echo: ml-msp-echo/ml-msp-echo.c ml-linkd/ml-msp.c ml-linkd/ml-msp.h | $(BUILD)
 	docker run --rm --platform linux/arm64 -v $(REPO):/w -w /w \

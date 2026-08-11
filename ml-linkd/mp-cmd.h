@@ -60,17 +60,70 @@ static inline int mp_header_only(uint8_t *frame, enum mp_type type, uint32_t sta
     return MP_HDR_LEN;
 }
 
-/* MEDIA_PARAMS handshake: the goggle's poll and the air's reply. The reply is header-only here: the
- * vendor's carries media params, but our goggle dispatches on msg_type alone (ml-linkd.c) and takes
- * its video geometry from SetLdCfg, so there is no field to fabricate. */
+/* MEDIA_PARAMS handshake: the goggle's poll and the air's reply. */
 static inline int mp_params_request(uint8_t *frame, uint32_t stamp)
 {
     return mp_header_only(frame, MP_REQUEST, stamp);
 }
 
-static inline int mp_params_reply(uint8_t *frame, uint32_t stamp)
+/* The reply carries a 72-byte body and MUST declare that length. A vendor receiver tests the
+ * declared length against 0x48 before anything else (AR_FSM_RX_CommonMessageProcessThread,
+ * archive/re/ghidra/out/ar_lowdelay-full.txt:21814) and drops the datagram with
+ * "receive params size[%d] error , really size[72]" on a mismatch, so a header-only reply never
+ * raises PARAMS_RECEIVED: the receiver then never runs its RealTimeInit and never asks for the
+ * keyframe that starts video. Our own goggle dispatches on msg_type alone and takes its geometry
+ * from SetLdCfg, so it ignores everything below and accepts this frame unchanged.
+ *
+ * Field map, recovered from the consumer's stores into g_stRxParams (:21921) and its readers in
+ * AR_FSM_RX_RealTimeInit (:18752). Offsets are absolute into the datagram:
+ *
+ *   28  u32  source ready. NON-ZERO IS MANDATORY - RealTimeInit refuses with "Tx Sns Is Not
+ *            Ready..." while this is 0, so a correctly sized body of zeros fails one rung later
+ *            than a header-only one rather than working. The vendor sets it when its HDMI source
+ *            connects (:15365) and clears it on disconnect (:15442); our source is the camera,
+ *            which is live whenever there is anything to answer with.
+ *   32  u32  set to 1 alongside it on the vendor's format-change path (:15479).
+ *   44  f32  frame rate, high precision. Zero is tolerated here: the receiver substitutes its own
+ *            configured rate when it reads 0.0 (:18882). Sent anyway, since we know it.
+ *   48  u32  width. 0x780 = 1920, 0x500 = 1280, 0x2d0 = 720; the receiver decodes the pair at
+ *            48/52 into "720P60" and friends at :23182.
+ *   52  u32  height.
+ *   56  u32  frame rate, whole. Consumed by AR_LOWDELAY_RX_SYSCTRL_SetCurInputFps.
+ *
+ * Deliberately zero, and the reasoning, because a wrong value here is worse than a zero:
+ * offsets 20/24 are a flag/value pair the receiver forwards to its pipeline create when the flag
+ * reads 1 (:18783), and zero is the "off" branch it already handles. Offsets 36, 40 and 60..91 are
+ * unidentified. Note 40 does reach the decoder create (:18880), so it is the first field to look at
+ * if a vendor goggle accepts the reply and then fails to bring its pipeline up.
+ *
+ * No 12-byte trailer, unlike the air's status frames: the vendor's own assembly
+ * (AR_FSM_TX_ProcessParamsRequest :15581) ends at the body, so there is nothing to copy.
+ */
+#define MP_PARAMS_BODY_LEN   0x48                                  /* 72, checked by the receiver */
+#define MP_PARAMS_TOTAL      (MP_OFF_BODY + MP_PARAMS_BODY_LEN)    /* 92 */
+
+#define MP_PR_OFF_SRC_READY  (MP_OFF_BODY + 8)    /* 28 */
+#define MP_PR_OFF_SRC_MODE   (MP_OFF_BODY + 12)   /* 32 */
+#define MP_PR_OFF_FPS_F      (MP_OFF_BODY + 24)   /* 44 */
+#define MP_PR_OFF_WIDTH      (MP_OFF_BODY + 28)   /* 48 */
+#define MP_PR_OFF_HEIGHT     (MP_OFF_BODY + 32)   /* 52 */
+#define MP_PR_OFF_FPS        (MP_OFF_BODY + 36)   /* 56 */
+
+static inline int mp_params_reply(uint8_t *frame, uint32_t width, uint32_t height, uint32_t fps,
+                                  uint32_t stamp)
 {
-    return mp_header_only(frame, MP_REPLY, stamp);
+    uint32_t ready = 1;
+    float fps_f = (float) fps;
+
+    mp_stamp(frame, MP_PARAMS_TOTAL, MP_REPLY, stamp, MP_PARAMS_BODY_LEN);
+    memcpy(frame + MP_PR_OFF_SRC_READY, &ready, 4);
+    memcpy(frame + MP_PR_OFF_SRC_MODE, &ready, 4);
+    memcpy(frame + MP_PR_OFF_FPS_F, &fps_f, 4);
+    memcpy(frame + MP_PR_OFF_WIDTH, &width, 4);
+    memcpy(frame + MP_PR_OFF_HEIGHT, &height, 4);
+    memcpy(frame + MP_PR_OFF_FPS, &fps, 4);
+
+    return MP_PARAMS_TOTAL;
 }
 
 /* MEDIA_IDR_REQUEST: the receiver asking the air for a keyframe, which is what starts video at
