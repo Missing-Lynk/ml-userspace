@@ -35,6 +35,7 @@
 #include <signal.h>
 #include <pthread.h>
 #include <time.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 
@@ -56,6 +57,8 @@
 #define ASSOC_STEP_US    20000
 #define SETTLE_STEP_US   167000
 #define STEADY_STEP_US   42000
+#define WRITE_WAIT_MS    100              /* bounded wait for the chip's cmd TX queue to drain */
+#define WRITE_POLL_MS    5                /* POLLOUT retry step inside that budget */
 
 #define SETTLE_TICKS     15               /* ~2.5 s of SETTLE */
 #define ALIVE_EVERY      720              /* STEADY ticks between alive lines (~30 s) */
@@ -180,17 +183,37 @@ void link_event(uint32_t state, const char *what)
 
 int send_frame(const uint8_t *frame, int n, const char *tag)
 {
-    ssize_t written = write(g_fd, frame, n);
-    if (written != n) {
+    struct pollfd pfd = { .fd = g_fd, .events = POLLOUT };
+    int waited_ms;
+
+    for (waited_ms = 0; waited_ms <= WRITE_WAIT_MS; waited_ms += WRITE_POLL_MS) {
+        ssize_t written = write(g_fd, frame, (size_t)n);
+
+        if (written == n) {
+            if (waited_ms > 0 && g_verbose) {
+                fprintf(stderr, TAG " tx %s accepted after %d ms of backpressure\n",
+                        tag, waited_ms);
+            }
+
+            if (g_verbose) {
+                fprintf(stderr, TAG " tx %s (%d B)\n", tag, n);
+            }
+
+            return 0;
+        }
+
+        if (written < 0 && (errno == EAGAIN || errno == EINTR)) {
+            pfd.revents = 0;
+            poll(&pfd, 1, WRITE_POLL_MS);
+            continue;
+        }
+
         fprintf(stderr, TAG " write(%s)=%zd (%s)\n", tag, written, strerror(errno));
         return -1;
     }
 
-    if (g_verbose) {
-        fprintf(stderr, TAG " tx %s (%d B)\n", tag, n);
-    }
-
-    return 0;
+    fprintf(stderr, TAG " write(%s) not accepted in %d ms, frame dropped\n", tag, WRITE_WAIT_MS);
+    return -1;
 }
 
 /* ASSOC: association bring-up, chip-bound (NOT air commands):
@@ -353,7 +376,7 @@ static int rx_main(const char *node)
 
     /* WAIT_DEV: ml-rf-bringup must have run; retry until the node appears. Log on the first miss
      * and then every OPEN_RETRY_EVERY tries, so a link down for a while does not flood the log. */
-    for (unsigned tries = 0; g_run && (g_fd = open(node, O_RDWR)) < 0; tries++) {
+    for (unsigned tries = 0; g_run && (g_fd = open(node, O_RDWR | O_NONBLOCK)) < 0; tries++) {
         if (tries == 0 || (tries % OPEN_RETRY_EVERY) == 0) {
             fprintf(stderr, TAG " open(%s): %s, retrying\n", node, strerror(errno));
         }
