@@ -1,15 +1,17 @@
 # MissingLynk userspace (the on-device open programs)
 
-The open user-space stack for Artosyn Proxima-9311 + AR8030 devices: the video pipeline, the HUD/menu, the RF link and status-LED daemons, and the wire contract they share. These run on the open Alpine slot-B rootfs against the open kernel, with no vendor user-space. Device-neutral: the same SoC/RF pair spans goggle, VRx, VTx, and air-unit products; hardware validation happens on a BetaFPV VR04 HD goggle, but nothing here is goggle-specific except where noted.
+The open user-space stack for Artosyn Proxima-9311 + AR8030 devices: media pipeline, HUD/menu, RF/session control, hardware daemons, and the wire contract they share. These programs run on the open Alpine slot-B rootfs against the open kernel, with no vendor user-space.
+
+The code is device-neutral where the SoC/RF pair is shared across goggle, VRx, VTx, and air-unit products. Hardware validation currently happens on BetaFPV VR04 HD goggles and matching air units.
 
 ## Components
 
 | Component | What it is |
 |---|---|
-| `gstreamer/` | The video pipeline: RF-feed decode-to-display (zero-copy DRM/KMS at 1080p60), the two-process pipeline/HUD split, and DVR recording on the wave5 encoder. Two packaging tracks (SD squashfs for development, a static binary for the rootfs); see `gstreamer/README.md`. |
+| `gstreamer/` | Media pipeline for receiver display/DVR and transmitter encode. Two packaging tracks: SD-card development builds and static rootfs-shipped binaries; see `gstreamer/README.md`. |
 | `ml-hud/` | The LVGL menu and OSD stack (Betaflight OSD, system OSD, settings menu), drawn on a DRM overlay plane. Static aarch64, third-party deps via CMake FetchContent. |
-| `ml-linkd/` | The RF link daemon: AR8030 association and steady cadence, the READY-gated `:10000`/`:20001` handshakes, telemetry published over the mlm seams. |
-| `ml-ledd/` | The status-LED daemon: renders off/solid/breathe/blink on the WS2812 chain; a command sink any producer can drive. |
+| `ml-linkd/` | RF/session daemon for receiver and air roles: AR8030 cadence, media handshakes, telemetry, OSD transport, RF commands, standby and power policy. |
+| `ml-*` tools | Small daemons and command-line helpers for RF bring-up, LEDs, MSP testing, and runtime control. Each tool directory carries its own local notes where needed. |
 | `ml-shared/` | `mlm.h`, the MissingLynk Messaging (MLM) wire contract every component includes. |
 | `assets/` | The boot splash and the OSD font, rendered by the user-space binaries and staged into the rootfs. |
 | `docs/` | The component internals and the vendor interfaces they consume: codec APIs (`vdec`/`venc`/`mpp-buffers`), the decode-display pipeline, RF video downlink / modes / channels, the MSP OSD format, and the RF-reached air unit. |
@@ -21,14 +23,16 @@ Every program includes `ml-shared/mlm.h`, so they live in one repo: the wire con
 One top-level `Makefile` drives all of it (cross-builds need docker with arm64 emulation via qemu binfmt):
 
 ```sh
-make            # everything: daemons, gstreamer, hud
-make daemons    # ml-linkd + ml-ledd (static musl aarch64) -> build/
-make gst        # the gstreamer pipeline/HUD binaries
+make            # everything: static daemons/tools, media pipeline, hud, font assets
+make daemons    # static musl aarch64 daemons/tools -> build/
+make gst        # SD-card development media binaries
+make gst-static # static rootfs-shipped media binaries
 make hud        # the LVGL HUD binary
+make check      # host-side tests, no device and no docker
 make clean      # remove build/
 ```
 
-The static daemons land in `build/`; gstreamer and hud own their own build trees.
+The static daemons/tools land in `build/`; gstreamer and hud own their own build trees.
 
 ## Building from a wrapper checkout
 
