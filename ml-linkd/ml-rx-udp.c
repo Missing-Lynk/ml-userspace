@@ -60,15 +60,15 @@ static uint32_t g_rx_pkts_last;             /* last heartbeat's counter value */
 static long g_rx_pkts_change_ms;            /* when it last advanced */
 static int g_rx_counting;                   /* counter has advanced at least once this session */
 #define MEDIA_STALL_MS 6000                 /* 3 heartbeats of a frozen counter = video is dead */
-static volatile long g_last_ready_ms;       /* last MLM_T_READY heartbeat */
+static long g_last_ready_ms;                /* last MLM_T_READY heartbeat */
 
 /* Air-unit RF config the HUD has commanded (MLM_T_RFCMD on link.sock). -1 = never commanded, so
  * nothing is pushed to the air until the HUD asserts it; the HUD re-asserts on every link-up edge.
  * ml-linkd re-sends the SetTranParm on a steady cadence while linked, so no per-change latch is
  * needed - a toggle or a returning air unit is picked up by the next tick. */
-static volatile int g_standby_arm = -1;     /* 0/1 = HUD-commanded u8StandbyModeEn, -1 = unknown */
-static volatile int g_power_dbm = -1;        /* HUD-commanded TX power (dBm) for SetTranParm body[0], -1 = unset */
-static volatile int g_bitrate_mbps;         /* HUD-commanded bitrate (Mbps) for SetLdCfg bitrate_q, 0 = unset */
+static int g_standby_arm = -1;              /* 0/1 = HUD-commanded u8StandbyModeEn, -1 = unknown */
+static int g_power_dbm = -1;                /* HUD-commanded TX power (dBm) for SetTranParm body[0], -1 = unset */
+static int g_bitrate_mbps;                  /* HUD-commanded bitrate (Mbps) for SetLdCfg bitrate_q, 0 = unset */
 
 /* Camera/scale state the HUD has commanded (MLM_RF_SET_CAMERA / MLM_RF_SET_SCALE). Owned entirely
  * by this thread: the commands arrive on link.sock and the :10000 datagrams leave on params_sock,
@@ -118,13 +118,13 @@ static void led_cmd(uint8_t mode, uint8_t r, uint8_t g, uint8_t b, uint16_t peri
 
 static void led_assert(void)
 {
-    if (!g_params_acked || g_air_lost) {
+    if (!rx_state_get(&g_params_acked) || rx_state_get(&g_air_lost)) {
         /* no usable link yet */
         led_cmd(MLM_LED_BREATHE, 0xff, 0x00, 0x00, LED_BREATHE_MS);
         return;
     }
 
-    if (g_standby_state) {
+    if (rx_state_get(&g_standby_state)) {
         /* link up, air in standby */
         led_cmd(MLM_LED_BREATHE, 0xff, 0x50, 0x00, LED_BREATHE_MS);
         return;
@@ -404,8 +404,8 @@ static void handle_rfcmd(const struct mlm_rfcmd *rfcmd, long now)
 /* One consumer READY heartbeat off link.sock. */
 static void handle_ready(const struct mlm_ready *ready, long now)
 {
-    if (!g_ready) {
-        g_ready = 1;
+    if (!rx_state_get(&g_ready)) {
+        rx_state_set(&g_ready, 1);
         if (g_verbose) {
             printf(TAG " consumer READY\n");
             fflush(stdout);
@@ -413,8 +413,9 @@ static void handle_ready(const struct mlm_ready *ready, long now)
     }
 
     g_last_ready_ms = now;
-    if (ready->frames_seen && g_params_acked && !g_video_confirmed) {
-        g_video_confirmed = 1;
+    if (ready->frames_seen && rx_state_get(&g_params_acked)
+        && !rx_state_get(&g_video_confirmed)) {
+        rx_state_set(&g_video_confirmed, 1);
         if (g_verbose) {
             printf(TAG " consumer confirms frames arriving\n");
             fflush(stdout);
@@ -450,7 +451,7 @@ static void handle_params(struct udp_socks *socks, const uint8_t *datagram, ssiz
          * ONCE per session (the first 0x02): the poll runs for the whole session, 0x02 replies
          * arrive every 2 s, and re-sending SetLdCfg on each would be exactly that mid-stream
          * reconfig. */
-        if (!g_params_acked && (g_power_dbm >= 0 || g_bitrate_mbps > 0)) {
+        if (!rx_state_get(&g_params_acked) && (g_power_dbm >= 0 || g_bitrate_mbps > 0)) {
             uint8_t cfg[MP_LDCFG_LEN];
             uint8_t dbm = g_power_dbm >= 0 ? (uint8_t) g_power_dbm : 0;
             /* standby: armed only when the HUD commanded it; never the base's 1 (an
@@ -472,7 +473,7 @@ static void handle_params(struct udp_socks *socks, const uint8_t *datagram, ssiz
          * once it is, which keeps the stream from going needlessly intra-heavy. Both the
          * air-loss watch and the video-stall watch clear g_video_confirmed, so requests
          * resume by themselves whenever video needs repairing. */
-        if (!g_video_confirmed) {
+        if (!rx_state_get(&g_video_confirmed)) {
             uint8_t frame[MP_HDR_LEN];
             sendto(socks->params, frame, mp_idr_request(frame, stamp_us), MSG_DONTWAIT,
                    (struct sockaddr *)&socks->air_params, sizeof socks->air_params);
@@ -482,8 +483,8 @@ static void handle_params(struct udp_socks *socks, const uint8_t *datagram, ssiz
             }
         }
 
-        if (!g_params_acked) {
-            g_params_acked = 1;
+        if (!rx_state_get(&g_params_acked)) {
+            rx_state_set(&g_params_acked, 1);
             link_event(MLM_LINK_PARAMS_ACKED, "MEDIA_PARAMS acked, video should start");
             led_cmd(MLM_LED_SOLID, 0x00, 0xff, 0x00, 0);
 
@@ -501,7 +502,7 @@ static void handle_params(struct udp_socks *socks, const uint8_t *datagram, ssiz
         /* the air reports its live work-mode on every change; latch it for the HUD icon */
         uint32_t wm;
         memcpy(&wm, datagram + STANDBY_OFF_MODE, 4);
-        g_standby_state = (wm == STANDBY_MODE_ON);
+        rx_state_set(&g_standby_state, wm == STANDBY_MODE_ON);
         if (g_verbose) {
             fprintf(stderr, TAG " standby work-mode=%u\n", wm);
         }
@@ -562,7 +563,7 @@ void *rx_udp_thread(void *arg)
     (void)arg;
     socks_open(&socks);
 
-    while (g_run) {
+    while (ml_should_run()) {
         long now = now_ms();
         uint32_t stamp_us;
         struct timespec t;
@@ -595,23 +596,24 @@ void *rx_udp_thread(void *arg)
          * air-side link bounce rebuilt its video path and now waits for a media handshake this
          * session already latched past. Re-arm the handshake: the ungated 2 s poll keeps running,
          * and the next 0x02 reply re-fires SetLdCfg + the type-3 ack (and the camera re-assert). */
-        if (g_params_acked && g_video_confirmed && g_rx_counting && !g_air_lost
+        if (rx_state_get(&g_params_acked) && rx_state_get(&g_video_confirmed)
+            && g_rx_counting && !rx_state_get(&g_air_lost)
             && now - g_rx_pkts_change_ms > MEDIA_STALL_MS) {
-            g_params_acked = 0;
-            g_video_confirmed = 0;
+            rx_state_set(&g_params_acked, 0);
+            rx_state_set(&g_video_confirmed, 0);
             g_rx_counting = 0;
             link_event(MLM_LINK_SESSION_RESTART,
                        "video datagrams stalled, re-running the media handshake");
         }
 
-        if (g_ready && now - g_last_ready_ms > READY_WINDOW_MS) {
-            g_ready = 0;
+        if (rx_state_get(&g_ready) && now - g_last_ready_ms > READY_WINDOW_MS) {
+            rx_state_set(&g_ready, 0);
             printf(TAG " consumer READY lost (heartbeat timeout)\n");
             fflush(stdout);
         }
 
         /* :20001 hello until the 3-way is done (vendor goes quiet after) */
-        if (socks.hello_bound && !g_hs_done && now - last_hello >= HELLO_IVL_MS) {
+        if (socks.hello_bound && !rx_state_get(&g_hs_done) && now - last_hello >= HELLO_IVL_MS) {
             sendto(socks.hello, hello, sizeof hello, MSG_DONTWAIT,
                    (struct sockaddr *)&socks.air_hello, sizeof socks.air_hello);
             last_hello = now;
@@ -629,8 +631,8 @@ void *rx_udp_thread(void *arg)
 
                 sendto(socks.hello, ack, n, MSG_DONTWAIT,
                        (struct sockaddr *)&socks.air_hello, sizeof socks.air_hello);
-                if (!g_hs_done) {
-                    g_hs_done = 1;
+                if (!rx_state_get(&g_hs_done)) {
+                    rx_state_set(&g_hs_done, 1);
                     if (g_verbose) {
                         printf(TAG " :20001 3-way done (air identity %zd B, type2 ACK sent)\n", n);
                         fflush(stdout);
@@ -648,7 +650,8 @@ void *rx_udp_thread(void *arg)
          * handshook in a ~10 s loop. Pre-media the poll is READY-gated so the air's first IDR lands
          * with a bound consumer; once acked it is the ungated keepalive, and it is also what paces
          * the IDR request (which rides the 0x02 reply). */
-        if (socks.params_bound && g_hs_done && (g_no_gate || g_ready || g_params_acked)
+        if (socks.params_bound && rx_state_get(&g_hs_done)
+            && (g_no_gate || rx_state_get(&g_ready) || rx_state_get(&g_params_acked))
             && now - last_req >= PARAMS_IVL_MS) {
             uint8_t frame[MP_HDR_LEN];
 
@@ -663,9 +666,9 @@ void *rx_udp_thread(void *arg)
 
         /* drain :10000: params reply + telemetry/OSD; all of it counts as air liveness */
         while ((n = recvfrom(socks.params, buf, sizeof buf, MSG_DONTWAIT, NULL, NULL)) > 0) {
-            g_last_telem_ms = now;
-            if (g_air_lost) {
-                g_air_lost = 0;
+            rx_time_set(&g_last_telem_ms, now);
+            if (rx_state_get(&g_air_lost)) {
+                rx_state_set(&g_air_lost, 0);
                 link_event(MLM_LINK_SESSION_RESTART, "TX unit returned, re-handshaking");
                 led_cmd(MLM_LED_BREATHE, 0xff, 0x00, 0x00, LED_BREATHE_MS);
                 /* the periodic sender re-applies the standby-arm on its own once the air is back */
@@ -675,12 +678,13 @@ void *rx_udp_thread(void *arg)
         }
 
         /* air-loss watch (only meaningful once telemetry has flowed in STEADY) */
-        if (g_steady && !g_air_lost && g_last_telem_ms
-            && now - g_last_telem_ms > AIR_LOSS_MS) {
-            g_air_lost = 1;
-            g_hs_done = 0;                  /* re-arm the :20001 3-way for the next session */
-            g_params_acked = 0;
-            g_video_confirmed = 0;
+        long last_telem_ms = rx_time_get(&g_last_telem_ms);
+        if (rx_state_get(&g_steady) && !rx_state_get(&g_air_lost) && last_telem_ms
+            && now - last_telem_ms > AIR_LOSS_MS) {
+            rx_state_set(&g_air_lost, 1);
+            rx_state_set(&g_hs_done, 0);     /* re-arm the :20001 3-way for the next session */
+            rx_state_set(&g_params_acked, 0);
+            rx_state_set(&g_video_confirmed, 0);
             link_event(MLM_LINK_TX_LOST, "no :10000 traffic for 5 s");
             led_cmd(MLM_LED_BREATHE, 0xff, 0x00, 0x00, LED_BREATHE_MS);
         }
@@ -692,7 +696,8 @@ void *rx_udp_thread(void *arg)
          * once either has been commanded by the HUD; the other falls back to a safe default (vendor
          * 100 mW / disarmed) so a fabricated byte never reaches the air. */
         if (socks.params_bound && (g_standby_arm >= 0 || g_power_dbm >= 0)
-            && g_hs_done && !g_air_lost && now - last_stp >= STANDBY_IVL_MS) {
+            && rx_state_get(&g_hs_done) && !rx_state_get(&g_air_lost)
+            && now - last_stp >= STANDBY_IVL_MS) {
             uint8_t frame[MP_STP_LEN];
             uint8_t power   = (g_power_dbm >= 0) ? (uint8_t) g_power_dbm : AIR_TX_DBM;
             uint8_t standby = (g_standby_arm >= 0) ? (uint8_t) g_standby_arm : 0;
@@ -709,7 +714,7 @@ void *rx_udp_thread(void *arg)
         /* (SetLdCfg is sent in the MEDIA_PARAMS 0x02-reply handler, before the 0x03 ack, to match
          * the vendor's per-cycle 01->02->0a->03 sequence - not here.) */
 
-        if (socks.params_bound && g_params_acked && !g_air_lost) {
+        if (socks.params_bound && rx_state_get(&g_params_acked) && !rx_state_get(&g_air_lost)) {
             push_camera_scale(&socks, stamp_us);
         }
 

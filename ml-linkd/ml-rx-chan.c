@@ -7,7 +7,9 @@
  * here too, so every SelectChn goes out from one place.
  */
 #define _GNU_SOURCE
+#include <pthread.h>
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -77,50 +79,50 @@
 #define SCAN_FREQ_MHZ_MAX 6100
 
 /* Local baseband link metrics, parsed from the GET replies in the reader thread and published for
- * the HUD's System OSD. Single writer (reader), single reader (main publish); MLM_LINKINFO_NONE
- * until a reply lands. */
-static volatile int g_snr_db = MLM_LINKINFO_NONE;
-static volatile int g_distance_m = MLM_LINKINFO_NONE;
-static volatile int g_throughput_kbps;      /* measured PHY link throughput (Get1V1Info +0x0c); 0 = no link */
+ * the HUD's System OSD. MLM_LINKINFO_NONE until a reply lands. */
+static atomic_int g_snr_db = MLM_LINKINFO_NONE;
+static atomic_int g_distance_m = MLM_LINKINFO_NONE;
+static atomic_int g_throughput_kbps;        /* measured PHY link throughput (Get1V1Info +0x0c); 0 = no link */
 
 /* Raw Get1V1Info sampling for the channel sweep. g_snr_db deliberately holds the last GOOD value
  * (raw 0 replies do not overwrite it, so the OSD does not flicker), which makes it unusable for the
  * sweep: a dead channel would silently inherit the previous channel's SNR. g_v1v1_seq increments on
  * EVERY reply including raw 0, so the sweep can wait for a fresh sample and tell "no lock" (raw 0)
  * apart from "no reply at all". Single writer (reader), single reader (main sweep). */
-static volatile unsigned g_v1v1_seq;        /* bumped on every Get1V1Info reply */
-static volatile int g_v1v1_raw;             /* raw linear SNR of the last reply (0 = no lock) */
-static volatile int g_v1v1_chan = -1;       /* working channel (+0x25) of the last reply, -1 = absent */
+static atomic_uint g_v1v1_seq;              /* bumped on every Get1V1Info reply */
+static atomic_int g_v1v1_raw;               /* raw linear SNR of the last reply (0 = no lock) */
+static atomic_int g_v1v1_chan = -1;         /* working channel (+0x25) of the last reply, -1 = absent */
 
 /* Last Get1V1Info reply payload, for --scan-probe. The +0x25 working-channel offset the sweep gates
  * on is INFERRED, so the sweep dumps one reply per run: on a live link the byte holding the current
  * channel index must equal the tuned channel, which locates it without trusting the inference. */
 #define V1V1_PAY_MAX     64
 static uint8_t g_v1v1_pay[V1V1_PAY_MAX];
-static volatile int g_v1v1_plen;
+static atomic_int g_v1v1_plen;
 
 /* The parsed channel table, owned by the main STEADY thread. The reader parses a GetScanResult reply
  * into it and sets g_scan_ready; the sweep then fills in snr_db per channel and publishes it. Not
  * published from the reader: the SNR only exists after the main thread has visited each channel. */
 static struct mlm_scan g_scan;
-static volatile int g_scan_ready;           /* a GetScanResult reply has landed in g_scan */
+static pthread_mutex_t g_scan_lock = PTHREAD_MUTEX_INITIALIZER;
+static atomic_int g_scan_ready;             /* a GetScanResult reply has landed in g_scan */
 
 /* The current band's valid-channel mask (the config JSON's chan_valid_bmp, echoed by the chip in
  * every GetScanResult reply). Its own global rather than a read of g_scan: the select gate reads it
  * off the UDP thread, and g_scan belongs to the main thread. 0 = not read back yet, in which case
  * the band is unknown and selects are allowed through rather than all rejected. */
-static volatile uint32_t g_valid_bmp;
+static atomic_uint g_valid_bmp;
 
 /* Channel select: the HUD queues a retune here (UDP thread), the bb-socket owner (main STEADY loop)
  * issues it once and clears it back to -1. One-shot, NOT a latch: re-issuing SelectChn on a cadence
  * would retune the RX continuously. The select must come from the bb-socket TX thread only; issuing
  * it from the UDP thread would race the steady poll and get lost (RE of the stock picker). */
-static volatile int g_pending_chnidx = -1;  /* HUD-requested channel table index (0..18), -1 = none */
+static atomic_int g_pending_chnidx = -1;    /* HUD-requested channel table index (0..18), -1 = none */
 /* Channel the local RX is tuned to; tracks every SelectChn we issue, for the OSD and the sweep's
  * restore. -1 until rx_chan_open has read the band and chosen one, which is also the state left
  * behind when GetScanResult does not answer: we have set no channel, so we do not claim one. */
-static volatile int g_cur_chnidx = -1;
-static volatile int g_pending_scan;         /* HUD requested a one-shot scan (MLM_RF_SCAN); STEADY fires it */
+static atomic_int g_cur_chnidx = -1;
+static atomic_int g_pending_scan;           /* HUD requested a one-shot scan (MLM_RF_SCAN); STEADY fires it */
 
 /* mlm_scan.active_idx is a u8 and the HUD highlights the tile whose index equals it. No table index
  * is 0xff, so that is the encoding for "no channel set yet" and the grid highlights nothing. */
@@ -128,32 +130,36 @@ static volatile int g_pending_scan;         /* HUD requested a one-shot scan (ML
 
 static uint8_t active_idx(void)
 {
-    return g_cur_chnidx >= 0 ? (uint8_t)g_cur_chnidx : ACTIVE_IDX_NONE;
+    int cur_chnidx = atomic_load_explicit(&g_cur_chnidx, memory_order_relaxed);
+
+    return cur_chnidx >= 0 ? (uint8_t)cur_chnidx : ACTIVE_IDX_NONE;
 }
 
 int rx_chan_index(void)
 {
-    return g_cur_chnidx >= 0 ? g_cur_chnidx : MLM_LINKINFO_NONE;
+    int cur_chnidx = atomic_load_explicit(&g_cur_chnidx, memory_order_relaxed);
+
+    return cur_chnidx >= 0 ? cur_chnidx : MLM_LINKINFO_NONE;
 }
 
 uint32_t rx_chan_valid_bmp(void)
 {
-    return g_valid_bmp;
+    return atomic_load_explicit(&g_valid_bmp, memory_order_relaxed);
 }
 
 int rx_chan_snr_db(void)
 {
-    return g_snr_db;
+    return atomic_load_explicit(&g_snr_db, memory_order_relaxed);
 }
 
 int rx_chan_distance_m(void)
 {
-    return g_distance_m;
+    return atomic_load_explicit(&g_distance_m, memory_order_relaxed);
 }
 
 int rx_chan_throughput_kbps(void)
 {
-    return g_throughput_kbps;
+    return atomic_load_explicit(&g_throughput_kbps, memory_order_relaxed);
 }
 
 /* Parse a raw GetScanResult reply (struct-of-arrays, HW-decoded) into g_scan for the sweep. The chip
@@ -182,7 +188,7 @@ void rx_chan_on_scan_result(const uint8_t *payload, int plen)
 
     memset(&scan, 0, sizeof scan);
     scan.valid_bmp = bmp;
-    g_valid_bmp = bmp;
+    atomic_store_explicit(&g_valid_bmp, bmp, memory_order_relaxed);
     scan.count = (uint8_t)count;
     scan.active_idx = active_idx();
 
@@ -208,8 +214,10 @@ void rx_chan_on_scan_result(const uint8_t *payload, int plen)
         scan.chan[i].snr_raw = MLM_SCAN_RAW_NONE;
     }
 
+    pthread_mutex_lock(&g_scan_lock);
     g_scan = scan;
-    g_scan_ready = 1;
+    pthread_mutex_unlock(&g_scan_lock);
+    atomic_store_explicit(&g_scan_ready, 1, memory_order_release);
     if (g_verbose) {
         printf(TAG " scan: count=%d valid_bmp=0x%08x\n", count, bmp);
         fflush(stdout);
@@ -234,14 +242,17 @@ void rx_chan_on_1v1(const uint8_t *payload, int plen)
      * working channel the sample belongs to so the sweep can reject stale ones */
     kept = plen > V1V1_PAY_MAX ? V1V1_PAY_MAX : plen;
 
-    g_v1v1_raw = (int)raw;
-    g_v1v1_chan = plen > V1V1_OFF_CHAN ? (int)payload[V1V1_OFF_CHAN] : -1;
+    atomic_store_explicit(&g_v1v1_raw, (int)raw, memory_order_relaxed);
+    atomic_store_explicit(&g_v1v1_chan,
+                          plen > V1V1_OFF_CHAN ? (int)payload[V1V1_OFF_CHAN] : -1,
+                          memory_order_relaxed);
     memcpy(g_v1v1_pay, payload, (size_t)kept);
-    g_v1v1_plen = kept;
-    g_v1v1_seq++;
+    atomic_store_explicit(&g_v1v1_plen, kept, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_v1v1_seq, 1, memory_order_release);
 
     if (raw > 0) {
-        g_snr_db = (int)lroundf(10.0f * log10f((float)raw / 36.0f));
+        atomic_store_explicit(&g_snr_db, (int)lroundf(10.0f * log10f((float)raw / 36.0f)),
+                              memory_order_relaxed);
 
         /* distance rides the same populated reply: i32 at +0x08, metres, vendor-style clamp of
          * negative (no fix) to 0. Empty inter-poll replies keep the last good value, same as SNR. */
@@ -251,22 +262,27 @@ void rx_chan_on_1v1(const uint8_t *payload, int plen)
                          | ((uint32_t)payload[V1V1_OFF_DIST + 2] << 16)
                          | ((uint32_t)payload[V1V1_OFF_DIST + 3] << 24));
 
-            g_distance_m = dist < 0 ? 0 : (int)dist;
+            atomic_store_explicit(&g_distance_m, dist < 0 ? 0 : (int)dist,
+                                  memory_order_relaxed);
         }
 
         /* measured PHY link throughput rides the same populated reply: u32 kbps at +0x0c. Empty
          * inter-poll replies keep the last good value, same as SNR. */
         if (plen >= V1V1_OFF_THROUGHPUT + 4) {
-            g_throughput_kbps = (int)((uint32_t)payload[V1V1_OFF_THROUGHPUT]
-                         | ((uint32_t)payload[V1V1_OFF_THROUGHPUT + 1] << 8)
-                         | ((uint32_t)payload[V1V1_OFF_THROUGHPUT + 2] << 16)
-                         | ((uint32_t)payload[V1V1_OFF_THROUGHPUT + 3] << 24));
+            atomic_store_explicit(&g_throughput_kbps,
+                                  (int)((uint32_t)payload[V1V1_OFF_THROUGHPUT]
+                                  | ((uint32_t)payload[V1V1_OFF_THROUGHPUT + 1] << 8)
+                                  | ((uint32_t)payload[V1V1_OFF_THROUGHPUT + 2] << 16)
+                                  | ((uint32_t)payload[V1V1_OFF_THROUGHPUT + 3] << 24)),
+                                  memory_order_relaxed);
         }
     }
 
     if (g_verbose) {
-        printf(TAG " 1v1info snr_raw=%u snr_db=%d dist_m=%d thr_kbps=%d\n", raw, g_snr_db,
-               g_distance_m, g_throughput_kbps);
+        printf(TAG " 1v1info snr_raw=%u snr_db=%d dist_m=%d thr_kbps=%d\n", raw,
+               atomic_load_explicit(&g_snr_db, memory_order_relaxed),
+               atomic_load_explicit(&g_distance_m, memory_order_relaxed),
+               atomic_load_explicit(&g_throughput_kbps, memory_order_relaxed));
         fflush(stdout);
     }
 }
@@ -278,23 +294,35 @@ void rx_chan_on_1v1(const uint8_t *payload, int plen)
  * the table has been seeded once. Same STEADY thread as sweep_run, so it never runs mid-sweep. */
 void rx_chan_table_publish(void)
 {
-    if (!g_scan_ready) {
+    struct mlm_scan scan;
+
+    if (!atomic_load_explicit(&g_scan_ready, memory_order_acquire)) {
         return;
     }
 
+    pthread_mutex_lock(&g_scan_lock);
     g_scan.active_idx = active_idx();
     g_scan.measured = 0;
-    mlm_pub(MLM_TELEMETRY_SOCK, MLM_T_SCAN, &g_scan, sizeof g_scan);
+    scan = g_scan;
+    pthread_mutex_unlock(&g_scan_lock);
+
+    mlm_pub(MLM_TELEMETRY_SOCK, MLM_T_SCAN, &scan, sizeof scan);
 }
 
 /* Publish a completed sweep: active_idx = @p restore, measured = 1 for this one publish only (a
  * one-shot edge, so the cadence's table publishes stay measured=0 and never clear the HUD spinner). */
 static void scan_publish_swept(int restore)
 {
+    struct mlm_scan scan;
+
+    pthread_mutex_lock(&g_scan_lock);
     g_scan.active_idx = restore >= 0 ? (uint8_t)restore : ACTIVE_IDX_NONE;
     g_scan.measured = 1;
-    mlm_pub(MLM_TELEMETRY_SOCK, MLM_T_SCAN, &g_scan, sizeof g_scan);
+    scan = g_scan;
     g_scan.measured = 0;
+    pthread_mutex_unlock(&g_scan_lock);
+
+    mlm_pub(MLM_TELEMETRY_SOCK, MLM_T_SCAN, &scan, sizeof scan);
 }
 
 /* @return the lowest channel index set in @bmp, or -1 if none is. */
@@ -355,10 +383,11 @@ void rx_chan_open(uint8_t *frame, uint32_t *seq_link)
     uint8_t poll[19];
     int target;
 
-    g_scan_ready = 0;
+    atomic_store_explicit(&g_scan_ready, 0, memory_order_relaxed);
     bb_get(poll, GET_SCAN_RESULT, (*seq_link)++);
     send_frame(poll, 19, "get-scan");
-    for (long t0 = now_ms(); !g_scan_ready; ) {
+    for (long t0 = now_ms();
+         !atomic_load_explicit(&g_scan_ready, memory_order_acquire); ) {
         if (now_ms() - t0 >= SWEEP_SCAN_MS) {
             printf(TAG " band: no GetScanResult reply, no channel set\n");
             fflush(stdout);
@@ -368,14 +397,18 @@ void rx_chan_open(uint8_t *frame, uint32_t *seq_link)
         usleep(5000);
     }
 
-    if (saved >= 0 && ((g_scan.valid_bmp >> saved) & 1)) {
+    pthread_mutex_lock(&g_scan_lock);
+    uint32_t valid_bmp = g_scan.valid_bmp;
+    pthread_mutex_unlock(&g_scan_lock);
+
+    if (saved >= 0 && ((valid_bmp >> saved) & 1)) {
         target = saved;
     } else {
-        target = first_valid_idx(g_scan.valid_bmp);
+        target = first_valid_idx(valid_bmp);
     }
 
     if (target < 0) {
-        printf(TAG " band: valid_bmp=0x%08x has no channel, none set\n", g_scan.valid_bmp);
+        printf(TAG " band: valid_bmp=0x%08x has no channel, none set\n", valid_bmp);
         fflush(stdout);
 
         return;
@@ -386,15 +419,15 @@ void rx_chan_open(uint8_t *frame, uint32_t *seq_link)
      */
     if (saved >= 0 && target != saved) {
         printf(TAG " band: saved ch%d outside valid_bmp=0x%08x, opening on first valid ch%d\n",
-               saved, g_scan.valid_bmp, target);
+               saved, valid_bmp, target);
         fflush(stdout);
     } else if (g_verbose) {
-        printf(TAG " band: opening on ch%d (valid_bmp=0x%08x)\n", target, g_scan.valid_bmp);
+        printf(TAG " band: opening on ch%d (valid_bmp=0x%08x)\n", target, valid_bmp);
         fflush(stdout);
     }
 
     send_frame(frame, bb_select_channel(frame, (uint8_t)target, (*seq_link)++), "open-chn");
-    g_cur_chnidx = target;
+    atomic_store_explicit(&g_cur_chnidx, target, memory_order_relaxed);
     usleep(OPEN_STEP_US);
 
     rx_chan_table_publish();   /* active_idx reflects the channel just chosen */
@@ -406,12 +439,13 @@ void rx_chan_open(uint8_t *frame, uint32_t *seq_link)
 static int v1v1_poll(uint32_t *seq_link)
 {
     uint8_t poll[19];
-    unsigned seq0 = g_v1v1_seq;
+    unsigned seq0 = atomic_load_explicit(&g_v1v1_seq, memory_order_acquire);
 
     bb_get(poll, GET_1V1INFO, (*seq_link)++);
     send_frame(poll, 19, "sweep-1v1");
 
-    for (long t0 = now_ms(); g_v1v1_seq == seq0; ) {
+    for (long t0 = now_ms();
+         atomic_load_explicit(&g_v1v1_seq, memory_order_acquire) == seq0; ) {
         if (now_ms() - t0 >= SWEEP_REPLY_MS) {
             return 0;
         }
@@ -439,7 +473,7 @@ static int sweep_measure(uint32_t *seq_link, int chnidx)
             return MLM_SCAN_RAW_NONE;
         }
 
-        if (g_v1v1_chan == chnidx) {
+        if (atomic_load_explicit(&g_v1v1_chan, memory_order_relaxed) == chnidx) {
             int raw;
 
             usleep(SWEEP_DWELL_MS * 1000);
@@ -447,7 +481,7 @@ static int sweep_measure(uint32_t *seq_link, int chnidx)
                 return MLM_SCAN_RAW_NONE;
             }
 
-            raw = g_v1v1_raw;
+            raw = atomic_load_explicit(&g_v1v1_raw, memory_order_relaxed);
 
             /* Re-read an implausibly low sample. The chip reports the new working channel at +0x25
              * before it has finished recomputing the SNR, so the gate does not fully close the race
@@ -457,8 +491,13 @@ static int sweep_measure(uint32_t *seq_link, int chnidx)
              * two: a genuinely dead channel reads ~0 twice, so this cannot mask one. */
             if (raw < SWEEP_RETRY_RAW) {
                 usleep(SWEEP_DWELL_MS * 1000);
-                if (v1v1_poll(seq_link) && g_v1v1_raw > raw) {
-                    raw = g_v1v1_raw;
+                int next_raw;
+
+                if (v1v1_poll(seq_link)) {
+                    next_raw = atomic_load_explicit(&g_v1v1_raw, memory_order_relaxed);
+                    if (next_raw > raw) {
+                        raw = next_raw;
+                    }
                 }
             }
 
@@ -487,13 +526,14 @@ static void sweep_run(uint8_t *frame, uint32_t *seq_link)
     uint8_t poll[19];
     int order[MLM_SCAN_MAX_CH];
     int n = 0;
-    int restore = g_cur_chnidx;
+    int restore = atomic_load_explicit(&g_cur_chnidx, memory_order_relaxed);
 
     /* seed freq[] + the current mode's valid bitmap */
-    g_scan_ready = 0;
+    atomic_store_explicit(&g_scan_ready, 0, memory_order_relaxed);
     bb_get(poll, GET_SCAN_RESULT, (*seq_link)++);
     send_frame(poll, 19, "get-scan");
-    for (long t0 = now_ms(); !g_scan_ready; ) {
+    for (long t0 = now_ms();
+         !atomic_load_explicit(&g_scan_ready, memory_order_acquire); ) {
         if (now_ms() - t0 >= SWEEP_SCAN_MS) {
             printf(TAG " scan: no GetScanResult reply, sweep skipped\n");
             fflush(stdout);
@@ -507,11 +547,14 @@ static void sweep_run(uint8_t *frame, uint32_t *seq_link)
      * holding restore is a candidate for the gate, and V1V1_OFF_CHAN must be among them. On a dead
      * link the whole struct reads zero and this proves nothing, so the link state is printed too. */
     if (g_scan_probe && v1v1_poll(seq_link)) {
-        printf(TAG " scan: 1v1 on active ch%d (hs=%d air_lost=%d) plen=%d raw=%d\n", restore, g_hs_done,
-               g_air_lost, g_v1v1_plen, g_v1v1_raw);
-        for (int i = 0; i < g_v1v1_plen; i += 16) {
+        int plen = atomic_load_explicit(&g_v1v1_plen, memory_order_relaxed);
+
+        printf(TAG " scan: 1v1 on active ch%d (hs=%d air_lost=%d) plen=%d raw=%d\n",
+               restore, rx_state_get(&g_hs_done), rx_state_get(&g_air_lost),
+               plen, atomic_load_explicit(&g_v1v1_raw, memory_order_relaxed));
+        for (int i = 0; i < plen; i += 16) {
             printf(TAG " scan: 1v1[%02x]", i);
-            for (int k = 0; k < 16 && i + k < g_v1v1_plen; k++) {
+            for (int k = 0; k < 16 && i + k < plen; k++) {
                 printf(" %02x", g_v1v1_pay[i + k]);
             }
 
@@ -519,7 +562,7 @@ static void sweep_run(uint8_t *frame, uint32_t *seq_link)
         }
 
         printf(TAG " scan: offsets holding the active channel (%d):", restore);
-        for (int i = 0; i < g_v1v1_plen; i++) {
+        for (int i = 0; i < plen; i++) {
             if (g_v1v1_pay[i] == (uint8_t)restore) {
                 printf(" +0x%02x", i);
             }
@@ -543,14 +586,14 @@ static void sweep_run(uint8_t *frame, uint32_t *seq_link)
      * over the 16 Race channels that is ~8 s of blocked STEADY cadence, past AIR_LOSS_MS, which
      * would fake an air loss and tear down the handshake. Publish the same all-NOLOCK answer at
      * once instead - the table and bitmap are already seeded, only the readings are missing. */
-    if (!g_hs_done || g_air_lost) {
+    if (!rx_state_get(&g_hs_done) || rx_state_get(&g_air_lost)) {
         for (int k = 0; k < n; k++) {
             g_scan.chan[order[k]].snr_raw = MLM_SCAN_RAW_NOLOCK;
         }
 
         scan_publish_swept(restore);
         printf(TAG " scan: no air unit (hs=%d air_lost=%d), %d channels reported unmeasured\n",
-               g_hs_done, g_air_lost, n);
+               rx_state_get(&g_hs_done), rx_state_get(&g_air_lost), n);
         fflush(stdout);
 
         return;
@@ -570,9 +613,9 @@ static void sweep_run(uint8_t *frame, uint32_t *seq_link)
         int raw;
 
         /* the active channel is already tuned on the first visit */
-        if (idx != g_cur_chnidx) {
+        if (idx != atomic_load_explicit(&g_cur_chnidx, memory_order_relaxed)) {
             send_frame(frame, bb_select_channel(frame, (uint8_t)idx, (*seq_link)++), "sweep-sel");
-            g_cur_chnidx = idx;
+            atomic_store_explicit(&g_cur_chnidx, idx, memory_order_relaxed);
         }
 
         raw = sweep_measure(seq_link, idx);
@@ -587,16 +630,18 @@ static void sweep_run(uint8_t *frame, uint32_t *seq_link)
          * channel times out to NOLOCK and the gate is keyed on the wrong byte. */
         if (g_verbose) {
             printf(TAG " scan: ch%-2d %u MHz raw=%-6d chan=%-3d snr=%d\n", idx,
-                   g_scan.chan[idx].freq_mhz, raw, g_v1v1_chan, g_scan.chan[idx].snr_db);
+                   g_scan.chan[idx].freq_mhz, raw,
+                   atomic_load_explicit(&g_v1v1_chan, memory_order_relaxed),
+                   g_scan.chan[idx].snr_db);
             fflush(stdout);
         }
     }
 
     /* restore the active channel and hand the rate back to the chip: the link and video resume here.
      * Auto MCS must be restored on every exit or the link stays pinned to MCS 0 after a scan. */
-    if (restore >= 0 && g_cur_chnidx != restore) {
+    if (restore >= 0 && atomic_load_explicit(&g_cur_chnidx, memory_order_relaxed) != restore) {
         send_frame(frame, bb_select_channel(frame, (uint8_t)restore, (*seq_link)++), "sweep-restore");
-        g_cur_chnidx = restore;
+        atomic_store_explicit(&g_cur_chnidx, restore, memory_order_relaxed);
     }
 
     send_frame(frame, bb_set_mcs_mode(frame, MCS_MODE_AUTO, (*seq_link)++), "sweep-mcs-auto");
@@ -605,7 +650,8 @@ static void sweep_run(uint8_t *frame, uint32_t *seq_link)
     if (restore >= 0) {
         printf(TAG " scan: swept %d channels, active %d restored\n", n, restore);
     } else {
-        printf(TAG " scan: swept %d channels, left on %d (none was set)\n", n, g_cur_chnidx);
+        printf(TAG " scan: swept %d channels, left on %d (none was set)\n", n,
+               atomic_load_explicit(&g_cur_chnidx, memory_order_relaxed));
     }
 
     fflush(stdout);
@@ -626,9 +672,11 @@ void rx_chan_request_select(unsigned chnidx)
         return;
     }
 
-    if (g_valid_bmp != 0 && !((g_valid_bmp >> chnidx) & 1)) {
+    uint32_t valid_bmp = atomic_load_explicit(&g_valid_bmp, memory_order_relaxed);
+
+    if (valid_bmp != 0 && !((valid_bmp >> chnidx) & 1)) {
         fprintf(stderr, TAG " rfcmd: channel %u outside band valid_bmp=0x%08x, ignoring\n",
-                chnidx, g_valid_bmp);
+                chnidx, valid_bmp);
         return;
     }
 
@@ -638,13 +686,13 @@ void rx_chan_request_select(unsigned chnidx)
         fflush(stdout);
     }
 
-    g_pending_chnidx = (int)chnidx;
+    atomic_store_explicit(&g_pending_chnidx, (int)chnidx, memory_order_release);
 }
 
 /* Queue a one-shot sweep; read-only and self-restoring, so it needs no gate of its own. */
 void rx_chan_request_scan(void)
 {
-    g_pending_scan = 1;
+    atomic_store_explicit(&g_pending_scan, 1, memory_order_release);
     if (g_verbose) {
         printf(TAG " rfcmd: scan requested\n");
         fflush(stdout);
@@ -656,23 +704,22 @@ void rx_chan_request_scan(void)
  * both stay request-driven and never ride the cadence. */
 void rx_chan_service(uint8_t *frame, uint32_t *seq_link)
 {
+    int chnidx;
+
     /* Clear before sending so a request that arrives during the tune is not lost to the clear. The
      * tune is async and the air follows transparently; g_cur_chnidx tracks it so the published OSD
      * channel stays correct. */
-    if (g_pending_chnidx >= 0) {
-        int chnidx = g_pending_chnidx;
-
-        g_pending_chnidx = -1;
+    chnidx = atomic_exchange_explicit(&g_pending_chnidx, -1, memory_order_acquire);
+    if (chnidx >= 0) {
         send_frame(frame, bb_select_channel(frame, (uint8_t)chnidx, (*seq_link)++), "select-chn");
-        g_cur_chnidx = chnidx;
+        atomic_store_explicit(&g_cur_chnidx, chnidx, memory_order_relaxed);
         if (g_verbose) {
             printf(TAG " selected channel %d\n", chnidx);
             fflush(stdout);
         }
     }
 
-    if (g_pending_scan) {
-        g_pending_scan = 0;
+    if (atomic_exchange_explicit(&g_pending_scan, 0, memory_order_acquire)) {
         sweep_run(frame, seq_link);
     }
 }

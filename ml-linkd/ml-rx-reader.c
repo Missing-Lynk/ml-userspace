@@ -84,11 +84,11 @@ void *rx_reader_thread(void *arg)
     uint8_t buf[8192];
     (void)arg;
 
-    while (g_run) {
+    while (ml_should_run()) {
         ssize_t n = read(g_fd, buf, sizeof buf);
 
         if (n <= 0) {
-            if (!g_run) {
+            if (!ml_should_run()) {
                 break;
             }
 

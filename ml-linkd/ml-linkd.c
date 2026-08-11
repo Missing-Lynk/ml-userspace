@@ -68,28 +68,26 @@
 #define SCAN_TABLE_EVERY 48               /* republish the seeded channel table every Nth tick (~2 s) */
 #define SEQ_START        0x15             /* initial poll sequence number */
 
-volatile int g_run = 1;                     /* shared with the air role (ml-linkd.h) */
+atomic_int g_run = 1;                       /* shared with the air role (ml-linkd.h) */
 int g_verbose;                              /* shared with the air role (ml-linkd.h) */
 int g_fd = -1;                              /* /dev/artosyn_sdio */
 int g_no_gate;
 int g_scan_probe;                           /* --scan-probe: hexdump the raw GetScanResult + Get1V1Info replies */
 static int g_role_air;                      /* --role air: transmit-side (air unit), not the RX goggle */
 
-/* Handshake/link state, written by whichever module owns the transition and read across the role.
- * All plain ints/timestamps, single writer per field, so volatile is enough. */
-volatile int g_steady;                      /* FSM reached STEADY */
-volatile int g_hs_done;                     /* :20001 3-way done */
-volatile int g_params_acked;                /* the air answered our params poll this session */
-volatile int g_air_lost;                    /* >5 s :10000 silence flagged */
-volatile int g_ready;                       /* consumer READY (heartbeat fresh) */
-volatile int g_video_confirmed;             /* consumer reported frames_seen after our ACK */
-volatile int g_standby_state;               /* air's LIVE work-mode from SetStandyMode (0x12): 1 = standby */
-volatile long g_last_telem_ms;              /* last :10000 RX */
+atomic_int g_steady;                        /* FSM reached STEADY */
+atomic_int g_hs_done;                       /* :20001 3-way done */
+atomic_int g_params_acked;                  /* the air answered our params poll this session */
+atomic_int g_air_lost;                      /* >5 s :10000 silence flagged */
+atomic_int g_ready;                         /* consumer READY (heartbeat fresh) */
+atomic_int g_video_confirmed;               /* consumer reported frames_seen after our ACK */
+atomic_int g_standby_state;                 /* air's LIVE work-mode from SetStandyMode (0x12): 1 = standby */
+atomic_long g_last_telem_ms;                /* last :10000 RX */
 
 static void on_sig(int sig)
 {
     (void)sig;
-    g_run = 0;
+    ml_request_stop();
 }
 
 long now_ms(void)
@@ -227,12 +225,12 @@ static void assoc_bringup(void)
     uint8_t frame[32];
     static const uint8_t log_open[4] = { 0 };
 
-    for (int i = 0; i < 6 && g_run; i++) {
+    for (int i = 0; i < 6 && ml_should_run(); i++) {
         send_frame(frame, bb_build_frame(frame, BB_LINK, 0, 0, 0x01, 0, NULL, 0), "assoc");
         usleep(ASSOC_STEP_US);
     }
 
-    for (int i = 0; i < 2 && g_run; i++) {
+    for (int i = 0; i < 2 && ml_should_run(); i++) {
         send_frame(frame, bb_build_frame(frame, BB_LINK, 0, 0, 0x00, 0, NULL, 0), "assoc");
         usleep(ASSOC_STEP_US);
     }
@@ -240,7 +238,7 @@ static void assoc_bringup(void)
     send_frame(frame, bb_build_frame(frame, BB_LOG, 0, 0, 0x00, 0, log_open, 4), "assoc-log");
     usleep(ASSOC_STEP_US);
 
-    for (int port = 0x0e; port >= 0 && g_run; port--) {
+    for (int port = 0x0e; port >= 0 && ml_should_run(); port--) {
         if (port == 0x05) {
             continue;
         }
@@ -252,7 +250,7 @@ static void assoc_bringup(void)
 /* SETTLE: ~2.5 s of Get1V1Info + ff02 ONLY (an early GetTime poll wedges the air). */
 static void rx_settle(const uint8_t *ff02, uint32_t *seq_link)
 {
-    for (int i = 0; i < SETTLE_TICKS && g_run; i++) {
+    for (int i = 0; i < SETTLE_TICKS && ml_should_run(); i++) {
         uint8_t poll[19];
 
         bb_get(poll, GET_1V1INFO, (*seq_link)++);
@@ -287,9 +285,9 @@ static void rx_steady(uint8_t *frame, const uint8_t *ff02, uint32_t *seq_link, u
 {
     unsigned long ticks = 0;
 
-    g_steady = 1;
+    rx_state_set(&g_steady, 1);
     link_event(MLM_LINK_ASSOCIATED, "bring-up done, steady cadence");
-    while (g_run) {
+    while (ml_should_run()) {
         uint8_t poll[19];
 
         bb_get(poll, GET_TIME, (*seq_video)++);
@@ -311,17 +309,19 @@ static void rx_steady(uint8_t *frame, const uint8_t *ff02, uint32_t *seq_link, u
          * config fact we always know; SNR/distance go stale on air loss, so blank them then and let
          * the HUD dim the whole air-unit side off its own connection state. */
         if (ticks % LINKINFO_EVERY == 0) {
+            int air_lost = rx_state_get(&g_air_lost);
+            int standby_state = rx_state_get(&g_standby_state);
             struct mlm_linkinfo info = {
                 .channel = rx_chan_index(),
-                .snr_db = g_air_lost ? MLM_LINKINFO_NONE : rx_chan_snr_db(),
-                .distance_m = g_air_lost ? MLM_LINKINFO_NONE : rx_chan_distance_m(),
-                .flags = (!g_air_lost && g_standby_state) ? MLM_LINKINFO_F_STANDBY : 0,
+                .snr_db = air_lost ? MLM_LINKINFO_NONE : rx_chan_snr_db(),
+                .distance_m = air_lost ? MLM_LINKINFO_NONE : rx_chan_distance_m(),
+                .flags = (!air_lost && standby_state) ? MLM_LINKINFO_F_STANDBY : 0,
                 /* rx_throughput (Get1V1Info +0x0c) = measured PHY link throughput. We publish it RAW.
                  * The vendor OSD shows this same field but divides it by a HARDCODED 6 in standby
                  * (AR_MID_GET_REALTIME_SYS_INFO param_2[7] = uVar3 / 6, gated on the RcStatus standby
                  * low byte) - a fixed display fudge, not a real measurement, so we deliberately do
                  * NOT replicate it. Our number is the honest link throughput in both states. */
-                .throughput_kbps = g_air_lost ? 0 : (uint32_t)rx_chan_throughput_kbps(),
+                .throughput_kbps = air_lost ? 0 : (uint32_t)rx_chan_throughput_kbps(),
             };
 
             mlm_pub(MLM_TELEMETRY_SOCK, MLM_T_LINKINFO, &info, sizeof info);
@@ -338,7 +338,9 @@ static void rx_steady(uint8_t *frame, const uint8_t *ff02, uint32_t *seq_link, u
          * periodic form is a -v convenience for watching a session, not news. */
         if (++ticks % ALIVE_EVERY == 0 && g_verbose) {
             printf(TAG " alive hs=%d ready=%d acked=%d video=%d air_lost=%d thr_kbps=%d\n",
-                   g_hs_done, g_ready, g_params_acked, g_video_confirmed, g_air_lost,
+                   rx_state_get(&g_hs_done), rx_state_get(&g_ready),
+                   rx_state_get(&g_params_acked), rx_state_get(&g_video_confirmed),
+                   rx_state_get(&g_air_lost),
                    rx_chan_throughput_kbps());
             fflush(stdout);
         }
@@ -377,7 +379,7 @@ static int rx_main(const char *node)
 
     /* WAIT_DEV: ml-rf-bringup must have run; retry until the node appears. Log on the first miss
      * and then every OPEN_RETRY_EVERY tries, so a link down for a while does not flood the log. */
-    for (unsigned tries = 0; g_run && (g_fd = open(node, O_RDWR | O_NONBLOCK)) < 0; tries++) {
+    for (unsigned tries = 0; ml_should_run() && (g_fd = open(node, O_RDWR | O_NONBLOCK)) < 0; tries++) {
         if (tries == 0 || (tries % OPEN_RETRY_EVERY) == 0) {
             fprintf(stderr, TAG " open(%s): %s, retrying\n", node, strerror(errno));
         }
@@ -385,7 +387,7 @@ static int rx_main(const char *node)
         sleep(1);
     }
 
-    if (!g_run) {
+    if (!ml_should_run()) {
         return 0;
     }
 
@@ -407,7 +409,7 @@ static int rx_main(const char *node)
     rc = pthread_create(&udp_th, NULL, rx_udp_thread, NULL);
     if (rc != 0) {
         fprintf(stderr, TAG " UDP thread: %s\n", strerror(rc));
-        g_run = 0;
+        ml_request_stop();
         reader_join(reader_th);
         close(g_fd);
         g_fd = -1;
@@ -436,7 +438,7 @@ static int rx_main(const char *node)
 
     rx_steady(frame, ff02, &seq_link, &seq_video);
 
-    g_run = 0;
+    ml_request_stop();
     reader_join(reader_th);
     pthread_join(udp_th, NULL);
     close(g_fd);

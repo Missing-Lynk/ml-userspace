@@ -6,6 +6,7 @@
  */
 #define _GNU_SOURCE
 #include <stdio.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <stdint.h>
 #include <unistd.h>
@@ -35,10 +36,10 @@
  * like the Get1V1Info pattern (seq bumped on every reply so the poll can wait for a fresh one).
  * g_pair_mac is written by the reader and read by main only while a poll it issued is in flight, so
  * the seq fence orders the accesses. */
-static volatile int g_pending_bind;         /* a bind request is queued for the STEADY loop */
-static volatile int g_bind_persist;         /* queued request wants persistence (arg != 0) */
-static volatile unsigned g_pair_seq;        /* bumped on every GET_PAIR reply */
-static volatile int g_pair_hit;             /* last reply's slot-0 candidate bit */
+static atomic_int g_pending_bind;           /* a bind request is queued for the STEADY loop */
+static atomic_int g_bind_persist;           /* queued request wants persistence (arg != 0) */
+static atomic_uint g_pair_seq;              /* bumped on every GET_PAIR reply */
+static atomic_int g_pair_hit;               /* last reply's slot-0 candidate bit */
 static uint8_t g_pair_mac[4];               /* last reply's slot-0 MAC, wire order */
 
 /* An air unit is currently alive (fresh :10000 telemetry). Gates binding: pair-locking a new peer
@@ -47,7 +48,9 @@ static uint8_t g_pair_mac[4];               /* last reply's slot-0 MAC, wire ord
  * (authoritative: the queue hop is not atomic with the check). */
 int rx_bind_air_alive(long now)
 {
-    return !g_air_lost && g_last_telem_ms && now - g_last_telem_ms < AIR_LOSS_MS;
+    long last_telem_ms = rx_time_get(&g_last_telem_ms);
+
+    return !rx_state_get(&g_air_lost) && last_telem_ms && now - last_telem_ms < AIR_LOSS_MS;
 }
 
 /* Persist a locked peer MAC into the config candidate list by running the ml-rf-persist helper
@@ -97,7 +100,7 @@ static int bind_persist(const uint8_t mac[4])
  * (g_bind_persist == 0) leaves only the runtime lock, which a power cycle reverts. Blocks the STEADY
  * cadence for up to BIND_WINDOW_MS, which is fine: the air-liveness gate means there is no session
  * to disturb. */
-static void bind_run(uint8_t *frame, uint32_t *seq_link)
+static void bind_run(uint8_t *frame, uint32_t *seq_link, int persist)
 {
     uint8_t mac[4] = { 0 };
     int hits = 0;
@@ -112,23 +115,23 @@ static void bind_run(uint8_t *frame, uint32_t *seq_link)
     link_event(MLM_LINK_BINDING, "pair mode on, waiting for an air unit in bind mode");
     send_frame(frame, bb_pair_mode(frame, 1, 0, (*seq_link)++), "pair-on");
 
-    for (long t0 = now_ms(); g_run && now_ms() - t0 < BIND_WINDOW_MS && hits < BIND_HITS; ) {
+    for (long t0 = now_ms();
+         ml_should_run() && now_ms() - t0 < BIND_WINDOW_MS && hits < BIND_HITS; ) {
         uint8_t poll[19];
-        unsigned seq0 = g_pair_seq;
+        unsigned seq0 = atomic_load_explicit(&g_pair_seq, memory_order_acquire);
         long ts;
 
         bb_get(poll, GET_PAIR, (*seq_link)++);
         send_frame(poll, 19, "pair-poll");
 
-        for (ts = now_ms(); g_pair_seq == seq0 && now_ms() - ts < BIND_REPLY_MS; ) {
+        for (ts = now_ms();
+             atomic_load_explicit(&g_pair_seq, memory_order_acquire) == seq0
+             && now_ms() - ts < BIND_REPLY_MS; ) {
             usleep(2000);
         }
 
-        if (g_pair_seq != seq0) {
-            /* pair with the RELEASE fence in the reader: once the new seq is visible, the matching
-             * g_pair_hit + g_pair_mac are too. */
-            __atomic_thread_fence(__ATOMIC_ACQUIRE);
-            if (g_pair_hit) {
+        if (atomic_load_explicit(&g_pair_seq, memory_order_acquire) != seq0) {
+            if (atomic_load_explicit(&g_pair_hit, memory_order_relaxed)) {
                 hits++;
                 memcpy(mac, g_pair_mac, sizeof mac);
             }
@@ -149,7 +152,7 @@ static void bind_run(uint8_t *frame, uint32_t *seq_link)
 
     /* dry-run: chip-runtime lock only (power cycle reverts). persist: also write the config, and
      * report if that write failed so the peer is known to be runtime-only. */
-    if (!g_bind_persist) {
+    if (!persist) {
         tag = " (dry-run)";
     } else if (bind_persist(mac) == 0) {
         tag = " (persisted)";
@@ -172,13 +175,9 @@ void rx_bind_on_pair(const uint8_t *payload, int plen)
         return;
     }
 
-    g_pair_hit = payload[0] & 1;
+    atomic_store_explicit(&g_pair_hit, payload[0] & 1, memory_order_relaxed);
     memcpy(g_pair_mac, payload + 1, sizeof g_pair_mac);
-    /* publish g_pair_hit/g_pair_mac before the seq bump so a reader that observes the new
-     * g_pair_seq is guaranteed to see the matching hit + MAC (aarch64 is weakly ordered; the
-     * volatile seq alone does not order the plain g_pair_mac store). */
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-    g_pair_seq++;
+    atomic_fetch_add_explicit(&g_pair_seq, 1, memory_order_release);
 }
 
 /* Refused while an air unit is alive so nothing can re-pair mid-flight; the immediate BIND_FAIL
@@ -190,7 +189,7 @@ void rx_bind_request(int persist, long now)
         return;
     }
 
-    if (g_pending_bind) {
+    if (atomic_load_explicit(&g_pending_bind, memory_order_acquire)) {
         fprintf(stderr, TAG " rfcmd: bind already queued, ignoring\n");
         return;
     }
@@ -200,17 +199,19 @@ void rx_bind_request(int persist, long now)
         fflush(stdout);
     }
 
-    g_bind_persist = persist;
-    g_pending_bind = 1;
+    atomic_store_explicit(&g_bind_persist, persist, memory_order_relaxed);
+    atomic_store_explicit(&g_pending_bind, 1, memory_order_release);
 }
 
 /* Run a queued bind from the bb-socket TX thread. */
 void rx_bind_service(uint8_t *frame, uint32_t *seq_link)
 {
-    if (!g_pending_bind) {
+    int persist;
+
+    if (!atomic_exchange_explicit(&g_pending_bind, 0, memory_order_acquire)) {
         return;
     }
 
-    g_pending_bind = 0;
-    bind_run(frame, seq_link);
+    persist = atomic_load_explicit(&g_bind_persist, memory_order_relaxed);
+    bind_run(frame, seq_link, persist);
 }

@@ -447,7 +447,7 @@ void air_main(const char *hw_version, const char *fc_tty, enum ml_rate_mode rate
            LOCAL_ADDR, PARAMS_PORT, fc_tty);
     fflush(stdout);
 
-    while (g_run) {
+    while (ml_should_run()) {
         long now = now_ms();
         struct timespec t;
         uint32_t stamp_us;

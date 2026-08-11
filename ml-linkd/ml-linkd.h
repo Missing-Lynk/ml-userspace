@@ -5,6 +5,8 @@
 #ifndef ML_LINKD_H
 #define ML_LINKD_H
 
+#include <stdatomic.h>
+
 #define TAG              "[ml-linkd]"
 
 #define LOCAL_ADDR       "10.0.0.1"        /* goggle (RX) sdio0 address */
@@ -16,8 +18,18 @@
 #define PKT_MAX          600               /* UDP receive buffer */
 #define UDP_TICK_US      50000             /* 20 Hz service tick */
 
-extern volatile int g_run;                 /* cleared by the signal handler to stop the loops */
+extern atomic_int g_run;                   /* cleared by the signal handler to stop the loops */
 extern int g_verbose;                      /* -v */
+
+static inline int ml_should_run(void)
+{
+    return atomic_load_explicit(&g_run, memory_order_relaxed);
+}
+
+static inline void ml_request_stop(void)
+{
+    atomic_store_explicit(&g_run, 0, memory_order_relaxed);
+}
 
 /* Monotonic milliseconds. */
 long now_ms(void);
