@@ -29,6 +29,8 @@
 #define MSP_DP_DRAW_SCREEN  4
 #define MSP_DP_CLEAR_SCREEN 2
 
+#define LOG_TAG             "ml-msp"
+
 static uint16_t read_le16(const uint8_t *p)
 {
     return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
@@ -98,13 +100,33 @@ static int send_request(struct ml_msp *msp, uint8_t cmd)
     uint8_t frame[MSP_FRAME_OVERHEAD] = { '$', 'M', '<', 0, cmd, cmd };
     ssize_t n = write(msp->fd, frame, sizeof frame);
 
-    return n == (ssize_t)sizeof frame ? 0 : -1;
+    if (n == (ssize_t)sizeof frame) {
+        return 0;
+    }
+
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+        return 1;
+    }
+
+    return -1;
 }
 
 static void records_clear(struct ml_msp *msp)
 {
     msp->records_len = 0;
     msp->record_count = 0;
+}
+
+static void msp_drop_fd(struct ml_msp *msp, const char *what)
+{
+    if (msp->fd >= 0) {
+        fprintf(stderr, LOG_TAG ": %s: %s, closing FC UART\n", what, strerror(errno));
+        close(msp->fd);
+        msp->fd = -1;
+    }
+
+    msp->rx_len = 0;
+    records_clear(msp);
 }
 
 static int append_record(struct ml_msp *msp, const uint8_t *payload, uint8_t len)
@@ -280,7 +302,7 @@ static void scan_frames(struct ml_msp *msp, long now_ms)
              * it matches the preamble above and is dropped harmlessly by process_frame. */
             if (msp->rx[pos] == '$' && msp->rx[pos + 1] == 'X' && !g_saw_msp_v2) {
                 g_saw_msp_v2 = 1;
-                fprintf(stderr, "ml-msp: MSP v2 ($X) frame on the FC UART, ignored; "
+                fprintf(stderr, LOG_TAG ": MSP v2 ($X) frame on the FC UART, ignored; "
                                 "this parser is v1 only\n");
             }
 
@@ -316,7 +338,8 @@ static void scan_frames(struct ml_msp *msp, long now_ms)
 
 void ml_msp_service(struct ml_msp *msp, long now_ms)
 {
-    ssize_t n;
+    ssize_t n = 0;
+    int rc;
 
     if (msp->fd < 0) {
         return;
@@ -328,18 +351,31 @@ void ml_msp_service(struct ml_msp *msp, long now_ms)
         scan_frames(msp, now_ms);
     }
 
+    if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+        msp_drop_fd(msp, "read");
+        return;
+    }
+
     if (msp->rx_len == sizeof msp->rx) {
         memmove(msp->rx, msp->rx + 3, msp->rx_len - 3);
         msp->rx_len -= 3;
     }
 
     if (now_ms >= msp->next_status_ms) {
-        send_request(msp, MSP_STATUS);
+        rc = send_request(msp, MSP_STATUS);
+        if (rc < 0) {
+            msp_drop_fd(msp, "write status request");
+            return;
+        }
         msp->next_status_ms = now_ms + MSP_STATUS_MS;
     }
 
     if (now_ms >= msp->next_battery_ms) {
-        send_request(msp, MSP_BATTERY_STATE);
+        rc = send_request(msp, MSP_BATTERY_STATE);
+        if (rc < 0) {
+            msp_drop_fd(msp, "write battery request");
+            return;
+        }
         msp->next_battery_ms = now_ms + MSP_BATTERY_MS;
     }
 }
