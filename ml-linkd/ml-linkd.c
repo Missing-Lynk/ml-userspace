@@ -373,6 +373,7 @@ static int rx_main(const char *node)
     pthread_t reader_th, udp_th;
     uint8_t frame[64], ff02[19];
     uint32_t seq_link = SEQ_START, seq_video = SEQ_START;
+    int rc;
 
     /* WAIT_DEV: ml-rf-bringup must have run; retry until the node appears. Log on the first miss
      * and then every OPEN_RETRY_EVERY tries, so a link down for a while does not flood the log. */
@@ -395,8 +396,23 @@ static int rx_main(const char *node)
         fflush(stdout);
     }
 
-    pthread_create(&reader_th, NULL, rx_reader_thread, NULL);
-    pthread_create(&udp_th, NULL, rx_udp_thread, NULL);
+    rc = pthread_create(&reader_th, NULL, rx_reader_thread, NULL);
+    if (rc != 0) {
+        fprintf(stderr, TAG " reader thread: %s\n", strerror(rc));
+        close(g_fd);
+        g_fd = -1;
+        return 1;
+    }
+
+    rc = pthread_create(&udp_th, NULL, rx_udp_thread, NULL);
+    if (rc != 0) {
+        fprintf(stderr, TAG " UDP thread: %s\n", strerror(rc));
+        g_run = 0;
+        reader_join(reader_th);
+        close(g_fd);
+        g_fd = -1;
+        return 1;
+    }
 
     /* ASSOC: association bring-up (chip-bound), then build the reusable ff02 heartbeat frame */
     if (g_verbose) {
@@ -424,6 +440,7 @@ static int rx_main(const char *node)
     reader_join(reader_th);
     pthread_join(udp_th, NULL);
     close(g_fd);
+    g_fd = -1;
 
     return 0;
 }
