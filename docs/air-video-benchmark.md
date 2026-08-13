@@ -58,6 +58,11 @@ Its distribution is also remarkably flat. The IDR is 1.7x the mean P-frame. For 
 
 ### Vendor encoder configuration, from the blob
 
+Two different vendor encoders are described below and they do **not** share a QP floor. `venc8` is the
+goggle's RTSP re-encode channel, configured in code. The air unit's downlink encoder is a separate
+path configured from a table, and it is the one to match for the downlink; see "The air unit's own
+encoder configuration" below before taking any value from the `venc8` rows.
+
 `AR_LOWDELAY_RtspVencInit(8, H265, H265CBR, w, h, 5000 kbps, gop=0, framerate)`, channel attr `enRcMode=10`, `u32Gop=0`, `u32StatTime=30`, `bByFrame=1`, GOP mode NormalP with `s32IPQpDelta = -2`, followed by a `GetRcParam` / `SetRcParam` override.
 
 Two things this rules out, both checked in the decompile:
@@ -91,7 +96,75 @@ Three consequences.
 
 **Iprop is retired as the explanation for the vendor's flat peak-to-mean.** The service stores and returns the pair but nothing on this path consumes it (call chain in `venc-api.md`); the host-side VBR helper reads a different pair of slots. It is public API state the service preserves, not a rate-allocation input. Whatever flattens the vendor's peak, it is not this.
 
-**`MINQP` is now 0**, the vendor value, where the recorded runs above used 25. The driver's default of 8 is what let rate control pin flat content at the QP floor and overshoot the target 1.6x on `bars`; raising it shapes the stream better than the vendor does, which makes it an improvement rather than parity. The case for a floor above 0 lives in `plans/beyond-vendor-backlog.md`. Every table above was taken at `MINQP=25` and is not comparable to a run at the new default.
+**`MINQP` 0 here is the `venc8` value and is NOT what the air unit should run.** It is kept below as
+the record of what the goggle's RTSP re-encode channel uses; the air's own downlink encoder uses a
+floor of 15 (see "The air unit's own encoder configuration"), and `ml-air-video` defaults to that.
+Do not take the 0 in this paragraph as the air-side target. The rest of the paragraph describes the
+bench runner, where the recorded runs above used 25. The driver's default of 8 is what let rate control pin flat content at the QP floor and overshoot the target 1.6x on `bars`; raising it shapes the stream better than the vendor does, which makes it an improvement rather than parity. The case for a floor above 0 lives in `plans/beyond-vendor-backlog.md`. Every table above was taken at `MINQP=25` and is not comparable to a run at the new default.
+
+### The air unit's own encoder configuration
+
+The air's `ar_lowdelay` does not configure its downlink encoder in code. It loads `cfg_venc.json`
+from `usr_data`, and when that file is absent - which it is on a factory unit, the partition is
+blank - `AR_CFG_VENC_LoadDefault` fills the channel from a static table. That table is exported as
+`stVencTxMap` (20 entries of 64 bytes: name, target, type, default string, min, max, description);
+`u8KeyFrameMultiplier` and friends are its keys. Recovered from the air-side binary
+`archive/out/air-probe/airfs/bin/ar_lowdelay`, whose `.dynstr` carries the names.
+
+| key | default | range |
+|---|---:|---|
+| `enable` | 1 | 0..1 |
+| `encodeType` | 2 (H.265) | 0..5 |
+| `gop` | 0 | 0..200 |
+| `brcMode` | 0 (CBR) | 0..6 |
+| `cbrAvgBps` | 2000 | 128..16000 kbps |
+| `u8KeyFrameMultiplier` | 4 | 1..100 |
+| `u8NonKeyFrameMultiplier` | 2 | 1..100 |
+| `qpMinI` | **15** | 0..51 |
+| `qpMaxI` | 51 | 0..51 |
+| `qpMinP` | **15** | 0..51 |
+| `qpMaxP` | 51 | 0..51 |
+| `statTime` | 0 | 0..60 |
+| `u32SkipThreshold` | 5 | 0..10 |
+| `u32AutoRoiThreshold` | 682 | 100..10000 |
+
+**The QP floor is 15 on both I and P.** This is the one field that differs materially from the
+`venc8` rcParam table above, which reads `MinIQp = 0` - and `venc8` is the wrong path to copy for
+the downlink. `ml-air-video` now defaults `ML_AIR_MINQP` to 15.
+
+`cbrAvgBps` is only the seed: the live bitrate is MCS-derived (`ml-linkd`), and the vendor's measured
+stream runs about 5.35 Mbit/s per tile, above this default and above ours.
+
+**The two multipliers are not rate limits.** `ar_video_h26x_enc_exe_init` in `libmpp_service.so`
+computes `keyFrameSize = align16(u8KeyFrameMultiplier * u32BufSize / 8)` and the non-key size the
+same way, then clamps each to the raw frame size and warns if `u32BufSize` is too small for them.
+They size the bitstream buffer. With `u32BufSize = align16(w) * align16(h) * 3/2` that is about
+806 kB for a 1920x560 tile, four orders off anything that could shape a picture.
+
+### No per-frame byte cap was found in any path searched
+
+Worth stating plainly, because it has been looked for twice. Searched and clean: `stVencTxMap`, the
+rcParam struct, the channel attr, the multiplier math in `libmpp_service`, and the wave5 register
+set; mainline `enc_wave_param` has no such field either. Handoff 081 reached the same conclusion
+independently for the `venc8` path.
+
+This is inference from static RE over those paths, not a proof of absence - no runtime measurement
+shows the vendor encoder refusing to emit a large picture. It is strong enough to stop looking, and
+the explanation it leaves is sufficient: the vendor's frames are small because of how its rate
+control is configured.
+
+An earlier note here recorded an "18000-byte ceiling" in the vendor capture. That was a histogram
+bucket, not a cap: the vendor's true maximum across 2017 packets is 18,919 B.
+
+What the numbers say, at matched bitrate:
+
+| | vendor | ours, `MINQP=0` |
+|---|---:|---:|
+| bitrate per tile | 5.35 Mbit/s | 4.0 Mbit/s |
+| peak access unit | 18,919 B | 75,970 B |
+| peak, bits per pixel (1920x560) | 0.14 | 0.57 |
+
+The vendor spends *more* bitrate and produces a peak four times smaller. The difference is the floor.
 
 ### VBV does not bound the peak on hard content
 
