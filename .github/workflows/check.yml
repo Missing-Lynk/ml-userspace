@@ -1,0 +1,40 @@
+# Build and run the host tests: `make check`. No device, no docker, no cross-toolchain - the tests
+# link pure logic (the :10000 frame builders, the MSP canvas encoder, the air's power/standby state
+# machine) against checked-in captures and run on the runner itself.
+#
+# This job lives here rather than in the superproject because the superproject's runners cannot
+# check the submodules out: they are pinned over SSH URLs a runner has no key for, which is why
+# its own workflows all set submodules: false. Putting it here also means a drift is reported on
+# the commit that causes it instead of on the pointer bump that later imports it, which is the
+# failure this job exists to catch: the MEDIA_PARAMS frame grew a 12-byte tail and its test went
+# on asserting the old 92-byte layout across two releases with nothing to notice.
+#
+# No path filter. `make check` compiles ml-linkd/, ml-hud/src/osd/ and tests/ into one binary each,
+# so a filter would have to track that dependency list by hand and would fail open when it drifted.
+# The whole job is a few seconds; running it on everything is cheaper than maintaining the filter.
+#
+# ubuntu-24.04 rather than ubuntu-latest: CHECK_CFLAGS carries -Werror, so the compiler version
+# decides what fails, and a floating runner label would move it without an edit here. Bump this tag
+# deliberately, the same way .github/workflows/shell.yml in the superproject pins its shellcheck.
+
+name: check
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Host tests
+        run: make check
