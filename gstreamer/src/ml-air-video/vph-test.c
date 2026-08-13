@@ -64,6 +64,66 @@ int main(void)
         failures++;
     }
 
+
+    /* The vendor's own per-access-unit SEI, byte for byte, from a capture of a stock air unit
+     * (archive/out/rf-capture/assoc-arm.c0.h265, offset 18919). A vendor goggle stops its receive
+     * pipeline on an access unit that carries no user data, so this NAL is mandatory and its shape
+     * is not ours to choose. */
+    {
+        static const uint8_t sei_golden[] = {
+            0x00, 0x00, 0x00, 0x01, 0x4e, 0x01, 0x05, 0x44,
+            0xbd, 0xe9, 0x45, 0xdc, 0xb7, 0x48, 0xd9, 0xe6,
+            0x20, 0xd8, 0x2c, 0x96, 0xef, 0xee, 0x23, 0xd9,
+            'C', 'h', 'n', 'I', 'd', ' ', '0', ' ',
+            'F', 'r', 'a', 'm', 'e', 'I', 'd', ' ', '1', ' ',
+            'P', 'T', 'S', ' ', '4', '3', 'b', '1', '9', 'd', 'e', ' ',
+            'F', 'i', 'l', 'e', 'd', ' ', '4', ' ',
+            'B', 'R', ' ', '3', '9', '2', '6', ' ',
+            'Q', 'P', ' ', '2', '5', 0x00, 0x80
+        };
+        uint8_t sei[VPH_SEI_MAX];
+        size_t n = vph_sei_build(sei, sizeof sei, 0, 1, 0x43b19de, 3926, 0x25);
+
+        if (n != sizeof sei_golden || memcmp(sei, sei_golden, n) != 0) {
+            printf("FAIL vph_sei_build differs from the vendor SEI (got %zu, want %zu)\n",
+                   n, sizeof sei_golden);
+            for (size_t i = 0; i < n && i < sizeof sei_golden; i++) {
+                if (sei[i] != sei_golden[i]) {
+                    printf("  [%2zu] got 0x%02x want 0x%02x\n", i, sei[i], sei_golden[i]);
+                }
+            }
+            failures++;
+        }
+
+        /* A prefix SEI belongs immediately before the first slice: after VPS/SPS/PPS on an IDR
+         * access unit, at offset 0 on a P access unit. Anywhere earlier shifts the access-unit
+         * head that a vendor receiver byte-checks. */
+        {
+            static const uint8_t p_au[] = { 0, 0, 0, 1, 0x02, 0x01, 0xaa };
+            static const uint8_t idr_au[] = { 0, 0, 0, 1, 0x40, 0x01, 0xaa,
+                                              0, 0, 0, 1, 0x42, 0x01, 0xbb,
+                                              0, 0, 0, 1, 0x44, 0x01, 0xcc,
+                                              0, 0, 0, 1, 0x26, 0x01, 0xdd };
+            static const uint8_t no_vcl[] = { 0, 0, 0, 1, 0x40, 0x01, 0xaa };
+
+            if (vph_first_vcl_offset(p_au, sizeof p_au) != 0) {
+                printf("FAIL first VCL of a P access unit is not 0\n");
+                failures++;
+            }
+            if (vph_first_vcl_offset(idr_au, sizeof idr_au) != 21) {
+                printf("FAIL first VCL of an IDR access unit is not 21 (got %zu)\n",
+                       vph_first_vcl_offset(idr_au, sizeof idr_au));
+                failures++;
+            }
+            /* No slice at all must report "none", so the caller does not attach per-frame user
+             * data to an access unit that codes no frame. */
+            if (vph_first_vcl_offset(no_vcl, sizeof no_vcl) != sizeof no_vcl) {
+                printf("FAIL an access unit with no VCL NAL did not report its own length\n");
+                failures++;
+            }
+        }
+    }
+
     if (failures == 0) {
         printf("ok - all packetizer self-tests passed\n");
         return 0;

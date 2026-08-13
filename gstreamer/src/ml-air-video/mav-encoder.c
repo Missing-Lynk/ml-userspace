@@ -290,15 +290,46 @@ int air_enc_open(struct air_tile *tile, const char *dev, int fps)
      * gives it a picture it cannot configure a decoder for. Seq-init parameter, so it has to be set
      * before streaming starts, not alongside the keyframe request. */
     air_enc_ctrl(tile, V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR, 1, "prepend sps/pps to idr");
+
+    /* No access-unit delimiters. wave5 defaults this control to 1, prepending a 7-byte AUD to every
+     * access unit; the vendor encoder emits none.
+     *
+     * AR_LDRT_RX_VDEC_RecvStreamCheck in libldrt_pipeline.so validates the IDR access-unit head
+     * against twelve hard-coded bytes - start code, 0x40 0x01 (VPS) at [4], a second start code at
+     * [39], 0x42 0x01 (SPS) - and on mismatch logs "Parser IDR Stream Error", resets the decoder and
+     * drops the frame. The AUD shifts the VPS by 7 bytes and fails five of the twelve. Our own
+     * goggle ignores AUDs, so this is invisible on our own link. */
+    air_enc_ctrl(tile, V4L2_CID_MPEG_VIDEO_AU_DELIMITER, 0, "au delimiter");
+
+    /* Level 4.0, which is what a vendor IDR carries (general_level_idc 120). Unset, our VPS goes out
+     * with general_level_idc 10: not a defined HEVC level (valid are 30/60/63/90/93/120), and read
+     * as Level 1 it permits 36864 luma samples against the 1,075,200 of a 1920x560 tile. A receiver
+     * sizing decode or display buffers from the level then sizes for QCIF. Our own goggle sizes
+     * from the SPS dimensions, so this is invisible on our own link.
+     *
+     * wave5 maps LEVEL_4 to 40 * 3 = 120. Verify on the wire (glue/capture/vph-sniff.c): the
+     * registered default LEVEL_1 should give 30 and measured 10. */
+    air_enc_ctrl(tile, V4L2_CID_MPEG_VIDEO_HEVC_LEVEL, V4L2_MPEG_VIDEO_HEVC_LEVEL_4, "hevc level");
     air_enc_ctrl(tile, V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE, 1, "frame rc");
     air_enc_ctrl(tile, V4L2_CID_MPEG_VIDEO_MB_RC_ENABLE,
                  atoi(air_env_or("ML_AIR_MBRC", "1")), "mb rc");
+    /* The QP floor bounds peak access-unit size on this path. 15 is the vendor air unit's value for
+     * both I and P (qpMinI / qpMinP in stVencTxMap, the table its ar_lowdelay feeds to
+     * AR_CFG_VENC_LoadDefault; qpMax 51 already matches). The MinIQp 0 in the rcParam comparison in
+     * docs/air-video-benchmark.md is venc8, the GOGGLE's RTSP re-encode channel, not this one.
+     *
+     * Nothing else bounds a picture here. VBV is derived to three quarters of a datagram but shapes
+     * the average, not the peak (measured 5.6x over budget on hard content). The vendor's
+     * u8KeyFrameMultiplier / u8NonKeyFrameMultiplier are bitstream BUFFER sizing, not rate limits:
+     * libmpp_service computes align16(multiplier * u32BufSize / 8), ~806 kB for a 1920x560 tile.
+     * Bitrate is not the lever either - the vendor stream runs 5.35 Mbit/s per tile, above our
+     * default, and peaks at 18919 B (0.14 bpp) where a floor of 0 gave a 75970 B IDR (0.57 bpp). */
     air_enc_ctrl(tile, V4L2_CID_MPEG_VIDEO_HEVC_MIN_QP,
-                 atoi(air_env_or("ML_AIR_MINQP", "0")), "min qp");
+                 atoi(air_env_or("ML_AIR_MINQP", "15")), "min qp");
     air_enc_ctrl(tile, V4L2_CID_MPEG_VIDEO_HEVC_MAX_QP,
                  atoi(air_env_or("ML_AIR_MAXQP", "51")), "max qp");
-    air_enc_ctrl(tile, V4L2_CID_MPEG_VIDEO_HEVC_I_FRAME_QP,
-                 atoi(air_env_or("ML_AIR_IQP", "30")), "i frame qp");
+    tile->enc_qp = atoi(air_env_or("ML_AIR_IQP", "30"));
+    air_enc_ctrl(tile, V4L2_CID_MPEG_VIDEO_HEVC_I_FRAME_QP, tile->enc_qp, "i frame qp");
     memset(&rb, 0, sizeof rb);
     rb.type = otype;
     rb.memory = V4L2_MEMORY_DMABUF;

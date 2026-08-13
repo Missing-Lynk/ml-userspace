@@ -47,10 +47,30 @@ gboolean au_has_idr(const guint8 *es, int n)
     return FALSE;
 }
 
+/* Value of one hex digit, or -1. */
+static int sei_hexval(guint8 c)
+{
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+
+    return -1;
+}
+
 /* Read the unsigned integer that follows @p tag (a 2-char literal like "BR") in the ASCII SEI
- * user-data @p p[0..n). Skips any non-digit run between the tag and the number. Returns the value
- * and TRUE, or FALSE if the tag or a following digit is absent. */
-static gboolean sei_tag_uint(const guint8 *p, int n, const char *tag, int *out)
+ * user-data @p p[0..n). Skips any run between the tag and the number that cannot start one.
+ * Returns the value and TRUE, or FALSE if the tag or a following digit is absent.
+ *
+ * @p base must match the field: the vendor emits BR in decimal but PTS and QP in HEX
+ * ("ChnId 0 FrameId 1 PTS 43b19de Filed 4 BR 3926 QP 25", where QP 25 is 37 and QP 1e is 30).
+ * Reading a hex field as decimal stops at the first letter, so QP 1e used to read as 1. */
+static gboolean sei_tag_uint(const guint8 *p, int n, const char *tag, int base, int *out)
 {
     for (int i = 0; i + 1 < n; i++) {
         if (p[i] != (guint8)tag[0] || p[i + 1] != (guint8)tag[1]) {
@@ -58,18 +78,26 @@ static gboolean sei_tag_uint(const guint8 *p, int n, const char *tag, int *out)
         }
 
         int j = i + 2;
-        while (j < n && (p[j] < '0' || p[j] > '9')) {
+        while (j < n && (base == 16 ? sei_hexval(p[j]) < 0 : (p[j] < '0' || p[j] > '9'))) {
             j++;
         }
 
-        if (j >= n || p[j] < '0' || p[j] > '9') {
+        if (j >= n) {
             return FALSE;
         }
 
         int v = 0;
-        while (j < n && p[j] >= '0' && p[j] <= '9') {
-            v = v * 10 + (p[j] - '0');
-            j++;
+        if (base == 16) {
+            int d;
+            while (j < n && (d = sei_hexval(p[j])) >= 0) {
+                v = v * 16 + d;
+                j++;
+            }
+        } else {
+            while (j < n && p[j] >= '0' && p[j] <= '9') {
+                v = v * 10 + (p[j] - '0');
+                j++;
+            }
         }
 
         *out = v;
@@ -80,10 +108,11 @@ static gboolean sei_tag_uint(const guint8 *p, int n, const char *tag, int *out)
 }
 
 /* Extract the air encoder's BR (kbps) and QP from the AU's PREFIX_SEI (H.265 NAL 39), which carries
- * ASCII "ChnId N FrameId N PTS <hex> ... BR <kbps> QP <n>". The prefix SEI precedes the first VCL
- * NAL, so the scan stops at the first slice NAL (type < 32) and stays cheap. The token scan is
- * position-independent (matches "BR"/"QP" literally), so extra fields between PTS and BR do not
- * matter. Returns TRUE only if both values were found; *br_kbps / *qp are left untouched otherwise.
+ * ASCII "ChnId N FrameId N PTS <hex> Filed N BR <kbps, decimal> QP <hex>". The prefix SEI precedes
+ * the first VCL NAL, so the scan stops at the first slice NAL (type < 32) and stays cheap. The
+ * token scan is position-independent (matches "BR"/"QP" literally), so extra fields between PTS and
+ * BR do not matter. Returns TRUE only if both values were found; *br_kbps / *qp are left untouched
+ * otherwise.
  */
 gboolean sei_parse_brqp(const guint8 *es, int n, int *br_kbps, int *qp)
 {
@@ -110,8 +139,8 @@ gboolean sei_parse_brqp(const guint8 *es, int n, int *br_kbps, int *qp)
                 }
 
                 int br = 0, q = 0;
-                if (sei_tag_uint(es + body, end - body, "BR", &br)
-                    && sei_tag_uint(es + body, end - body, "QP", &q)) {
+                if (sei_tag_uint(es + body, end - body, "BR", 10, &br)
+                    && sei_tag_uint(es + body, end - body, "QP", 16, &q)) {
                     *br_kbps = br;
                     *qp = q;
                     return TRUE;

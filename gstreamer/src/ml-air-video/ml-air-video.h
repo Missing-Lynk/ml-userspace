@@ -171,6 +171,7 @@ struct air_tile {
     int enc_bitrate;               /* bitrate to re-apply on recovery */
     int enc_vbv;                   /* VBV window to re-apply on recovery */
     int fps_pending;               /* rate adopted on the next access unit, 0 when none */
+    volatile gint reset_pending;   /* session reset adopted on the next access unit (see mav-tx.c) */
     guint32 ts_base_id;            /* frame_id the VPH timestamp base was taken at */
     guint32 ts_base_ms;            /* VPH timestamp at ts_base_id */
 
@@ -209,6 +210,22 @@ struct air_tile {
     int tx_errno;                  /* errno of the most recent tx_error */
     guint32 tx_maxlen;             /* largest access unit seen, for sizing the limit against */
 
+    /* Access unit with the PREFIX_SEI spliced in. Held per tile because the two tiles are emitted
+     * from independent encoder threads. */
+    guint8 aubuf[AIR_TX_MAX];
+    volatile guint64 sei_skipped;  /* sent without an SEI: a vendor goggle stops on one */
+    int enc_qp;                    /* configured QP, reported in the SEI (V4L2 has no per-frame QP) */
+
+    /* Per-tile entry-point state. The two tiles are independent encoder instances covering
+     * different parts of the scene, so one can produce a transmittable IDR while the other's is
+     * still oversized. Arming is global, so without this the second tile's IDR is dropped by
+     * vph_build and - with gop 0 producing no further IDR on its own - that tile never gets an
+     * entry point at all, leaving half the picture dead for the session. Each tile therefore
+     * retries its own keyframe until one of its IDRs actually goes out. */
+    guint8 idr_sent;               /* an IDR from this tile has reached the socket */
+    guint32 idr_retries;           /* keyframes asked for after an oversized IDR */
+    guint32 idr_forced_at;         /* frame_id of the most recent force, for the spacing gate */
+
     /* A frame lost between the encoder and this program: appsrc refused the input, or a pulled
      * sample could not be mapped. Rare, but the same failure class as tx_oversize was: without a
      * counter the frame is gone and every other number still reads healthy. */
@@ -226,6 +243,9 @@ extern GstVideoInfo g_src_info;        /* source 1920x1080 I420 layout */
 extern GQuark g_recycle_quark;
 extern volatile guint64 g_src_lost;    /* frames dropped upstream of the tile split */
 extern int g_notx;
+/* ML_AIR_NOSEI: transmit without the per-frame PREFIX_SEI. Only for isolating the SEI in a
+ * bench run - a vendor goggle stops its receive pipeline on the first access unit that lacks it. */
+extern int g_nosei;
 
 /* Camera path drives the encoders through V4L2 directly instead of GStreamer, which is the only
  * way to state the capture stride. ML_AIR_GST=1 restores the GStreamer path for comparison. */
@@ -238,6 +258,38 @@ extern int g_enc_direct;
  * is nothing to transmit either. */
 extern int g_on_demand;
 extern volatile gint g_enc_up;         /* encoders open and streaming; the "is it running" flag */
+
+/* Transmit is held until an IDR arrives that is both substantive and sendable.
+ *
+ * Lower bound: the encoder's first pictures are black whatever the camera sees. Access unit 0
+ * decodes to an all-zero 1920x560 frame and is 391 B on both a synthetic scene and live camera
+ * content; two near-empty P-frames follow before content starts at ~22 kB. A vendor decoder rejects
+ * the black IDR with "AR_MPI_VDEC_SendStream: invalid frame, bs_size = 0, frame_size = 391", firing
+ * AR_LDRT_RX_PipelineRstEvent -> PipelineReset -> StopRx. Each reset takes another ~28 MB media
+ * block on a 118 MB machine; a few exhaust it, blanking the panel and the OSD that composites on
+ * the same layer, and the watchdog then reboots. The vendor encoder emits nothing below 336 B and
+ * its IDRs are ~16 kB. AIR_TX_ARM_BYTES sits between 391 B and a real IDR.
+ *
+ * The session's only other IDR is the black one at frame 0, so AIR_TX_WARMUP_AUS forces a real one
+ * into existence. AIR_TX_ARM_MAX_DROP arms on any IDR as a fallback, so a dark scene cannot hold
+ * transmit off indefinitely.
+ *
+ * Upper bound: vph_build refuses an IDR past one datagram and gop 0 produces no further one, so
+ * arming on it leaves the session with no entry point. The first camera IDR measured 75970 B at
+ * ML_AIR_MINQP 0 (now 15, the vendor's value). Retried AIR_TX_ARM_MAX_RETRY times, then reported
+ * once and left alone. */
+#define AIR_TX_ARM_BYTES     2000   /* an IDR at least this big is real, not the black start-up one */
+#define AIR_TX_WARMUP_AUS    8      /* access units to let pass before forcing the arming keyframe */
+#define AIR_TX_ARM_MAX_DROP  240    /* ~4 s at 60 fps: arm on any IDR rather than never starting */
+#define AIR_TX_ARM_MAX_RETRY 8      /* keyframes to ask for while the IDR will not fit a datagram */
+
+/* Frames between two forced keyframes on the SAME encoder instance. A force arms intra_period 1 for
+ * one picture and restores it on the next; a second force inside that window makes the restore
+ * write the armed value back, and the instance stays all-intra for its lifetime. Measured: two
+ * forces on consecutive frames produced 206 consecutive IDRs. Guarded in wave5-vpu-enc.c too. */
+#define AIR_TX_FORCE_GAP     4
+
+extern volatile gint g_tx_armed;       /* a substantive IDR has been sent; transmit freely */
 
 extern int g_stagger;                  /* serialize the two encoder bring-ups */
 extern int g_primed;                   /* set once the staggered bring-up completed */
@@ -295,6 +347,15 @@ void air_enc_restart(struct air_tile *tile);
 void air_enc_close(struct air_tile *tile);
 int air_enc_held(const struct air_tile *tile);
 int air_enc_set_int(struct air_tile *tile, guint32 id, gint32 val, const char *name);
+
+/* End the current downlink session: hold transmit and rebase the VPH timestamp to 0, so the next
+ * receiver is met with a stream that starts where the vendor's does. A receiver that power-cycles
+ * restarts its clock at zero and discards everything arriving in its future - measured as a
+ * constant 31 s skew, a black panel, and every decode counter healthy.
+ *
+ * Callable from any thread: flags the tiles, and the transmit path performs the reset on its next
+ * access unit. Nothing is in effect when this returns. */
+void air_tx_session_reset(void);
 int air_enc_set_bitrate(struct air_tile *tile, int bitrate);
 int air_enc_set_vbv(struct air_tile *tile, int vbv);
 int air_enc_set_fps(struct air_tile *tile, int fps);

@@ -73,4 +73,47 @@ size_t vph_build(uint8_t *out, size_t out_cap,
                  uint32_t timestamp_ms, uint32_t resolution,
                  const uint8_t *es, uint32_t es_len);
 
+/** Upper bound on a built SEI NAL, for sizing a caller's scratch buffer. Sized for the worst case
+ * the builder will accept: a 0xfe payload plus prefix, with an emulation-prevention byte after
+ * every second byte. The real NAL is 76-77 bytes. */
+#define VPH_SEI_MAX     512
+
+/**
+ * @brief Offset of the first VCL NAL in an HEVC access unit.
+ *
+ * A prefix SEI has to sit immediately before the first slice: ahead of the parameter sets it would
+ * shift the access-unit head, and a vendor receiver byte-checks that head (see
+ * userspace/docs/rf-video-downlink.md). On an IDR access unit this lands after VPS/SPS/PPS, on a
+ * P access unit at offset 0, which is exactly the vendor's own layout.
+ *
+ * @param es     HEVC access unit.
+ * @param es_len length of @p es.
+ * @return byte offset of the start code introducing the first VCL NAL (nal_unit_type <= 31), or
+ *         @p es_len if the access unit contains none.
+ */
+size_t vph_first_vcl_offset(const uint8_t *es, size_t es_len);
+
+/**
+ * @brief Build the vendor's per-access-unit PREFIX_SEI (user_data_unregistered).
+ *
+ * A vendor goggle calls AR_MPI_VDEC_GetUserData on every decoded frame and tears its whole receive
+ * pipeline down when the access unit carried none, so this NAL is mandatory rather than
+ * diagnostic. Layout and the constant UUID are recovered from a vendor capture; the field format is
+ * "ChnId %d FrameId %d PTS %x Filed %d BR %d QP %x" with a NUL terminator ("Filed" is the vendor's
+ * spelling). Whether the receiver reads any field or only requires the call to succeed is not
+ * established, so the format is matched rather than approximated.
+ *
+ * @param out     destination, at least VPH_SEI_MAX bytes.
+ * @param out_cap capacity of @p out.
+ * @param chn     ChnId.
+ * @param frame_id FrameId.
+ * @param pts     PTS, emitted in hex.
+ * @param bitrate_kbps BR, emitted in decimal.
+ * @param qp      QP, emitted in hex.
+ * @return bytes written, or 0 if @p out_cap is too small.
+ */
+size_t vph_sei_build(uint8_t *out, size_t out_cap,
+                     uint32_t chn, uint32_t frame_id, uint32_t pts,
+                     uint32_t bitrate_kbps, uint32_t qp);
+
 #endif /* ML_AIR_VPH_H */

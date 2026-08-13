@@ -31,25 +31,29 @@ int main(int argc, char **argv)
         arg = 2;
     }
 
-    /* keyframe is the only command that takes no argument of its own. */
+    /* keyframe and session-reset take no argument of their own. */
+    int noarg = argc - arg >= 1 && (strcmp(argv[arg], "keyframe") == 0 ||
+                                    strcmp(argv[arg], "session-reset") == 0);
+
     if (
         argc - arg < 1 ||
-        (argc - arg < 2 && strcmp(argv[arg], "keyframe") != 0) ||
+        (argc - arg < 2 && !noarg) ||
         (strcmp(argv[arg], "bitrate") != 0 && strcmp(argv[arg], "fps") != 0 &&
         strcmp(argv[arg], "capfps") != 0 &&
-        strcmp(argv[arg], "rate") != 0 && strcmp(argv[arg], "keyframe") != 0)
+        strcmp(argv[arg], "rate") != 0 && !noarg)
     ) {
         fprintf(stderr,
                 "usage: " PROG " [socket] bitrate <bps-per-tile> [vbv-ms]\n"
                 "       " PROG " [socket] fps <fps>\n"
                 "       " PROG " [socket] capfps <fps>   (feeder only, rate control untouched)\n"
                 "       " PROG " [socket] rate <bps-per-tile> <fps> [vbv-ms]\n"
-                "       " PROG " [socket] keyframe\n");
+                "       " PROG " [socket] keyframe\n"
+                "       " PROG " [socket] session-reset   (what ml-linkd sends a new receiver)\n");
         return 2;
     }
 
-    if (strcmp(argv[arg], "keyframe") == 0) {
-        snprintf(cmd, sizeof cmd, "keyframe\n");
+    if (noarg) {
+        snprintf(cmd, sizeof cmd, "%s\n", argv[arg]);
     } else if (strcmp(argv[arg], "rate") == 0 && argc - arg >= 4) {
         snprintf(cmd, sizeof cmd, "rate %s %s %s\n", argv[arg + 1], argv[arg + 2],
                  argv[arg + 3]);

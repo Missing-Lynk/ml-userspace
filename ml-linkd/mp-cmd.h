@@ -74,50 +74,77 @@ static inline int mp_params_request(uint8_t *frame, uint32_t stamp)
  * keyframe that starts video. Our own goggle dispatches on msg_type alone and takes its geometry
  * from SetLdCfg, so it ignores everything below and accepts this frame unchanged.
  *
- * Field map, recovered from the consumer's stores into g_stRxParams (:21921) and its readers in
- * AR_FSM_RX_RealTimeInit (:18752). Offsets are absolute into the datagram:
+ * Field map. Values are a real vendor reply captured off a working session
+ * (archive/out/rf-capture/assoc-arm-sdio0.pcap, the one type-2 in it): 104 bytes, so there IS a
+ * 12-byte tail past the body. Consumers are the stores into g_stRxParams (:21921) and the readers
+ * in AR_FSM_RX_RealTimeInit (:18752). Offsets are absolute into the datagram:
  *
- *   28  u32  source ready. NON-ZERO IS MANDATORY - RealTimeInit refuses with "Tx Sns Is Not
- *            Ready..." while this is 0, so a correctly sized body of zeros fails one rung later
- *            than a header-only one rather than working. The vendor sets it when its HDMI source
- *            connects (:15365) and clears it on disconnect (:15442); our source is the camera,
- *            which is live whenever there is anything to answer with.
- *   32  u32  set to 1 alongside it on the vendor's format-change path (:15479).
- *   44  f32  frame rate, high precision. Zero is tolerated here: the receiver substitutes its own
- *            configured rate when it reads 0.0 (:18882). Sent anyway, since we know it.
- *   48  u32  width. 0x780 = 1920, 0x500 = 1280, 0x2d0 = 720; the receiver decodes the pair at
- *            48/52 into "720P60" and friends at :23182.
- *   52  u32  height.
- *   56  u32  frame rate, whole. Consumed by AR_LOWDELAY_RX_SYSCTRL_SetCurInputFps.
+ *   16  u32  48 00 00 00   declared body length, 72.
+ *   20  u32  01 00 00 00   pipeline flag. MUST BE 1 - see below.
+ *   24  u32  01 00 00 00   pipeline value, forwarded to the pipeline create (:18783).
+ *   28  u32  01 00 00 00   source ready. NON-ZERO IS MANDATORY - RealTimeInit refuses with "Tx Sns
+ *                          Is Not Ready..." while this is 0, so a correctly sized body of zeros
+ *                          fails one rung later than a header-only one. The vendor sets it when its
+ *                          HDMI source connects (:15365), clears it on disconnect (:15442); our
+ *                          source is the camera, live whenever there is anything to answer with.
+ *   32  u32  00 00 00 00   zero, though the vendor's format-change path sets it (:15479).
+ *   44  f32  e5 ff 6f 42   59.99988, frame rate, high precision. Zero is tolerated - the receiver
+ *                          substitutes its configured rate when it reads 0.0 (:18882).
+ *   48  u32  80 07 00 00   1920. The receiver decodes 48/52 into "720P60" and friends at :23182.
+ *   52  u32  38 04 00 00   1080.
+ *   56  u32  3c 00 00 00   60, frame rate, whole. Read by AR_LOWDELAY_RX_SYSCTRL_SetCurInputFps.
+ *   88  f32  00 00 80 3f   1.0.
+ *   92..103                zero, the tail.
  *
- * Deliberately zero, and the reasoning, because a wrong value here is worse than a zero:
- * offsets 20/24 are a flag/value pair the receiver forwards to its pipeline create when the flag
- * reads 1 (:18783), and zero is the "off" branch it already handles. Offsets 36, 40 and 60..91 are
- * unidentified. Note 40 does reach the decoder create (:18880), so it is the first field to look at
- * if a vendor goggle accepts the reply and then fails to bring its pipeline up.
+ * Offsets 36, 40 and 60..87 are unidentified. 40 reaches the decoder create (:18880), so it is the
+ * first field to look at if a vendor goggle accepts the reply and then fails to bring up its
+ * pipeline.
  *
- * No 12-byte trailer, unlike the air's status frames: the vendor's own assembly
- * (AR_FSM_TX_ProcessParamsRequest :15581) ends at the body, so there is nothing to copy.
+ * With the flag at 20 set to zero, a vendor goggle accepts the reply, brings up decoder channel 0,
+ * and fails every SendStream on channel 1 with "invalid frame, bs_size = 0" until it resets its
+ * pipeline. AR_LDRT_RX_VDEC_Enable (libldrt_pipeline.so @0x38a68) seeds a channel count of 1 and
+ * replaces it with the pattern's count only when this flag reads 1:
+ *
+ *    38ac0:  mov  w1, #0x1          ; count = 1
+ *    38ac4:  ldr  w0, [x20]         ; arg[0] = this flag
+ *    38acc:  cmp  w0, w1
+ *    38ad0:  b.ne 38adc             ; leave count at 1
+ *    38ad4:  ldrh w0, [x25, #40]    ; count = pattern channel count
+ *
+ * That count bounds the AR_MPI_VDEC_CreateChn loop (@0x38c14, bound reloaded @0x38ce0), so a zero
+ * flag creates decoder channel 0 and nothing else. The demux still feeds channel 1, whose
+ * per-channel bitstream-buffer size is therefore 0; AR_MPI_VDEC_SendStream loads that from the
+ * channel table at +92 and rejects any frame with frame_size >= bs_size, returning 0x80058403 -
+ * the VDEC illegal-parameter code, not a verdict on our bitstream.
  */
 #define MP_PARAMS_BODY_LEN   0x48                                  /* 72, checked by the receiver */
-#define MP_PARAMS_TOTAL      (MP_OFF_BODY + MP_PARAMS_BODY_LEN)    /* 92 */
+#define MP_PARAMS_TAIL       12                                    /* zero bytes past the body */
+#define MP_PARAMS_TOTAL      (MP_OFF_BODY + MP_PARAMS_BODY_LEN + MP_PARAMS_TAIL)  /* 104 */
 
+#define MP_PR_OFF_PIPE_FLAG  (MP_OFF_BODY + 0)    /* 20 */
+#define MP_PR_OFF_PIPE_VAL   (MP_OFF_BODY + 4)    /* 24 */
 #define MP_PR_OFF_SRC_READY  (MP_OFF_BODY + 8)    /* 28 */
-#define MP_PR_OFF_SRC_MODE   (MP_OFF_BODY + 12)   /* 32 */
+#define MP_PR_OFF_SRC_MODE   (MP_OFF_BODY + 12)   /* 32, zero on the wire */
 #define MP_PR_OFF_FPS_F      (MP_OFF_BODY + 24)   /* 44 */
 #define MP_PR_OFF_WIDTH      (MP_OFF_BODY + 28)   /* 48 */
 #define MP_PR_OFF_HEIGHT     (MP_OFF_BODY + 32)   /* 52 */
 #define MP_PR_OFF_FPS        (MP_OFF_BODY + 36)   /* 56 */
+#define MP_PR_OFF_SCALE_F    (MP_OFF_BODY + 68)   /* 88, float 1.0 */
 
 static inline int mp_params_reply(uint8_t *frame, uint32_t width, uint32_t height, uint32_t fps,
                                   uint32_t stamp)
 {
-    uint32_t ready = 1;
+    uint32_t one = 1;
     float fps_f = (float) fps;
+    float scale = 1.0f;
 
     mp_stamp(frame, MP_PARAMS_TOTAL, MP_REPLY, stamp, MP_PARAMS_BODY_LEN);
-    memcpy(frame + MP_PR_OFF_SRC_READY, &ready, 4);
-    memcpy(frame + MP_PR_OFF_SRC_MODE, &ready, 4);
+    /* The pipeline flag/value pair. Zero at the flag creates decoder channel 0 only. */
+    memcpy(frame + MP_PR_OFF_PIPE_FLAG, &one, 4);
+    memcpy(frame + MP_PR_OFF_PIPE_VAL, &one, 4);
+    memcpy(frame + MP_PR_OFF_SRC_READY, &one, 4);
+    /* MP_PR_OFF_SRC_MODE stays zero: the wire capture has zero there. */
+    memcpy(frame + MP_PR_OFF_SCALE_F, &scale, 4);
     memcpy(frame + MP_PR_OFF_FPS_F, &fps_f, 4);
     memcpy(frame + MP_PR_OFF_WIDTH, &width, 4);
     memcpy(frame + MP_PR_OFF_HEIGHT, &height, 4);

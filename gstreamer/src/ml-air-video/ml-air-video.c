@@ -112,9 +112,11 @@ GstVideoInfo g_src_info;
 GQuark g_recycle_quark;
 static int g_verbose;
 int g_notx;
+int g_nosei;
 int g_enc_direct;
 int g_on_demand;
 volatile gint g_enc_up;
+volatile gint g_tx_armed;
 int g_stagger;
 int g_primed;
 int g_bench_free;
@@ -325,6 +327,7 @@ int main(int argc, char **argv)
 
     g_verbose = (getenv("ML_AIR_VERBOSE") != NULL);
     g_notx = (getenv("ML_AIR_NOTX") != NULL);
+    g_nosei = (getenv("ML_AIR_NOSEI") != NULL);
     g_bench_free = (getenv("ML_AIR_BENCH_FREE") != NULL);
     g_bench_fps = fps > 0 ? fps : 60;
     g_cap_fps = fps;

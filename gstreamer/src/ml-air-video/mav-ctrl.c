@@ -246,6 +246,10 @@ gboolean air_on_ctrl(G_GNUC_UNUSED int fd, G_GNUC_UNUSED GIOCondition cond,
     } else if (sscanf(buf, "capfps %d", &fps) == 1) {
         ret = air_set_cap_fps(fps);
         snprintf(reply, sizeof reply, "%s capfps=%d\n", ret == 0 ? "ok" : "err", fps);
+    } else if (strncmp(buf, "session-reset", 13) == 0) {
+        air_tx_session_reset();
+        ret = 0;
+        snprintf(reply, sizeof reply, "ok session-reset\n");
     } else if (strncmp(buf, "keyframe", 8) == 0) {
         ret = air_force_keyframe_all();
         snprintf(reply, sizeof reply, "%s keyframe\n", ret == 0 ? "ok" : "err");
@@ -253,7 +257,7 @@ gboolean air_on_ctrl(G_GNUC_UNUSED int fd, G_GNUC_UNUSED GIOCondition cond,
         ret = -1;
         snprintf(reply, sizeof reply,
                  "err expected: bitrate <bps> [vbv] | fps <fps> | capfps <fps> |"
-                 " rate <bps> <fps> [vbv] | keyframe\n");
+                 " rate <bps> <fps> [vbv] | keyframe | session-reset\n");
     }
 
     (void)write(cfd, reply, strlen(reply));

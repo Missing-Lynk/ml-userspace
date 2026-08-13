@@ -68,13 +68,65 @@ void air_power_tran_parm(struct air_power *pw, const uint8_t *dgram, ssize_t n)
     air_power_command(pw, dgram[MP_STP_OFF_DBM], dgram[MP_STP_OFF_STANDBY], "SetTranParm");
 }
 
+/* Report the SetLdCfg body on first arrival and on every change. ml-linkd consumes two bytes of
+ * 192; the rest is the sender's session state and the only statement a goggle makes about the
+ * geometry, tiling and aspect it expects. A vendor sender configures its own receiver from this
+ * block, so a mismatch against what the air transmits is not visible anywhere else. */
+static void air_power_ld_cfg_report(const uint8_t *body)
+{
+    static uint8_t last[sizeof(struct mp_ldcfg)];
+    static int have_last;
+    struct mp_ldcfg cfg;
+
+    if (have_last && memcmp(last, body, sizeof last) == 0) {
+        return;
+    }
+
+    memcpy(last, body, sizeof last);
+    have_last = 1;
+    memcpy(&cfg, body, sizeof cfg);
+
+    printf(TAG " ldcfg: rec %ux%u, aspect %u, scale %u/%u, rotation %u, zoom %.3f, roi %u,"
+           " bitrate %u kbps, power %u dBm, standby %u\n",
+           cfg.rec_width, cfg.rec_height, cfg.aspect_ratio, cfg.scale_mode, cfg.scale_unk25,
+           cfg.rotation, (double)cfg.zoom_factor, cfg.roi_enable, cfg.bitrate_q * 250u,
+           cfg.tx_power_dbm, cfg.standby_mode_en);
+    printf(TAG " ldcfg: unk44 %u, unk45 %u, unk4a %u, unk4e %u, tran_blk %u/%u/%u/%u,"
+           " caps %02x/%02x\n",
+           cfg.unk44, cfg.unk45, cfg.unk4a, cfg.unk4e, cfg.tran_bw_mcs, cfg.tran_blk2,
+           cfg.tran_blk4, cfg.tran_blk6, cfg.caps_flags1, cfg.caps_flags2);
+
+    /* The undecoded remainder, so a field nobody has named yet is still recoverable from the log.
+     * Offsets are body-relative, matching the struct comments in mp-cmd.h. */
+    for (size_t off = 0; off < sizeof cfg; off += 16) {
+        size_t run = sizeof cfg - off < 16 ? sizeof cfg - off : 16;
+
+        printf(TAG " ldcfg: %02zx:", off);
+        for (size_t i = 0; i < run; i++) {
+            printf(" %02x", body[off + i]);
+        }
+        printf("\n");
+    } /* for each 16-byte row */
+
+    fflush(stdout);
+}
+
 /* SetLdCfg (0x0a): the durable lever, re-sent on every association. The other 190 bytes are
- * undecoded vendor state and are not read. */
+ * undecoded vendor state and are not read, but they are reported (above) because they are the only
+ * record of what the sender expects the air to transmit. */
 void air_power_ld_cfg(struct air_power *pw, const uint8_t *dgram, ssize_t n)
 {
     struct mp_ldcfg cfg;
 
-    if (air_power_disabled(pw, "SetLdCfg") || n < MP_LDCFG_LEN) {
+    if (n < MP_LDCFG_LEN) {
+        return;
+    }
+
+    /* Ahead of the power gate: the report describes the sender, not our policy, so it must survive
+     * a build or a boot that runs without --power-adapt. */
+    air_power_ld_cfg_report(dgram + MP_LDCFG_BODY_OFF);
+
+    if (air_power_disabled(pw, "SetLdCfg")) {
         return;
     }
 
@@ -278,6 +330,11 @@ static void air_power_goggle_lost(struct air_power *pw, struct air_bb *bb, long 
         printf(TAG " power: goggle silent for %d ms, commanded state cleared\n",
                AIR_POWER_LOST_MS);
     }
+
+    /* Not the place to reset the video session: this window fires on a healthy link. A vendor
+     * goggle stops sending :10000 once video is up (measured: RX frozen for minutes while the
+     * picture ran), so a reset here ends working video ~5 s in. It hangs off the params request
+     * instead, which a receiver sends while establishing. */
 
     fflush(stdout);
 }

@@ -367,6 +367,20 @@ static void air_on_params(const struct air_msg_ctx *c, const uint8_t *dgram, ssi
                                    c->stamp_us),
                    MSG_DONTWAIT, (struct sockaddr *)c->tx->dst, sizeof *c->tx->dst);
 
+            /* A params request means a receiver is establishing a session. A goggle that has
+             * power-cycled restarts its clock at zero while our VPH timestamp carries on from the
+             * previous session - measured 31 s ahead, which its constant-frame-rate stage rejects
+             * frame by frame ("incorrect PTS %u, current time %u") with every decode counter
+             * healthy: IDRs accepted, no invalid frame, no pipeline reset, black panel.
+             *
+             * A no-op unless transmit is armed, so the repeats a waiting receiver sends cost
+             * nothing and a content receiver sends none. Not hung off the :10000 silence window,
+             * where a vendor goggle goes quiet on a healthy link. The vendor restarts its session
+             * the same way: AR_FSM_TX_ProcessIdrRequest runs PIPELINE_Start from not-streaming.
+             *
+             * Best effort: ml-air-video need not be running (RF-only and bench builds). */
+            air_ctrl_send("session-reset\n");
+
             if (g_verbose) {
                 fprintf(stderr, TAG " rx MEDIA_PARAMS_REQUEST -> reply\n");
             }
