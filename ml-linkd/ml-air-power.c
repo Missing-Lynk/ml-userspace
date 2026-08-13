@@ -275,12 +275,15 @@ static void air_power_frame_rate(struct air_power *pw, int standby_active)
     fflush(stdout);
 }
 
-/* Report the work mode on a change, and keep re-sending an unacked standby entry: the drop is
- * gated on the ack, so a lost report would otherwise hold the air at full power indefinitely. */
+/* Report the work mode on a change, and re-send an unacked standby entry a bounded number of times
+ * so a lost report still reaches a goggle that is listening. Bounded because a vendor goggle never
+ * acks: without the limit this is an unending 2 Hz datagram at a receiver that has nothing to say
+ * back. The drop itself no longer waits for the ack, so the re-send is redundancy, not a gate. */
 static void air_power_report(struct air_power *pw, long now, air_power_report_fn report, void *ctx)
 {
     int due = (pw->work_mode != pw->reported_mode)
               || (pw->work_mode == MP_STANDBY_ON && !pw->acked
+                  && pw->reports < AIR_POWER_REPORT_MAX
                   && now - pw->report_ms >= AIR_POWER_REPORT_MS);
 
     if (!due || report == NULL) {
@@ -298,11 +301,20 @@ static void air_power_report(struct air_power *pw, long now, air_power_report_fn
 
     pw->reported_mode = pw->work_mode;
     pw->report_ms = now;
+    pw->reports++;
 }
 
 /* Hand the radio back to the chip once the goggle has gone quiet, so a unit left in standby by a
  * receiver that disappeared does not stay at the minimum. The commanded power is forgotten with
- * it: the next association re-seeds it from SetLdCfg. */
+ * it: the next association re-seeds it from SetLdCfg.
+ *
+ * :10000 silence is a poor stand-in for "the goggle is gone", and AIR_POWER_LOST_MS is far too
+ * short for it. Measured against a vendor goggle with video running: three datagrams in 90 s (the
+ * operator's own standby toggles) and one in a separate 75 s window. A goggle that is working and
+ * idle says nothing for minutes, so this window fires repeatedly on a healthy link and every firing
+ * used to cancel a commanded standby. No timeout on this signal is correct; the right signal is the
+ * chip's association state (GET_PAIR / GET_1V1INFO), whose decode is not yet validated - so this
+ * stays timeout-based for now and is deliberately conservative about what it clears. */
 static void air_power_goggle_lost(struct air_power *pw, struct air_bb *bb, long now)
 {
     uint8_t frame[32];
@@ -311,11 +323,14 @@ static void air_power_goggle_lost(struct air_power *pw, struct air_bb *bb, long 
         return;
     }
 
+    /* Power only. The commanded standby is deliberately NOT cleared here: silence does not mean the
+     * goggle is gone, and clearing it takes a unit out of a standby the operator is still looking
+     * at - measured, the air returned to 60 fps by itself ~90 s into a standby the goggle was still
+     * displaying. Standby is a commanded state re-seeded by SetLdCfg on every association, so a
+     * goggle that really has gone leaves the air at the standby frame rate until the next one
+     * associates and says otherwise, which is self-correcting and costs nothing: power follows the
+     * arm state, not standby, so the radio is not held down by it. */
     pw->last_rx_ms = 0;
-    pw->standby_cmd = MP_STANDBY_NORMAL;
-    pw->work_mode = MP_STANDBY_NORMAL;
-    pw->reported_mode = MP_STANDBY_NORMAL;
-    pw->acked = 0;
     pw->commanded_dbm = -1;
     pw->applied_dbm = -1;
     pw->probe_dbm = -1;
@@ -324,11 +339,11 @@ static void air_power_goggle_lost(struct air_power *pw, struct air_bb *bb, long 
         && air_bb_send(bb, frame, bb_set_power_auto(frame, 1, bb->seq++),
                        "SET_POWER_AUTO(1)") == 0) {
         pw->auto_disabled = 0;
-        printf(TAG " power: goggle silent for %d ms, back to the chip's closed loop\n",
-               AIR_POWER_LOST_MS);
+        printf(TAG " power: goggle silent for %d ms, back to the chip's closed loop"
+               " (standby unchanged)\n", AIR_POWER_LOST_MS);
     } else {
-        printf(TAG " power: goggle silent for %d ms, commanded state cleared\n",
-               AIR_POWER_LOST_MS);
+        printf(TAG " power: goggle silent for %d ms, commanded power cleared"
+               " (standby unchanged)\n", AIR_POWER_LOST_MS);
     }
 
     /* Not the place to reset the video session: this window fires on a healthy link. A vendor
@@ -377,6 +392,7 @@ void air_power_service(struct air_power *pw, struct air_bb *bb, long now,
     if (want_mode != pw->work_mode) {
         pw->work_mode = want_mode;
         pw->acked = 0;
+        pw->reports = 0;
     }
 
     /* The probe sends nothing at all, on the bb socket or on the wire. */
@@ -384,8 +400,13 @@ void air_power_service(struct air_power *pw, struct air_bb *bb, long now,
         air_power_report(pw, now, report, ctx);
     }
 
-    /* Entering standby waits for the ack before the drop; leaving it does not wait for anything. */
-    standby_active = (pw->work_mode == MP_STANDBY_ON && pw->acked);
+    /* The commanded mode is the drop, with no ack required. A vendor goggle sends no STB_EVENT_ACK
+     * at all: measured over 90 s across an off/on/off toggle, the only :10000 traffic from the
+     * goggle was the three SetTranParm datagrams carrying the toggles. Gating the drop on an ack
+     * left its UI showing standby while the air transmitted at 60 fps. The goggle's own
+     * "AR_LOWDELAY_RX_SYSCTRL_StbAck ... NextWorkMode 1" log line is it handling our report, not
+     * sending a reply. The report is still sent, and an ack still stops the re-send. */
+    standby_active = (pw->work_mode == MP_STANDBY_ON);
 
     /* Power follows the arm state, not standby. A disarmed aircraft holds the minimum; an absent
      * FC is arm-unknown and leaves the goggle in charge. Nothing is written before the goggle has

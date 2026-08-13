@@ -10,13 +10,14 @@
  *   1. a commanded power reaches the radio exactly once, with the chip's self-adjust turned off
  *      first, and a repeat of the same value writes nothing,
  *   2. a dBm outside the chip's pwr_range is rejected and leaves the applied value alone,
- *   3. entering standby reports the work mode and drops NOTHING until the goggle's ack arrives,
+ *   3. entering standby reports the work mode and drops the frame rate on the command itself,
  *   4. the frame-rate drop moves the capture feeder alone, so the encoders keep budgeting bits for
  *      their declared rate and the emitted bitrate falls with the frame rate,
  *   5. the whole policy truth table: power follows the FC arm state, the frame rate follows the
  *      goggle's standby arm, arming overrides both, and an absent FC is arm-UNKNOWN rather than
  *      disarmed so the goggle's value stands,
- *   6. a goggle that goes silent releases the radio back to its closed loop.
+ *   6. a goggle that goes silent releases the radio back to its closed loop, and leaves a
+ *      commanded standby alone.
  *
  * Two are worth the test on their own. Dropping power before the receiver has acknowledged is how a
  * standby entry turns into a lost link. And treating an absent FC as disarmed would pin a bench
@@ -170,22 +171,34 @@ int main(void)
     air_power_service(&pw, &bb, now, stub_report, NULL);
     check(stub_power_writes == 1 && stub_power_dbm == 20, "30 dBm rejected, 20 dBm still applied");
 
-    /* 3: standby is reported, and the frame rate does not drop until the goggle acks. */
+    /* 3: standby is reported AND applied on the command, with no ack required. A vendor goggle
+     * sends no STB_EVENT_ACK at all (measured: 90 s across an off/on/off toggle carried three
+     * SetTranParm datagrams and nothing else), so gating the drop on one left the goggle showing
+     * standby while the air ran at 60 fps. */
     now += 2000;
     air_power_rx(&pw, now);
     command(&pw, 20, 1);
     air_power_service(&pw, &bb, now, stub_report, NULL);
     check(stub_reports == 1 && stub_report_mode == MP_STANDBY_ON, "standby entry reported");
-    check(stub_fps_writes == 0, "frame rate held until the ack");
+    check(stub_fps_writes == 1 && stub_fps == AIR_POWER_FPS_STANDBY,
+          "standby drops the frame rate on the command, without an ack");
 
     now += AIR_POWER_REPORT_MS;
     air_power_service(&pw, &bb, now, stub_report, NULL);
     check(stub_reports == 2, "an unacked standby entry is re-reported");
 
+    /* The re-send is bounded: a goggle that never acks must not be sent 0x12 at 2 Hz forever. */
+    for (int i = 0; i < AIR_POWER_REPORT_MAX + 5; i++) {
+        now += AIR_POWER_REPORT_MS;
+        air_power_service(&pw, &bb, now, stub_report, NULL);
+    }
+    check(stub_reports == AIR_POWER_REPORT_MAX, "the unacked re-send stops at AIR_POWER_REPORT_MAX");
+
     now += 100;
     air_power_stb_ack(&pw);
     air_power_service(&pw, &bb, now, stub_report, NULL);
-    check(stub_fps_writes == 1 && stub_fps == AIR_POWER_FPS_STANDBY, "standby drops the frame rate after the ack");
+    check(stub_fps_writes == 1 && stub_fps == AIR_POWER_FPS_STANDBY,
+          "an ack, if one ever arrives, changes nothing that is already applied");
     check(strcmp(stub_cmd, "capfps 15\n") == 0, "the frame-rate drop moves the FEEDER only (capfps, not fps)");
     check(stub_power_writes == 1 && stub_power_dbm == 20,
           "standby does NOT move power with no FC: arm is unknown, so the goggle stands");
@@ -197,7 +210,7 @@ int main(void)
     air_power_service(&pw, &bb, now, stub_report, NULL);
     check(stub_fps_writes == 2 && stub_fps == AIR_POWER_FPS_NORMAL, "leaving standby restores the frame rate");
     check(strcmp(stub_cmd, "capfps 60\n") == 0, "the restore also moves the feeder only");
-    check(stub_reports == 3 && stub_report_mode == MP_STANDBY_NORMAL, "normal work mode reported on exit");
+    check(stub_report_mode == MP_STANDBY_NORMAL, "normal work mode reported on exit");
 
     /* 5: the policy truth table. Power follows the arm state, the frame rate follows standby, and
      * arming overrides both. An absent FC is arm-unknown, not disarmed. */
@@ -215,11 +228,31 @@ int main(void)
      * the air is not honouring. */
     check(stub_report_mode == MP_STANDBY_NORMAL, "an armed aircraft reports work mode 0 despite the standby command");
 
-    /* 6: a silent goggle releases the radio back to the chip. */
+    /* 6: a silent goggle releases the radio back to the chip - and takes NOTHING else with it.
+     * Silence is not absence: a vendor goggle with video up sends nothing for minutes, so clearing
+     * the commanded standby here took the air out of a standby the operator was still looking at
+     * (measured on hardware: back to 60 fps ~90 s into an active standby). */
+    air_power_fc(&pw, 0, 0);          /* arm-unknown: standby applies and power still follows the
+                                       * goggle, so this block leaves the later checks untouched */
+    air_power_rx(&pw, now);
+    command(&pw, 20, 1);
+    air_power_service(&pw, &bb, now, stub_report, NULL);
+    int fps_writes_before_silence = stub_fps_writes;
+
     now += AIR_POWER_LOST_MS + 1;
     air_power_service(&pw, &bb, now, stub_report, NULL);
     check(stub_power_auto == 1, "a silent goggle re-enables the chip's self-adjust");
     check(pw.commanded_dbm == -1, "the commanded power is forgotten with the goggle");
+    check(stub_fps_writes == fps_writes_before_silence && stub_fps == AIR_POWER_FPS_STANDBY,
+          "silence does NOT take the air out of a commanded standby");
+
+    /* Back to normal, then silent again, so the rest of the test sees the same state it used to:
+     * no commanded power, self-adjust already released. */
+    air_power_rx(&pw, now);
+    command(&pw, 20, 0);
+    air_power_service(&pw, &bb, now, stub_report, NULL);
+    now += AIR_POWER_LOST_MS + 1;
+    air_power_service(&pw, &bb, now, stub_report, NULL);
 
     int auto_writes_after_release = stub_auto_writes;
     now += 100;

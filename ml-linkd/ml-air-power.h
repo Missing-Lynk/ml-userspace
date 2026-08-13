@@ -51,11 +51,15 @@
 
 #define AIR_POWER_POLL_MS      1000   /* GET_POWER read-back cadence */
 #define AIR_POWER_REPORT_MS    500    /* 0x12 re-send while a standby entry is unacked */
+#define AIR_POWER_REPORT_MAX   10     /* re-sends before giving up: no vendor goggle ever acks */
 
 /* Commanded state is only meaningful while the goggle is there to command it. After this much
  * :10000 silence the air returns to the chip's closed loop and full frame rate, so an unreachable
  * goggle cannot leave it pinned at the standby minimum. Matches the goggle's own TX_LOST window. */
-#define AIR_POWER_LOST_MS      5000
+#define AIR_POWER_LOST_MS      120000 /* :10000 silence before the radio goes back to the chip.
+                                      * Not 5000: a healthy vendor link is silent for minutes
+                                      * (measured 3 datagrams in 90 s), so a short window cancels a
+                                      * commanded standby on a working link. See ml-air-power.c. */
 
 #define AIR_POWER_PROBE_DUMPS  20     /* raw GET_POWER replies hexdumped before going quiet */
 
@@ -79,6 +83,7 @@ struct air_power {
     int reported_mode;       /* work mode the goggle has been told about */
     int acked;               /* the goggle's 0x1b for the current standby entry */
     long report_ms;          /* when the current work mode was last reported */
+    int reports;             /* 0x12 re-sends issued for the current standby entry */
 
     int applied_dbm;         /* dBm last written to the chip, -1 = none */
     int applied_fps;         /* feeder fps last pushed to ml-air-video, 0 = never touched */
