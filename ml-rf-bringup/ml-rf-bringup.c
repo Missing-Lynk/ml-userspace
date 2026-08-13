@@ -168,29 +168,74 @@ static void reprobe_host(void)
     write_attr(path, RF_HOST);
 }
 
-/* Poll the SDIO bus for the AR8030 (device id 0x8030, ROM mode). Returns 0 once seen. */
+/* Read one sysfs attribute into @p out as a NUL-terminated, newline-stripped string. */
+static int read_attr(const char *path, char *out, size_t out_len)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return -1;
+    }
+
+    ssize_t n_read = read(fd, out, out_len - 1);
+    close(fd);
+    if (n_read <= 0) {
+        return -1;
+    }
+
+    out[n_read] = '\0';
+    char *nl = strchr(out, '\n');
+    if (nl != NULL) {
+        *nl = '\0';
+    }
+
+    return 0;
+}
+
+/* Poll the SDIO bus for the AR8030 (device id 0x8030, ROM mode). Returns 0 once seen.
+ *
+ * The last scan's vendor:device pairs are kept for the timeout message: the chip can enumerate with
+ * a garbage device ID (observed 0x2a22, vendor 0x4152 correct), where artosyn_sdio's id_table never
+ * matches and nothing probes. That state and an empty bus both reach this timeout, and only the
+ * observed IDs separate them - kernel/docs/artosyn-sdio.md. */
 static int wait_ar8030(void)
 {
+    char seen[256];
+    size_t seen_len = 0;
+
     for (int attempt = 0; attempt < WAIT_TRIES; attempt++) {
         DIR *dir = opendir(SDIO_BUS);
         if (dir != NULL) {
             struct dirent *entry;
+
+            seen[0] = '\0';
+            seen_len = 0;
+
             while ((entry = readdir(dir)) != NULL) {
                 if (entry->d_name[0] == '.') {
                     continue;
                 }
 
                 char path[300];
+                char device_id[16];
+                char vendor_id[16];
+
                 snprintf(path, sizeof(path), SDIO_BUS "/%s/device", entry->d_name);
-                int fd = open(path, O_RDONLY);
-                if (fd < 0) {
+                if (read_attr(path, device_id, sizeof(device_id)) != 0) {
                     continue;
                 }
 
-                char device_id[16] = { 0 };
-                ssize_t n_read = read(fd, device_id, sizeof(device_id) - 1);
-                close(fd);
-                if (n_read > 0 && strstr(device_id, "8030") != NULL) {
+                snprintf(path, sizeof(path), SDIO_BUS "/%s/vendor", entry->d_name);
+                if (read_attr(path, vendor_id, sizeof(vendor_id)) != 0) {
+                    snprintf(vendor_id, sizeof(vendor_id), "?");
+                }
+
+                if (seen_len < sizeof(seen)) {
+                    seen_len += (size_t) snprintf(seen + seen_len, sizeof(seen) - seen_len,
+                                                  "%s%s:%s", seen_len > 0 ? " " : "",
+                                                  vendor_id, device_id);
+                }
+
+                if (strstr(device_id, "8030") != NULL) {
                     closedir(dir);
                     return 0;
                 }
@@ -201,6 +246,9 @@ static int wait_ar8030(void)
 
         usleep(WAIT_STEP_US);
     }
+
+    fprintf(stderr, PROG ": SDIO bus after %d s: %s\n", (WAIT_TRIES * WAIT_STEP_US) / 1000000,
+            seen_len > 0 ? seen : "no devices");
 
     return -1;
 }
