@@ -191,12 +191,14 @@ static int read_attr(const char *path, char *out, size_t out_len)
     return 0;
 }
 
-/* Poll the SDIO bus for the AR8030 (device id 0x8030, ROM mode). Returns 0 once seen.
+/* Poll the SDIO bus for the AR8030. Returns 0 once seen.
  *
- * The last scan's vendor:device pairs are kept for the timeout message: the chip can enumerate with
- * a garbage device ID (observed 0x2a22, vendor 0x4152 correct), where artosyn_sdio's id_table never
- * matches and nothing probes. That state and an empty bus both reach this timeout, and only the
- * observed IDs separate them - kernel/docs/artosyn-sdio.md. */
+ * Both id_table entries count: 0x8030 is the ROM loader and the driver uploads firmware to it,
+ * 0x8031 is already programmed and the upload is skipped. Gating narrower than the id_table refuses
+ * a chip the driver would bind.
+ *
+ * The observed vendor:device pairs are printed on timeout, because a garbage ID (0x2a22 seen) and
+ * an empty bus are otherwise indistinguishable - kernel/docs/artosyn-sdio.md. */
 static int wait_ar8030(void)
 {
     char seen[256];
@@ -235,7 +237,9 @@ static int wait_ar8030(void)
                                                   vendor_id, device_id);
                 }
 
-                if (strstr(device_id, "8030") != NULL) {
+                if (strstr(device_id, "8030") != NULL || strstr(device_id, "8031") != NULL) {
+                    fprintf(stderr, PROG ": AR8030 on SDIO as %s:%s%s\n", vendor_id, device_id,
+                            strstr(device_id, "8031") != NULL ? " (already programmed)" : "");
                     closedir(dir);
                     return 0;
                 }
