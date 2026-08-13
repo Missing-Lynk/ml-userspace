@@ -117,6 +117,8 @@ Do not trust the control-to-wire mapping without measuring it: the control's reg
 `glue/capture/vph-sniff.c` reads the air's own outgoing `:10001` packets via `AF_PACKET`/`ETH_P_ALL` on `sdio0` while `ml-air-camera` keeps running, and reports the access-unit size distribution, the Resolution field's constancy, and the head of every IDR. Every field it needs is in the 36-byte header, which rides in the first IP fragment, so the 4096-byte MTU needs no reassembly. Force a fresh IDR into the window with `ml-air-ctl keyframe`.
 
 Prefer it to `ML_AIR_DUMP`, which has to be the boot's **first** camera bring-up to write any DRAM at all (`plans/done/au-b-pipeline-dead-20260802.md`), and therefore costs a whole boot.
+
+For pixels rather than sizes, `glue/capture/vph-pcap.c` writes the same packets to a pcap and `glue/capture/vph-es.py` reassembles the IP fragments, strips the VPH header and tail, and emits one `.265` per tile for decoding on the host. Both run against a live session without disturbing it. Two things to know: the capture must be taken with an `ml-air-ctl keyframe` fired shortly after it starts, because `gop 0` leaves no entry point in a short window; and the capture loses packets to its own socket (51-72 of ~400-550 datagrams measured), so it proves that the frames which decoded are clean but **not** that the stream is complete. `PACKET_MMAP` would be needed before trusting it for a loss comparison.
 - Deframer/decode tooling: `libre/tools/ml-rf-udp/` (README has the byte-level layout).
 
 ## The video-start chain (all steps required, in order)
