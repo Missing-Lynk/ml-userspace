@@ -79,10 +79,16 @@ $(eval $(call daemon_rule,ml-rfcmd,linux-headers,))
 CHECK_CFLAGS := -O1 -Wall -Wextra -Werror
 
 .PHONY: check
-check: $(BUILD)/msp-canvas-roundtrip $(BUILD)/air-power-standby $(BUILD)/mp-params-reply
+check: $(BUILD)/msp-canvas-roundtrip $(BUILD)/air-power-standby $(BUILD)/mp-params-reply \
+       $(BUILD)/bb-frame-builders $(BUILD)/air-rate-governor $(BUILD)/rx-scan-decode \
+       $(BUILD)/mp-frame-builders
 	$(BUILD)/msp-canvas-roundtrip
 	$(BUILD)/air-power-standby
 	$(BUILD)/mp-params-reply
+	$(BUILD)/bb-frame-builders
+	$(BUILD)/air-rate-governor
+	$(BUILD)/rx-scan-decode
+	$(BUILD)/mp-frame-builders
 
 $(BUILD)/msp-canvas-roundtrip: tests/msp-canvas-roundtrip.c ml-linkd/ml-msp.c \
                                ml-hud/src/osd/msp_canvas.c | $(BUILD)
@@ -94,6 +100,20 @@ $(BUILD)/air-power-standby: tests/air-power-standby.c ml-linkd/ml-air-power.c | 
 # Header-only: mp-cmd.h is all inline, so the test needs no other translation unit.
 $(BUILD)/mp-params-reply: tests/mp-params-reply.c ml-linkd/mp-cmd.h | $(BUILD)
 	gcc $(CHECK_CFLAGS) -o $@ tests/mp-params-reply.c
+
+$(BUILD)/mp-frame-builders: tests/mp-frame-builders.c ml-linkd/mp-cmd.h | $(BUILD)
+	gcc $(CHECK_CFLAGS) -o $@ tests/mp-frame-builders.c
+
+# Header-only for the same reason: bb-cmd.h is all inline builders plus the length table.
+$(BUILD)/bb-frame-builders: tests/bb-frame-builders.c ml-linkd/bb-cmd.h | $(BUILD)
+	gcc $(CHECK_CFLAGS) -o $@ tests/bb-frame-builders.c
+
+$(BUILD)/air-rate-governor: tests/air-rate-governor.c ml-linkd/ml-air-rate.c | $(BUILD)
+	gcc $(CHECK_CFLAGS) -o $@ $^
+
+# ml-rx-chan.c pulls in the SNR conversion (libm) and the scan table's lock (pthread).
+$(BUILD)/rx-scan-decode: tests/rx-scan-decode.c ml-linkd/ml-rx-chan.c | $(BUILD)
+	gcc $(CHECK_CFLAGS) -o $@ $^ -lm -pthread
 
 $(BUILD)/ml-msp-echo: ml-msp-echo/ml-msp-echo.c ml-linkd/ml-msp.c ml-linkd/ml-msp.h | $(BUILD)
 	docker run --rm --platform linux/arm64 -v $(REPO):/w -w /w \
