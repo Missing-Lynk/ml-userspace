@@ -24,9 +24,24 @@ static guint g_pool_timer;          /* periodic session-pool cleanup source */
 static GMutex g_lock;
 static GstAppSrc *g_media_src;      /* the shared live media's appsrc, NULL = no prepared media */
 static gboolean g_wait_key;         /* hold AUs until the next IRAP (fresh media / re-sync) */
-static GstBuffer *g_params;         /* cached parameter-set prefix (VPS/SPS/PPS), byte-stream */
 static int g_h264 = -1;             /* codec latch: -1 unset, else ML_DVR_CODEC resolution */
 static guint64 g_pushed, g_dropped;
+
+/* Parameter-set cache. One slot per kind (H.265 VPS/SPS/PPS, H.264 SPS/PPS in slots 1 and 2),
+ * because the encoder may deliver them AU-aligned in one buffer or one NAL per buffer: a single
+ * cached prefix keeps only whichever kind arrived last, and a payloader fed one PPS never
+ * negotiates caps, so the media never leaves PREPARING and every DESCRIBE times out.
+ * g_params is their concatenation, rebuilt whenever a slot changes, and is what gets pushed.
+ */
+#define PS_SLOTS 3
+
+struct ps_range {
+    gsize off, len;                 /* within the scanned buffer; len 0 = this kind not present */
+};
+
+static guint8 *g_ps[PS_SLOTS];
+static gsize g_ps_len[PS_SLOTS];
+static GstBuffer *g_params;         /* cached parameter-set prefix, byte-stream */
 
 /* Same codec resolution as rec_start: ML_DVR_CODEC=h264/avc selects H.264, else H.265. */
 static gboolean codec_is_h264(void)
@@ -36,18 +51,24 @@ static gboolean codec_is_h264(void)
     return codec && (strcasecmp(codec, "h264") == 0 || strcasecmp(codec, "avc") == 0);
 }
 
-/* Scan a byte-stream AU up to its first VCL NAL. Reports whether the picture is an IRAP (H.265
- * BLA/IDR/CRA, H.264 IDR) and the byte length of a leading parameter-set prefix (VPS/SPS/PPS
- * NALs from the start of the AU; 0 = the AU does not open with parameter sets). alignment=au
- * means one picture per buffer, so the first VCL NAL decides the key property.
+/* Scan a byte-stream buffer up to its first VCL NAL. Reports whether the picture is an IRAP
+ * (H.265 BLA/IDR/CRA, H.264 IDR), the byte length of a leading parameter-set prefix (0 = the
+ * buffer does not open with parameter sets), and the extent of each parameter-set kind found
+ * (@p ps, indexed by PS slot; len 0 = absent). Parameter sets precede the picture, so the scan
+ * stops at the first VCL NAL and that NAL decides the key property.
  */
-static void au_scan(const guint8 *p, gsize n, gboolean h264, gboolean *key, gsize *param_len)
+static void au_scan(const guint8 *p, gsize n, gboolean h264, gboolean *key, gsize *param_len,
+                    struct ps_range ps[PS_SLOTS])
 {
-    gsize i = 0;
+    gsize i = 0, prev_start = 0;
     gboolean in_prefix = TRUE;
+    int prev_slot = -1;
 
     *key = FALSE;
     *param_len = 0;
+    for (int s = 0; s < PS_SLOTS; s++) {
+        ps[s].len = 0;
+    }
 
     while (i + 3 < n) {
         /* next 00 00 01 start code (a 4-byte 00 00 00 01 lands here via its inner 3 bytes) */
@@ -59,21 +80,29 @@ static void au_scan(const guint8 *p, gsize n, gboolean h264, gboolean *key, gsiz
         /* start of this NAL including its (3- or 4-byte) start code */
         gsize nal_start = (i > 0 && p[i - 1] == 0) ? i - 1 : i;
         guint8 nal_header = p[i + 3];
-        gboolean param, vcl, irap;
+        gboolean vcl, irap;
+        int slot;
 
         if (h264) {
             guint8 nal_type = nal_header & 0x1f;
-            param = nal_type == 7 || nal_type == 8;
+            slot = nal_type == 7 ? 1 : (nal_type == 8 ? 2 : -1);
             vcl = nal_type >= 1 && nal_type <= 5;
             irap = nal_type == 5;
         } else {
             guint8 nal_type = (nal_header >> 1) & 0x3f;
-            param = nal_type >= 32 && nal_type <= 34;
+            slot = nal_type >= 32 && nal_type <= 34 ? (int)(nal_type - 32) : -1;
             vcl = nal_type < 32;
             irap = nal_type >= 16 && nal_type <= 21;
         }
 
-        if (in_prefix && !param) {
+        /* the pending parameter-set NAL ends where this one begins */
+        if (prev_slot >= 0) {
+            ps[prev_slot].off = prev_start;
+            ps[prev_slot].len = nal_start - prev_start;
+            prev_slot = -1;
+        }
+
+        if (in_prefix && slot < 0) {
             in_prefix = FALSE;
             /* the prefix ends where the first non-parameter-set NAL starts */
             *param_len = nal_start;
@@ -84,13 +113,51 @@ static void au_scan(const guint8 *p, gsize n, gboolean h264, gboolean *key, gsiz
             return;
         }
 
+        prev_slot = slot;
+        prev_start = nal_start;
         i += 4;
     }
 
-    /* no VCL NAL found: a pure parameter-set AU - cache it whole */
+    /* ran off the end with no VCL NAL: close the pending parameter set against the buffer end */
+    if (prev_slot >= 0) {
+        ps[prev_slot].off = prev_start;
+        ps[prev_slot].len = n - prev_start;
+    }
+
     if (in_prefix) {
         *param_len = n;
     }
+}
+
+/* Rebuild the pushed prefix from the per-kind cache, in VPS/SPS/PPS order. Call under g_lock. */
+static void ps_rebuild(void)
+{
+    gsize total = 0, at = 0;
+    guint8 *flat;
+
+    for (int s = 0; s < PS_SLOTS; s++) {
+        total += g_ps_len[s];
+    }
+
+    if (g_params) {
+        gst_buffer_unref(g_params);
+        g_params = NULL;
+    }
+
+    if (total == 0) {
+        return;
+    }
+
+    flat = g_malloc(total);
+    for (int s = 0; s < PS_SLOTS; s++) {
+        if (g_ps_len[s] > 0) {
+            memcpy(flat + at, g_ps[s], g_ps_len[s]);
+            at += g_ps_len[s];
+        }
+    }
+
+    g_params = gst_buffer_new_memdup(flat, total);
+    g_free(flat);
 }
 
 /* Kick the encoder for an IRAP so a freshly prepared media (or a post-rebuild resume) does not
@@ -295,6 +362,7 @@ void rtsp_set(struct ctx *c, gboolean on)
 void rtsp_push(struct ctx *c, GstBuffer *au)
 {
     GstMapInfo map;
+    struct ps_range ps[PS_SLOTS];
     gboolean key = FALSE;
     gsize param_len = 0;
 
@@ -306,14 +374,26 @@ void rtsp_push(struct ctx *c, GstBuffer *au)
         return;
     }
 
-    au_scan(map.data, map.size, g_h264 == 1, &key, &param_len);
-    if (param_len > 0) {
+    au_scan(map.data, map.size, g_h264 == 1, &key, &param_len, ps);
+    {
+        gboolean changed = FALSE;
+
         g_mutex_lock(&g_lock);
-        if (g_params) {
-            gst_buffer_unref(g_params);
+        for (int s = 0; s < PS_SLOTS; s++) {
+            if (ps[s].len == 0) {
+                continue;
+            }
+
+            g_free(g_ps[s]);
+            g_ps[s] = g_memdup2(map.data + ps[s].off, ps[s].len);
+            g_ps_len[s] = ps[s].len;
+            changed = TRUE;
         }
 
-        g_params = gst_buffer_new_memdup(map.data, param_len);
+        if (changed) {
+            ps_rebuild();
+        }
+
         g_mutex_unlock(&g_lock);
     }
 
@@ -335,12 +415,18 @@ void rtsp_push(struct ctx *c, GstBuffer *au)
             return;
         }
 
-        /* fresh media: lead with the cached parameter sets unless this AU carries its own */
-        if (g_params && param_len == 0) {
-            gst_app_src_push_buffer(g_media_src, gst_buffer_copy(g_params));
-        }
-
         g_wait_key = FALSE;
+    }
+
+    /* Lead every IRAP with the cached parameter sets, unless the AU carries its own. The
+     * payloader has no caps, and so the media no SDP, until the parser has seen VPS/SPS/PPS;
+     * the encoder emits them once, in its first AU; and the media's appsrc is bounded and
+     * leaky, so a set pushed while the media is still being prepared can be dropped before
+     * the parser consumes it. Repeating them on each IRAP bounds that loss to one GOP
+     * instead of the life of the media.
+     */
+    if (key && param_len == 0 && g_params) {
+        gst_app_src_push_buffer(g_media_src, gst_buffer_copy(g_params));
     }
 
     /* metadata-only copy (shares the AU's memory); PTS cleared so do-timestamp restamps */
