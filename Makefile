@@ -24,6 +24,10 @@
 REPO  := $(abspath .)
 BUILD := $(REPO)/build
 
+# `all` is the goal for a bare `make`, stated because the first target below is the version-header
+# rule, and make's own default is the first target in the file.
+.DEFAULT_GOAL := all
+
 # Software version string embedded in ml-linkd (used as the air unit's fw_version); overridable.
 # Written to ml-linkd/version.h and rewritten only when it changes, so it never forces a rebuild.
 ML_VERSION ?= $(shell git -C $(REPO) describe --tags --always --dirty 2>/dev/null || echo dev)
