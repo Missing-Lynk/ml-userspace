@@ -25,7 +25,7 @@ Boundaries of the measurement:
 - `rx` is the FIRST datagram of the frame, so the arrival of the remaining datagrams is inside the measurement.
 - The flip event is the scanout latch. The panel then scans top to bottom over one refresh period, and the LCD adds its response time; both are constants common to any stack on this hardware.
 
-`glue/dev/ab-report.py` aggregates the summary lines (plus `stats.csv` / `threads.csv` from ml-logd) into the M1-M6 metrics and compares two run sets; see `plans/video-latency-and-load.md` for the metric definitions.
+`glue/dev/ab-report.py` aggregates the summary lines (plus `stats.csv` / `threads.csv` from ml-logd) into the M1-M6 metrics and compares two run sets; see `plans/done/video-latency-and-load.md` for the metric definitions.
 
 ## Stage breakdown (run-0104 medians)
 

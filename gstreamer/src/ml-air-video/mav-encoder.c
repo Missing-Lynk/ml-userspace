@@ -328,8 +328,25 @@ int air_enc_open(struct air_tile *tile, const char *dev, int fps)
                  atoi(air_env_or("ML_AIR_MINQP", "15")), "min qp");
     air_enc_ctrl(tile, V4L2_CID_MPEG_VIDEO_HEVC_MAX_QP,
                  atoi(air_env_or("ML_AIR_MAXQP", "51")), "max qp");
-    tile->enc_qp = atoi(air_env_or("ML_AIR_IQP", "30"));
+
+    /* The QP the first intra picture of the instance is coded at, and the reason the first IDR of
+     * a session is the largest access unit the link ever carries. Rate control has no history at
+     * picture 0, so wave5 opens with initial_rc_qp -1 and the firmware codes that picture at
+     * intra_qp; from picture 1 the loop takes over. The vendor's own default template carries
+     * intraQP 35 (ar_video_h26x_enc_exe_gen_default_param in libmpp_service.so; the recovered
+     * table is in docs/air-video-benchmark.md) and its session-opening IDR measures exactly QP 35
+     * on the wire, so 35 is the vendor's value rather than an inference from it. Read it back off
+     * a dump with glue/capture/hevc-slice-qp.py.
+     */
+    tile->enc_qp = atoi(air_env_or("ML_AIR_IQP", "35"));
     air_enc_ctrl(tile, V4L2_CID_MPEG_VIDEO_HEVC_I_FRAME_QP, tile->enc_qp, "i frame qp");
+
+    /* Vendor chromaCbQpOffset / chromaCrQpOffset, both -2. One control drives both, and the
+     * driver registers it under its H.264 name for every codec it offers.
+     */
+    air_enc_ctrl(tile, V4L2_CID_MPEG_VIDEO_H264_CHROMA_QP_INDEX_OFFSET,
+                 atoi(air_env_or("ML_AIR_CHROMAQP", "-2")), "chroma qp offset");
+
     memset(&rb, 0, sizeof rb);
     rb.type = otype;
     rb.memory = V4L2_MEMORY_DMABUF;

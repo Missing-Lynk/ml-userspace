@@ -8,7 +8,7 @@ The FC's Betaflight/INAV OSD arrives over **standard MSP DisplayPort**, `libvtxf
 
 **Vendor-specific (our RE, the body of this doc):** the Artosyn SHM canvas packing that `GetOsdContext` returns (the `b6 03` length-chained records), the GetOsdContext call/SHM, and the fact that the **menu** (not `ar_lowdelay`) must render it. From RE of `ar_lowdelay` / `test_uidesign` / `libvtxfc` + on-device captures.
 
-This doc describes the canvas as a **consumer** sees it. The producing side (the air unit polling a Betaflight FC over MSP on a serial port, packing the canvas, and relaying it as a `0x10` frame) is reverse-engineered in `plans/air-fc-msp-link.md`; the format below is what such an implementation has to emit.
+This doc describes the canvas as a **consumer** sees it. The producing side (the air unit polling a Betaflight FC over MSP on a serial port, packing the canvas, and relaying it as a `0x10` frame) is reverse-engineered in `plans/done/air-fc-msp-link.md`; the format below is what such an implementation has to emit.
 
 Confidence tags: **[confirmed]** (decoded cleanly + reproduces known text), **[inferred]**, **[open]**.
 

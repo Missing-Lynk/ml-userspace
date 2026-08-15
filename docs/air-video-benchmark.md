@@ -56,6 +56,44 @@ Its distribution is also remarkably flat. The IDR is 1.7x the mean P-frame. For 
 
 **So the ceiling is not a protocol problem.** It is a question of matching the vendor's per-frame budget, and the synthetic tiers' peaks do not predict camera behaviour.
 
+### The vendor's encoder open parameters, recovered field by field
+
+Everything below the channel attr and the rcParam override comes from one place. The MPP service builds every encoder channel from a default block filled by `ar_video_h26x_enc_exe_gen_default_param` (`libmpp_service.so` `0xa59b8`), which copies a rodata template at `0x304f20`..`0x30506f` into the channel object at `+0x1e90` in sixteen-byte chunks, then lets an environment variable override any field. Each field is named by that function's own log line, so the offset-to-name map is read out of the code rather than guessed: every `<name> is %d` format string is paired with the `ldr w6, [x19, #offset]` that feeds it. The template is not copied contiguously - three chunks are stored twice and three are zeroed - so the copy order has to be followed to read a value, not the rodata order.
+
+Three independent checks that the map is right: `nrIntraWeightY/Cb/Cr` read 7/7/7 and `nrInterWeightY/Cb/Cr` read 4/4/4, which are exactly the values mainline hardcodes; `initialRcQp` reads -1, matching the `s32FirstFrameStartQp` recovered separately from the rcParam print sequence; and `intraQP` reads 35, matching the QP measured off the wire in the vendor capture (below).
+
+| field | vendor | open driver | note |
+|---|---:|---|---|
+| `intraQP` | **35** | `hevc_i_frame_qp`, driver default 30 | QP of the first intra picture |
+| `initialRcQp` | -1 | -1 when RC is on | firmware picks the RC start QP |
+| `hvsQpScale` | 2 | 2, hardcoded | agrees |
+| `hvsMaxDeltaQp` | **4** | **10**, hardcoded | closed in patch `0280` |
+| `rcWeightParam` | 16 | 16, hardcoded | agrees |
+| `rcWeightBuf` | **1** | **128**, hardcoded | closed in patch `0280` |
+| `rdoSkip` | **0** | **1**, hardcoded | closed in patch `0280` |
+| `lambdaScalingEnable` | **0** | **1**, hardcoded | closed in patch `0280` |
+| `tmvpEnable` | **1** | **0**, never written | closed in patch `0280` |
+| `maxNumMerge` | **2** | **0**, never written | field takes 1 or 2; closed in patch `0280` |
+| `chromaCbQpOffset` / `chromaCrQpOffset` | **-2** | **0** | one control, `h264_chroma_qp_index_offset`; set by `ml-air-video` |
+| `gopPresetIdx` | 9 | `PRESET_IDX_IPP_SINGLE` = 9 | agrees |
+| `cuSizeMode` | 7 | `fixed_cu_size_mode` = 0x7 | agrees |
+| `skipIntraTrans` | 1 | 1, hardcoded | agrees |
+| `intraNxNEnable` | 1 | 1, hardcoded | agrees |
+| `saoEnable` / `disableDeblk` / `lfCrossSliceBoundaryEnable` | 1 / 0 / 1 | `hevc_loop_filter_mode` default | agrees |
+| `cuLevelRCEnable` / `hvsQPEnable` / `mbLevelRcEnable` | 1 / 1 / 1 | `mb_rc_enable` sets all three | agrees, and `ml-air-video` sets it |
+| `useRecommendEncParam` | 0 | not present | so the explicit `rdoSkip` 0 stands |
+| `vbvBufferSize` | 2000 | `vbv_size`, derived per bitrate | ours is deliberately tighter |
+| `intraQpOffset` | -5 | **not in the driver struct** | no register write, no control |
+| `bitAllocMode` / `roiEnable` / `s2fmeDisable` / `coefClearDisable` | 0 / 0 / 0 / 0 | not present | all zero, so nothing to close |
+| `minQpI` / `maxQpI` | 1 / 50 | `hevc_min_qp` / `hevc_max_qp` | template only; `stVencTxMap` overrides to 15 / 51 |
+| `level` | 0 | forced to `LEVEL_4` | 0 lets the firmware derive it, and it derives 120, which is what we force |
+| `bitRate` | 7168 | `video_bitrate` | template only; the air derives its own from RF MCS |
+| `picWidth` / `picHeight` / `frameRate` | 1920 / 1080 / 30 | per instance | template only |
+
+**`hvsQpScale` disagrees with the rcParam reading above**, which records 4 against this template's 2. The two came from different structs by different methods; this one is anchored by the three checks above and the rcParam one is not, so the driver keeps 2 and the question is open. Both agree `hvsMaxDeltaQp` is 4.
+
+**`intraQP` is the first-IDR lever.** With `initialRcQp` at -1 the first intra picture of an instance is coded at `intraQP`, because rate control has no history to work from at picture 0. The vendor's template value 35 and its measured wire QP 35 are the same number, which is what makes this a recovered value rather than an inference. See `plans/first-idr-size.md`.
+
 ### Vendor encoder configuration, from the blob
 
 Two different vendor encoders are described below and they do **not** share a QP floor. `venc8` is the
@@ -92,7 +130,7 @@ Three consequences.
 
 **CU-level rate control is confirmed parity**, not an improvement. It was enabled on inference and cut peak access-unit size 6.2x on `detail`; the vendor default turns out to be 1. The aggregate control is coarser than the vendor's three separate fields, but every field it sets matches.
 
-**HVS QP scale and max delta are a real parity gap, still open.** The driver hardcodes 2 and 10 in `wave5_set_enc_openparam`; the vendor uses 4 and 4. Because there is one correct value per field on this hardware, the fix belongs in the driver rather than in a new control. Not yet written, so no measurement above reflects it.
+**HVS max delta was a real parity gap, now closed in the driver.** The driver hardcoded 10 in `wave5_set_enc_openparam` against the vendor's 4, and patch `0280` sets it to 4 along with five other fields that have no control (see "The vendor's encoder open parameters, recovered"). No measurement in this document was taken with any of them. The scale is a different matter: this table reads 4 and the open-parameter template reads 2, the two readings are not reconciled, and the driver keeps 2.
 
 **Iprop is retired as the explanation for the vendor's flat peak-to-mean.** The service stores and returns the pair but nothing on this path consumes it (call chain in `venc-api.md`); the host-side VBR helper reads a different pair of slots. It is public API state the service preserves, not a rate-allocation input. Whatever flattens the vendor's peak, it is not this.
 
