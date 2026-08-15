@@ -61,6 +61,10 @@
 
 #define AIR_IDR_MIN_GAP_MS 500             /* floor between forced keyframes */
 
+/* Gap separating two :20001 hello episodes: the probes within one establishment repeat faster than
+ * this, a receiver that reappears has been quiet for longer. */
+#define AIR_HELLO_EPISODE_MS 5000
+
 /* Keyframe-on-request state. */
 struct air_idr {
     long last_ms;           /* when we last forced one, 0 = never */
@@ -367,19 +371,9 @@ static void air_on_params(const struct air_msg_ctx *c, const uint8_t *dgram, ssi
                                    c->stamp_us),
                    MSG_DONTWAIT, (struct sockaddr *)c->tx->dst, sizeof *c->tx->dst);
 
-            /* A params request means a receiver is establishing a session. A goggle that has
-             * power-cycled restarts its clock at zero while our VPH timestamp carries on from the
-             * previous session - measured 31 s ahead, which its constant-frame-rate stage rejects
-             * frame by frame ("incorrect PTS %u, current time %u") with every decode counter
-             * healthy: IDRs accepted, no invalid frame, no pipeline reset, black panel.
-             *
-             * A no-op unless transmit is armed, so the repeats a waiting receiver sends cost
-             * nothing and a content receiver sends none. Not hung off the :10000 silence window,
-             * where a vendor goggle goes quiet on a healthy link. The vendor restarts its session
-             * the same way: AR_FSM_TX_ProcessIdrRequest runs PIPELINE_Start from not-streaming.
-             *
-             * Best effort: ml-air-video need not be running (RF-only and bench builds). */
-            air_ctrl_send("session-reset\n");
+            /* Keepalive, not a session event: the receiver polls this every 2 s for the whole
+             * session whether or not it has video (ml-rx-udp.c :10000 poll). The session reset is
+             * on the :20001 hello. */
 
             if (g_verbose) {
                 fprintf(stderr, TAG " rx MEDIA_PARAMS_REQUEST -> reply\n");
@@ -433,7 +427,7 @@ void air_main(const char *hw_version, const char *fc_tty, enum ml_rate_mode rate
     struct air_udp_tx status_tx = { .sock = status_sock, .dst = &goggle_status,
                                     .bound = &status_bound };
     struct ml_msp msp;
-    long last_a = 0, last_b = 0;
+    long last_a = 0, last_b = 0, last_hello = 0;
     int msp_warned = 0;
     int one = 1;
 
@@ -546,11 +540,34 @@ void air_main(const char *hw_version, const char *fc_tty, enum ml_rate_mode rate
          * with byte[0]=0x01 (the type-1 identity); the goggle replies with the byte[0]=0x02 ACK. */
         for (int got = 0; hello_bound && got < AIR_RX_BURST_MAX &&
              (n = recvfrom(hello_sock, rx, sizeof rx, MSG_DONTWAIT, NULL, NULL)) > 0; got++) {
-            if (rx[0] == 0x00) {
-                rx[0] = 0x01;
-                sendto(hello_sock, rx, n, MSG_DONTWAIT,
-                       (struct sockaddr *)&goggle_hello, sizeof goggle_hello);
+            if (rx[0] != 0x00) {
+                continue;
             }
+
+            /* A hello opens a receiver session, and marks nothing else: the probe repeats until
+             * answered, then stops for the rest of the session (ml-rx-udp.c, g_hs_done).
+             *
+             * A receiver starts its clock at zero while our VPH timestamp carries on from the
+             * previous session, which its constant-frame-rate stage rejects frame by frame
+             * ("incorrect PTS %u, current time %u"). The reset rebases the timestamp.
+             *
+             * Edge-triggered per episode, and air_tx_session_reset is a no-op while transmit is
+             * unarmed, so it acts only on a receiver that reappears mid-stream.
+             *
+             * Best effort: ml-air-video need not be running (RF-only and bench builds). */
+            if (now - last_hello > AIR_HELLO_EPISODE_MS) {
+                air_ctrl_send("session-reset\n");
+
+                if (g_verbose) {
+                    fprintf(stderr, TAG " rx :20001 hello -> session reset\n");
+                }
+            }
+
+            last_hello = now;
+
+            rx[0] = 0x01;
+            sendto(hello_sock, rx, n, MSG_DONTWAIT,
+                   (struct sockaddr *)&goggle_hello, sizeof goggle_hello);
         }
 
         /* Service the goggle's :10000 datagrams. */

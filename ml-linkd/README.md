@@ -8,7 +8,7 @@ Association is autonomous from the `artosyn_sdio` insmod config, so in the stead
 
 - Reads the two SoC sensors over IIO: battery voltage from the SAR ADC (`artosyn-adc`, channel 1, `in_voltage1_input` x the board divider) and the junction temperature from the SoC sensor (`temperature`, `in_temp_scale`). Both are resolved by IIO device name and retried until the modules have coldplugged.
 - Transmits the `:10000` status frames to the goggle (10.0.0.1): `0x11` periodic (voltage, ~6 Hz) and `0x09` version/info (hw/fw strings + voltage + temperature, ~1 Hz).
-- Answers the goggle's `:20001` identity probe (mirrors the 520-byte type-0 datagram back with `byte[0]=0x01`).
+- Answers the goggle's `:20001` identity probe (mirrors the 520-byte type-0 datagram back with `byte[0]=0x01`), and asks `ml-air-video` for a `session-reset` on the first probe of an establishment. The probe marks a new receiver session, which the reset serves by rebasing the VPH timestamp for a receiver whose clock starts at zero. Edge-triggered per episode, and a no-op unless transmit is armed.
 - Answers the goggle's `:10000` type-1 MEDIA_PARAMS_REQUEST with a type-2 reply. The goggle gates its solid-green LED, its IDR request and its video-stall watch on this reply. The reply is 92 bytes: the 20-byte header declaring a `0x48` body, then geometry, frame rate and the source-ready word. A vendor receiver checks that declared length and drops anything else, and refuses to start its pipeline while the source-ready word is zero; our own goggle reads none of it. Field map and citations in `docs/rf-video-downlink.md` step 7, layout asserted by `tests/mp-params-reply.c`.
 - Answers the goggle's `:10000` type-3 MEDIA_IDR_REQUEST by forcing a keyframe through `ml-air-video`'s control socket. The stream carries one IDR at FrameId 0 and P-frames after, so this is how a receiver that joined later gets a decodable entry point. At most one forced keyframe per 500 ms.
 
@@ -103,7 +103,7 @@ Port `0x0c` polling must not start before `OPEN`; sending it during association 
 ### UDP (`sdio0`, RX = 10.0.0.1, TX = 10.0.0.100)
 
 - `:20001` - 3-way hello: 520 B type-0 at ~3 Hz; on the TX unit's type-1 identity, reply with the same packet, `byte[0]=0x02`, `byte[5]=0x00`. Hello stops once done.
-- `:10000` - params handshake: 24 B type-1 request every 2 s (timestamp at offset 8); on the TX unit's type-2 reply, send the 24 B type-3 MEDIA_IDR_REQUEST. Video on `:10001` starts after the type-3, which the TX unit answers with a keyframe (`mp-cmd.h`, `mp_idr_request`). Sent while video is unconfirmed; stops once the consumer reports composed frames.
+- `:10000` - params handshake: 24 B type-1 request every 2 s (timestamp at offset 8); on the TX unit's type-2 reply, send the 24 B type-3 MEDIA_IDR_REQUEST. Video on `:10001` starts after the type-3, which the TX unit answers with a keyframe (`mp-cmd.h`, `mp_idr_request`). The **type-3** is sent while video is unconfirmed and stops once the consumer reports composed frames. The **type-1** polls for the whole session: it is the keepalive that keeps `:10000` RX fresh, so the TX unit changes no state on it.
 - `:10000` - telemetry RX (u32 LE message type at offset 0): `0x10` = MSP DisplayPort, `0x09`/`0x11` = binary status. Republished over the IPC sockets below.
 
 ### Consumer-ready gate
