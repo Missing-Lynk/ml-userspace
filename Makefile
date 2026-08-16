@@ -6,6 +6,7 @@
 #   make ledd       just ml-ledd
 #   make msp-echo   just the passive FC UART test tool
 #   make rfcmd      just the RF command sender (drives ml-linkd's link.sock from a shell)
+#   make aed        just the auto-exposure daemon (air unit only)
 #   make gst        HOST/SD-CARD ONLY: dynamically linked gstreamer binaries (gstreamer/src/build.sh)
 #                   -> gstreamer/build/bin/. These CANNOT run on a device rootfs: there is no
 #                   GStreamer or glib installed there, so they die with "symbol not found".
@@ -52,12 +53,13 @@ DEV_HAS_FC_LINK  ?= 0
 all: daemons gst gst-static hud font
 
 daemons:    $(BUILD)/ml-linkd $(BUILD)/ml-ledd $(BUILD)/ml-rf-bringup $(BUILD)/ml-msp-echo \
-            $(BUILD)/ml-rfcmd
+            $(BUILD)/ml-rfcmd $(BUILD)/ml-aed
 linkd:      $(BUILD)/ml-linkd
 ledd:       $(BUILD)/ml-ledd
 rf-bringup: $(BUILD)/ml-rf-bringup
 msp-echo:   $(BUILD)/ml-msp-echo
 rfcmd:      $(BUILD)/ml-rfcmd
+aed:        $(BUILD)/ml-aed
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -78,6 +80,17 @@ $(eval $(call daemon_rule,ml-ledd,linux-headers,))
 $(eval $(call daemon_rule,ml-rf-bringup,linux-headers,))
 $(eval $(call daemon_rule,ml-rfcmd,linux-headers,))
 
+# Not daemon_rule: it needs -lm for log10f, and the macro's flag slot sits BEFORE the translation
+# unit, where a static link drops the library as unreferenced. It also does not include
+# ml-shared/mlm.h, so the macro's dependency on that header would be a lie.
+$(BUILD)/ml-aed: ml-aed/ml-aed.c ml-aed/ml-aed-core.c ml-aed/ml-aed-core.h \
+                 ml-aed/ml-aed-exptable.h | $(BUILD)
+	docker run --rm --platform linux/arm64 -v $(REPO):/w -w /w \
+	  alpine:3.24 sh -euc 'apk add -q build-base linux-headers; \
+	    gcc -O2 -Wall -static -o build/ml-aed \
+	      ml-aed/ml-aed.c ml-aed/ml-aed-core.c -lm'
+	@ls -la $@
+
 # Host tests. Built with the host compiler and run here, not cross-built: they exercise pure logic
 # against checked-in captures, so they need no device, no docker and no hardware.
 CHECK_CFLAGS := -O1 -Wall -Wextra -Werror
@@ -86,7 +99,7 @@ CHECK_CFLAGS := -O1 -Wall -Wextra -Werror
 check: $(BUILD)/msp-canvas-roundtrip $(BUILD)/air-power-standby $(BUILD)/mp-params-reply \
        $(BUILD)/bb-frame-builders $(BUILD)/air-rate-governor $(BUILD)/rx-scan-decode \
        $(BUILD)/mp-frame-builders $(BUILD)/rx-1v1-decode \
-       $(BUILD)/msp-parser
+       $(BUILD)/msp-parser $(BUILD)/ae-decision
 	$(BUILD)/msp-canvas-roundtrip
 	$(BUILD)/air-power-standby
 	$(BUILD)/mp-params-reply
@@ -96,6 +109,7 @@ check: $(BUILD)/msp-canvas-roundtrip $(BUILD)/air-power-standby $(BUILD)/mp-para
 	$(BUILD)/mp-frame-builders
 	$(BUILD)/rx-1v1-decode
 	$(BUILD)/msp-parser
+	$(BUILD)/ae-decision
 
 $(BUILD)/msp-canvas-roundtrip: tests/msp-canvas-roundtrip.c ml-linkd/ml-msp.c \
                                ml-hud/src/osd/msp_canvas.c | $(BUILD)
@@ -127,6 +141,10 @@ $(BUILD)/rx-1v1-decode: tests/rx-1v1-decode.c ml-linkd/ml-rx-chan.c | $(BUILD)
 
 $(BUILD)/msp-parser: tests/msp-parser.c ml-linkd/ml-msp.c | $(BUILD)
 	gcc $(CHECK_CFLAGS) -o $@ $^
+
+# The AE decision law, the half of ml-aed that touches no file descriptors. -lm for log10f.
+$(BUILD)/ae-decision: tests/ae-decision.c ml-aed/ml-aed-core.c | $(BUILD)
+	gcc $(CHECK_CFLAGS) -o $@ $^ -lm
 
 $(BUILD)/ml-msp-echo: ml-msp-echo/ml-msp-echo.c ml-linkd/ml-msp.c ml-linkd/ml-msp.h | $(BUILD)
 	docker run --rm --platform linux/arm64 -v $(REPO):/w -w /w \
