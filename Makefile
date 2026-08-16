@@ -83,12 +83,12 @@ $(eval $(call daemon_rule,ml-rfcmd,linux-headers,))
 # Not daemon_rule: it needs -lm for log10f, and the macro's flag slot sits BEFORE the translation
 # unit, where a static link drops the library as unreferenced. It also does not include
 # ml-shared/mlm.h, so the macro's dependency on that header would be a lie.
-$(BUILD)/ml-aed: ml-aed/ml-aed.c ml-aed/ml-aed-core.c ml-aed/ml-aed-core.h \
-                 ml-aed/ml-aed-exptable.h | $(BUILD)
+$(BUILD)/ml-aed: ml-aed/ml-aed.c ml-aed/ml-aed-core.c ml-aed/ml-aed-tuning.c \
+                 ml-aed/ml-aed-core.h ml-aed/ml-aed-tuning.h ml-aed/ml-aed-blob.h | $(BUILD)
 	docker run --rm --platform linux/arm64 -v $(REPO):/w -w /w \
 	  alpine:3.24 sh -euc 'apk add -q build-base linux-headers; \
 	    gcc -O2 -Wall -static -o build/ml-aed \
-	      ml-aed/ml-aed.c ml-aed/ml-aed-core.c -lm'
+	      ml-aed/ml-aed.c ml-aed/ml-aed-core.c ml-aed/ml-aed-tuning.c -lm'
 	@ls -la $@
 
 # Host tests. Built with the host compiler and run here, not cross-built: they exercise pure logic

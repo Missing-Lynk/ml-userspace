@@ -2,31 +2,40 @@
  * @file ae-decision.c
  * @brief Host test: the air unit's AE decision law, metering and actuation mappings.
  *
- * This is the replay oracle that used to be `ml-aed --selftest` inside the daemon. It drives the
- * real ml-aed-core.c, which is the half that touches no file descriptors, so it needs no device,
- * no ISP and no capture session. It asserts:
+ * Drives ml-aed-core.c, which touches no file descriptors, so this needs no device. It asserts:
  *
- *   1. the exposure table's oracle rows, including the two vendor operating points, so a
- *      regenerated ml-aed-exptable.h that moved cannot pass,
- *   2. both settled vendor points decide to stay put, which is the whole loop's resting behaviour,
- *   3. the recovered step arithmetic on synthetic lumas, including the min-step rule and the
- *      one-decision skip it arms,
+ *   1. the exposure table's oracle rows, including the two vendor operating points,
+ *   2. both settled vendor points decide to stay put,
+ *   3. the step arithmetic on synthetic lumas, the min-step rule and the one-decision skip,
  *   4. top saturation in the dark counting as settled, and the bottom clamp,
  *   5. the sensor gain-code inversion at the four validated points,
  *   6. the target curve's two clamp regions and one interpolated point,
  *   7. metering decimating the grid rather than averaging each block,
  *   8. the tone scalar staying on the band tables' axis across the whole index range.
- *
- * Two are worth the test on their own. The min-step skip is what stops the loop oscillating by one
- * index forever when the damped step truncates to zero, and asymmetric top saturation is what stops
- * the settle counter resetting every frame in the dark, which is the difference between a settled
- * reading and a permanently hunting one.
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
 
 #include "../ml-aed/ml-aed-core.h"
+
+/* The blob's own values, stated here: it is a capture artifact and not in the tree. */
+static struct ae_tuning vendor_tuning(struct mlaed_exp_entry *table, size_t len)
+{
+    struct ae_tuning t = {
+        .tolerance = 5.0f,
+        .damping = 50.0f / 256.0f,
+        .log_ladder = 77.893997f,
+        .curve = { { 20, 54 }, { 80, 54 }, { 120, 52 }, { 150, 49 }, { 200, 41 } },
+        .table = table,
+        .table_len = len,
+        .index_min = 1,
+        .index_max = (int)len - 1,
+    };
+
+    return t;
+}
+
 
 static int fail(const char *what)
 {
@@ -39,65 +48,74 @@ int main(void)
 {
     struct ae_state st;
     int step;
+    /* The three exposure-table rows the oracle asserts, at their real indices. */
+    static struct mlaed_exp_entry table[366];
+    struct ae_tuning tune;
 
-    if (mlaed_exp_table[0].gain_q8 != 256 || mlaed_exp_table[0].line_count != 1) {
+    table[0] = (struct mlaed_exp_entry){ 256, 1 };
+    table[283] = (struct mlaed_exp_entry){ 1432, 1125 };
+    table[317] = (struct mlaed_exp_entry){ 3938, 1125 };
+    table[365] = (struct mlaed_exp_entry){ 16328, 1125 };
+    tune = vendor_tuning(table, 366);
+
+    if (table[0].gain_q8 != 256 || table[0].line_count != 1) {
         return fail("table[0]");
     }
 
-    if (mlaed_exp_table[317].gain_q8 != 3938 ||
-        mlaed_exp_table[283].gain_q8 != 1432) {
+    if (table[317].gain_q8 != 3938 ||
+        table[283].gain_q8 != 1432) {
         return fail("table oracle rows 317/283");
     }
 
-    if (mlaed_exp_table[365].gain_q8 != 16328 ||
-        mlaed_exp_table[365].line_count != 1125) {
+    if (table[365].gain_q8 != 16328 ||
+        table[365].line_count != 1125) {
         return fail("table[365]");
     }
 
     /* Vendor live capture: settled at 317, luma 38.347, target 41. */
     st = (struct ae_state){ .exp_index = 317 };
-    step = ae_decide(&st, 38.347f);
+    step = ae_decide(&tune, &st, 38.347f);
     if (step != 0 || st.exp_index != 317 || st.settle_counter != 1) {
         return fail("live point should be settled");
     }
 
     /* Vendor bright capture: settled at 283, luma 45.278. */
     st = (struct ae_state){ .exp_index = 283 };
-    step = ae_decide(&st, 45.278f);
+    step = ae_decide(&tune, &st, 45.278f);
     if (step != 0 || st.exp_index != 283) {
         return fail("bright point should be settled");
     }
 
     /* Dark scene: luma 20 at 317 steps up by 4. */
     st = (struct ae_state){ .exp_index = 317 };
-    step = ae_decide(&st, 20.0f);
+    step = ae_decide(&tune, &st, 20.0f);
     if (step != 4 || st.exp_index != 321) {
         return fail("luma 20 should step +4");
     }
 
     /* Slightly bright: luma 47, damped step truncates to 0, min-step -1. */
     st = (struct ae_state){ .exp_index = 317 };
-    step = ae_decide(&st, 47.0f);
+    step = ae_decide(&tune, &st, 47.0f);
     if (step != -1 || st.exp_index != 316 || st.skip_countdown != 1) {
         return fail("luma 47 should min-step -1 and arm the skip");
     }
 
-    step = ae_decide(&st, 47.0f);
+    step = ae_decide(&tune, &st, 47.0f);
     if (step != 0 || st.exp_index != 316 || st.skip_countdown != 0) {
         return fail("armed skip should absorb the next decision");
     }
 
     /* Top saturation in the dark counts as settled. */
-    st = (struct ae_state){ .exp_index = AE_INDEX_MAX };
-    step = ae_decide(&st, 10.0f);
+    st = (struct ae_state){ .exp_index = tune.index_max };
+    step = ae_decide(&tune, &st, 10.0f);
     if (step != 0 || st.settle_counter != 1) {
         return fail("dark at the top index should settle");
     }
 
     /* Bottom clamp. */
     st = (struct ae_state){ .exp_index = 2 };
-    step = ae_decide(&st, 255.0f);
-    if (st.exp_index != AE_INDEX_MIN) {
+    step = ae_decide(&tune, &st, 255.0f);
+    if (st.exp_index != tune.index_min) {
         return fail("bottom clamp");
     }
 
@@ -119,11 +137,11 @@ int main(void)
     }
 
     /* Target curve: clamp regions and one interpolated point. */
-    if (ae_luma_target(317) != 41 || ae_luma_target(10) != 54) {
+    if (ae_luma_target(&tune, 317) != 41 || ae_luma_target(&tune, 10) != 54) {
         return fail("target curve clamps");
     }
 
-    if (ae_luma_target(100) != 53) {
+    if (ae_luma_target(&tune, 100) != 53) {
         return fail("target at 100 should interpolate to 53");
     }
 
@@ -168,7 +186,7 @@ int main(void)
     /* The two measured operating points, and the ceiling. */
     if (ae_tone_scalar_q8(283) != 283 * 256 ||
         ae_tone_scalar_q8(317) != 317 * 256 ||
-        ae_tone_scalar_q8(AE_INDEX_MAX) != AE_INDEX_MAX * 256) {
+        ae_tone_scalar_q8(tune.index_max) != tune.index_max * 256) {
         return fail("tone scalar Q8 mapping");
     }
 
@@ -177,7 +195,7 @@ int main(void)
      * it the driver clamps to the last entry silently, so selection would
      * stop long before the loop did.
      */
-    for (int i = AE_INDEX_MIN; i <= AE_INDEX_MAX; i++) {
+    for (int i = tune.index_min; i <= tune.index_max; i++) {
         int q8 = ae_tone_scalar_q8(i);
 
         if (q8 <= 0 || q8 > 550 * 256) {

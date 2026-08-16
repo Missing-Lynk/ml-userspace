@@ -1,7 +1,5 @@
 /*
- * ml-aed decision law. See ml-aed-core.h for what this half is and is not.
- *
- * Decision law:
+ * ml-aed decision law.
  *
  *      delta = luma_target - current_luma
  *      top index with delta > 0: settled, no step
@@ -22,14 +20,6 @@
 #include <math.h>
 
 #include "ml-aed-core.h"
-
-/* The five-knot luma target curve over exp_index, blob 0xba560. */
-static const struct {
-    int index;
-    int target;
-} ae_target_curve[] = {
-    { 20, 54 }, { 80, 54 }, { 120, 52 }, { 150, 49 }, { 200, 41 },
-};
 
 uint32_t mlaed_get_le32(const uint8_t *p)
 {
@@ -100,17 +90,19 @@ float ae_current_luma(float metered)
     return metered > 255.0f ? 255.0f : metered;
 }
 
-int ae_luma_target(int exp_index)
+int ae_luma_target(const struct ae_tuning *t, int exp_index)
 {
+    const typeof(t->curve[0]) *ae_target_curve = t->curve;
+
     if (exp_index <= ae_target_curve[0].index) {
         return ae_target_curve[0].target;
     }
 
-    if (exp_index >= ae_target_curve[AE_TARGET_KNOTS - 1].index) {
-        return ae_target_curve[AE_TARGET_KNOTS - 1].target;
+    if (exp_index >= ae_target_curve[MLAED_TARGET_CURVE_COUNT - 1].index) {
+        return ae_target_curve[MLAED_TARGET_CURVE_COUNT - 1].target;
     }
 
-    for (int i = 1; i < AE_TARGET_KNOTS; i++) {
+    for (unsigned int i = 1; i < MLAED_TARGET_CURVE_COUNT; i++) {
         if (exp_index < ae_target_curve[i].index) {
             int x0 = ae_target_curve[i - 1].index;
             int y0 = ae_target_curve[i - 1].target;
@@ -121,23 +113,23 @@ int ae_luma_target(int exp_index)
         }
     }
 
-    return ae_target_curve[AE_TARGET_KNOTS - 1].target;
+    return ae_target_curve[MLAED_TARGET_CURVE_COUNT - 1].target;
 }
 
-int ae_decide(struct ae_state *st, float current_luma)
+int ae_decide(const struct ae_tuning *t, struct ae_state *st, float current_luma)
 {
-    float target = (float)ae_luma_target(st->exp_index);
+    float target = (float)ae_luma_target(t, st->exp_index);
     float delta = target - current_luma;
     float log_term;
     int step;
 
-    if (st->exp_index >= AE_INDEX_MAX && delta > 0.0f) {
+    if (st->exp_index >= t->index_max && delta > 0.0f) {
         st->settle_counter++;
 
         return 0;
     }
 
-    if (fabsf(delta) <= AE_TOLERANCE) {
+    if (fabsf(delta) <= t->tolerance) {
         st->settle_counter++;
 
         return 0;
@@ -150,7 +142,7 @@ int ae_decide(struct ae_state *st, float current_luma)
     }
 
     log_term = log10f(target / current_luma);
-    step = (int)truncf(AE_DAMPING * AE_LOG_LADDER * log_term);
+    step = (int)truncf(t->damping * t->log_ladder * log_term);
     if (step == 0 && log_term != 0.0f) {
         step = log_term > 0.0f ? 1 : -1;
         st->skip_countdown = AE_MIN_STEP_SKIP;
@@ -159,12 +151,12 @@ int ae_decide(struct ae_state *st, float current_luma)
     st->settle_counter = 0;
     st->exp_index += step;
 
-    if (st->exp_index < AE_INDEX_MIN) {
-        st->exp_index = AE_INDEX_MIN;
+    if (st->exp_index < t->index_min) {
+        st->exp_index = t->index_min;
     }
 
-    if (st->exp_index > AE_INDEX_MAX) {
-        st->exp_index = AE_INDEX_MAX;
+    if (st->exp_index > t->index_max) {
+        st->exp_index = t->index_max;
     }
 
     return step;

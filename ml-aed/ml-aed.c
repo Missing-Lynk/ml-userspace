@@ -1,12 +1,10 @@
 /*
- * ml-aed: userspace auto-exposure for the air-unit camera. AE only; AWB is
- * gated off by the shipped tuning and the fixed-focus module leaves af_stats
- * disabled.
+ * ml-aed: userspace auto-exposure for the air-unit camera. AE only; AWB is gated off by the
+ * shipped tuning and the fixed-focus module leaves af_stats disabled.
  *
- * The kernel owns the interrupt path, the statistics ping-pong and the derived
- * register stages; this daemon reads statistics and writes the operating point
- * back through module parameters. The decision law itself is ml-aed-core.c,
- * which touches no file descriptors and is what tests/ae-decision.c replays.
+ * The kernel owns the interrupt path, the statistics ping-pong and the derived register stages.
+ * This daemon reads statistics and writes the operating point back through module parameters.
+ * The decision law is ml-aed-core.c.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -18,6 +16,9 @@
 #include <unistd.h>
 
 #include "ml-aed-core.h"
+
+/* Default for a hand-run; the per-board init script passes --tuning. */
+#define ML_AED_TUNING_FALLBACK "/lib/firmware/artosyn/nt99235-tuning-preview-fpv.bin"
 
 #define STATS_RAW_PATH  "/sys/kernel/debug/ar-isp/stats_raw"
 #define LADDER_ARM_PATH "/sys/kernel/debug/ar-isp/ladders"
@@ -76,9 +77,10 @@ static int write_int(const char *path, int value)
  * re-apply. The sensor driver clamps exposure at vts - 2 = 1123, two lines
  * under the table's 1125 ceiling; accepted as a 0.2% parity nit.
  */
-static int ae_actuate(const struct ae_opts *opts, int exp_index)
+static int ae_actuate(const struct ae_tuning *tune, const struct ae_opts *opts,
+              int exp_index)
 {
-    const struct mlaed_exp_entry *e = &mlaed_exp_table[exp_index];
+    const struct mlaed_exp_entry *e = &tune->table[exp_index];
     unsigned int code = ae_sensor_gain_code(e->gain_q8);
     int ret;
 
@@ -174,7 +176,7 @@ static int read_stats(uint8_t *buf)
     return -EAGAIN;
 }
 
-static int run_loop(const struct ae_opts *opts)
+static int run_loop(const struct ae_tuning *tune, const struct ae_opts *opts)
 {
     struct ae_state st = {
         .exp_index = opts->start_index,
@@ -195,7 +197,7 @@ static int run_loop(const struct ae_opts *opts)
      * 326. Reading the state back instead cannot work, because the gain code
      * is quantised and many indices share one code.
      */
-    ret = ae_actuate(opts, st.exp_index);
+    ret = ae_actuate(tune, opts, st.exp_index);
     if (ret) {
         fprintf(stderr, "ml-aed: initial actuate: %s\n", strerror(-ret));
         free(buf);
@@ -225,7 +227,7 @@ static int run_loop(const struct ae_opts *opts)
 
         luma = ae_current_luma(ae_metered_luma(buf + 4));
         prev = st.exp_index;
-        ae_decide(&st, luma);
+        ae_decide(tune, &st, luma);
         if (opts->max_step && abs(st.exp_index - prev) > opts->max_step) {
             st.exp_index = st.exp_index > prev ?
                 prev + opts->max_step : prev - opts->max_step;
@@ -245,14 +247,14 @@ static int run_loop(const struct ae_opts *opts)
         if (step || opts->verbose) {
             printf("seq %u luma %.3f target %d index %d step %d settle %u%s\n",
                    (unsigned int)seq, (double)luma,
-                   ae_luma_target(st.exp_index), st.exp_index,
+                   ae_luma_target(tune, st.exp_index), st.exp_index,
                    step, st.settle_counter,
                    opts->dry_run ? " (dry)" : "");
             fflush(stdout);
         }
 
         if (step) {
-            int ret = ae_actuate(opts, st.exp_index);
+            int ret = ae_actuate(tune, opts, st.exp_index);
 
             if (ret) {
                 fprintf(stderr, "ml-aed: actuate: %s\n", strerror(-ret));
@@ -281,6 +283,7 @@ static void usage(void)
         "  --no-ladders      actuate the sensor only\n"
         "  --tone            also drive gamma and DRC from the trigger scalar\n"
         "                    (off by default: its producer is unproven)\n"
+        "  --tuning PATH     sensor tuning blob (default: the board's firmware path)\n"
         "  --verbose         log settled decisions too\n");
 }
 
@@ -295,14 +298,17 @@ int main(int argc, char **argv)
         { "dry-run", no_argument, NULL, 'd' },
         { "no-ladders", no_argument, NULL, 'L' },
         { "tone", no_argument, NULL, 'T' },
+        { "tuning", required_argument, NULL, 'T' + 128 },
         { "verbose", no_argument, NULL, 'v' },
         { NULL, 0, NULL, 0 },
     };
     struct ae_opts opts = {
         .start_index = 317,
-        .floor_index = AE_INDEX_MIN,
+        .floor_index = 1,
     };
-    int c;
+    const char *tuning_path = ML_AED_TUNING_FALLBACK;
+    struct ae_tuning tune;
+    int c, ret;
 
     while ((c = getopt_long(argc, argv, "", longopts, NULL)) != -1) {
         switch (c) {
@@ -338,6 +344,10 @@ int main(int argc, char **argv)
             opts.tone = 1;
         } break;
 
+        case 'T' + 128: {
+            tuning_path = optarg;
+        } break;
+
         case 'v': {
             opts.verbose = 1;
         } break;
@@ -350,11 +360,29 @@ int main(int argc, char **argv)
         }
     }
 
-    if (opts.start_index < AE_INDEX_MIN || opts.start_index > AE_INDEX_MAX) {
-        usage();
+    /*
+     * The blob is the source for every AE constant, so it is loaded before anything is validated
+     * against it. There is no fallback: rootfs/build.sh refuses to build a rootfs without the
+     * file, and compiled-in values would be exactly the stale configuration this removes.
+     */
+    ret = ae_tuning_load(&tune, tuning_path);
+    if (ret) {
+        fprintf(stderr, "ml-aed: %s: %s\n", tuning_path,
+            ret == -EINVAL ? "not the size a tuning blob must be" : strerror(-ret));
 
         return 1;
     }
 
-    return run_loop(&opts);
+    if (opts.start_index < tune.index_min || opts.start_index > tune.index_max) {
+        fprintf(stderr, "ml-aed: --start-index must be %d..%d\n",
+            tune.index_min, tune.index_max);
+        ae_tuning_free(&tune);
+
+        return 1;
+    }
+
+    ret = run_loop(&tune, &opts);
+    ae_tuning_free(&tune);
+
+    return ret;
 }
