@@ -39,6 +39,16 @@
  * driver default, which pins the vendor's traced operating point.
  */
 
+/*
+ * Poll interval while the driver reports no statistics, and how many of those
+ * polls separate the "still waiting" lines. Frames land at 60/s, so 100 ms
+ * picks the first flip up promptly without spinning; 300 polls is one line per
+ * 30 s, which keeps a camera that never streams visible in the log without
+ * filling the 8 MiB /var/log tmpfs.
+ */
+#define STATS_POLL_US       100000
+#define STATS_POLL_REPORT   300
+
 struct ae_opts {
     int start_index;
     int max_step;               /* 0 = no clamp (vendor behaviour) */
@@ -183,6 +193,7 @@ static int run_loop(const struct ae_tuning *tune, const struct ae_opts *opts)
     };
     uint8_t *buf = malloc(STATS_RAW_SIZE);
     uint32_t last_seq = 0;
+    unsigned int waited = 0;
     int have_seq = 0, decided = 0, ret;
 
     if (!buf) {
@@ -210,11 +221,37 @@ static int run_loop(const struct ae_tuning *tune, const struct ae_opts *opts)
         float luma;
         int step, prev;
 
+        /*
+         * EAGAIN is the driver reporting no completed frame to hand over, not
+         * a failure: it holds before the first flip after stream-on, and again
+         * after any reconfigure, which republishes the statistics buffers and
+         * clears the valid flag. Waiting is the only correct response. Exiting
+         * leaves the camera at a fixed exposure until the next boot with the
+         * link, the encoder and every counter healthy, so nothing else reports
+         * the loss.
+         */
+        if (seq == -EAGAIN) {
+            if (!(waited % STATS_POLL_REPORT)) {
+                fprintf(stderr, "ml-aed: waiting for statistics%s\n",
+                        waited ? " (still)" : "");
+            }
+
+            waited++;
+            usleep(STATS_POLL_US);
+            continue;
+        }
+
         if (seq < 0) {
             fprintf(stderr, "ml-aed: stats_raw: %s\n", strerror(-seq));
             free(buf);
 
             return 1;
+        }
+
+        if (waited) {
+            fprintf(stderr, "ml-aed: statistics live after %u ms\n",
+                    waited * (STATS_POLL_US / 1000));
+            waited = 0;
         }
 
         if (have_seq && (uint32_t)seq == last_seq) {
