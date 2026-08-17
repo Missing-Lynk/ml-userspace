@@ -648,6 +648,105 @@ guint32 tile_fb_get(struct ctx *c, int ch, const struct tileview *t)
     return fb;
 }
 
+/* Where the splash FB's id is published for the next generation of this process. */
+#define IDLE_FB_STATE   MLM_RUN_DIR "/idle-fb"
+
+/* Every FB lives on ml-drmfd's shared drm_file, and a client's exit does not run drm_release,
+ * so an FB this process creates and does not remove stays allocated for as long as ml-drmfd
+ * lives: one leaked COMP_SIZE buffer per ml-pipeline generation. Removing the splash at exit is
+ * not available, because drm_disp_shutdown parks the CRTC on it precisely so the DC is never
+ * left fetching freed memory, and drm_framebuffer_remove would then disable the plane still
+ * scanning it. The id is published instead and the next generation adopts it, so the buffer is
+ * allocated once per ml-drmfd lifetime rather than once per pipeline lifetime.
+ *
+ * ml-drmfd unlinks and re-binds drm.sock on every start, so that socket identifies the broker
+ * instance, and with it the lifetime of every FB on the shared file. Inode and creation time
+ * together, because a tmpfs reuses inode numbers.
+ */
+static int drm_broker_id(char *out, size_t len)
+{
+    struct stat st;
+
+    if (stat(MLM_DRM_SOCK, &st)) {
+        return -1;
+    }
+
+    return snprintf(out, len, "%llu.%lld.%ld", (unsigned long long)st.st_ino,
+                    (long long)st.st_ctim.tv_sec, st.st_ctim.tv_nsec) > 0 ? 0 : -1;
+}
+
+/* The splash FB a previous generation left behind, or 0 when there is nothing to adopt. */
+static guint32 idle_fb_adopt(struct ctx *c)
+{
+    char now[64], was[64];
+    unsigned fb = 0;
+    drmModeFB2Ptr info;
+    FILE *f;
+
+    /* Declining to adopt is the pre-adoption behaviour exactly, so one binary measures both
+     * sides of the leak across a restart series.
+     */
+    if (getenv("ML_NOFBADOPT")) {
+        return 0;
+    }
+
+    if (drm_broker_id(now, sizeof now)) {
+        return 0;
+    }
+
+    f = fopen(IDLE_FB_STATE, "r");
+    if (!f) {
+        return 0;
+    }
+
+    if (fscanf(f, "%63s %u", was, &fb) != 2) {
+        fb = 0;
+    }
+
+    fclose(f);
+    if (!fb || strcmp(was, now)) {
+        /* a different broker: its FBs died with it */
+        return 0;
+    }
+
+    /* The id alone is not proof: check the FB behind it is still the splash and not something
+     * a later AddFB2 was handed the same id for.
+     */
+    info = drmModeGetFB2(c->drm_fd, fb);
+    if (!info) {
+        return 0;
+    }
+
+    if (info->width != COMP_W || info->height != COMP_H ||
+        info->pixel_format != DRM_FORMAT_YUV420) {
+        drmModeFreeFB2(info);
+        return 0;
+    }
+
+    drmModeFreeFB2(info);
+    fprintf(stderr, "ml-pipeline: adopted splash fb %u from the previous generation\n", fb);
+
+    return fb;
+}
+
+static void idle_fb_publish(guint32 fb)
+{
+    char now[64];
+    FILE *f;
+
+    if (drm_broker_id(now, sizeof now)) {
+        return;
+    }
+
+    f = fopen(IDLE_FB_STATE, "w");
+    if (!f) {
+        return;
+    }
+
+    fprintf(f, "%s %u\n", now, fb);
+    fclose(f);
+}
+
 /* Allocate the persistent black primary FB the CRTC parks on while a decode graph is torn down,
  * so the DC never scans a freed FB (the fault that powered the panel off on a playback<->live
  * swap). artosyn_vo has no dumb-buffer support, so it is a zeroed I420 dma-heap buffer (same
@@ -655,6 +754,11 @@ guint32 tile_fb_get(struct ctx *c, int ch, const struct tileview *t)
  * BEFORE the composite pool grabs the CMA, and only once. Returns 0 on success. */
 int drm_make_idle_fb(struct ctx *c)
 {
+    if (c->idle_fb) {
+        return 0;
+    }
+
+    c->idle_fb = idle_fb_adopt(c);
     if (c->idle_fb) {
         return 0;
     }
@@ -695,7 +799,13 @@ int drm_make_idle_fb(struct ctx *c)
     c->idle_fb = drm_make_fb(c, fd, &h);   /* PRIME-import as a YUV420 scanout FB (keeps fd via GEM) */
     c->idle_dumb = h;
 
-    return c->idle_fb ? 0 : -1;
+    if (!c->idle_fb) {
+        return -1;
+    }
+
+    idle_fb_publish(c->idle_fb);
+
+    return 0;
 }
 
 int drm_disp_init(struct ctx *c)
