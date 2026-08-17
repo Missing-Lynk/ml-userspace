@@ -250,6 +250,21 @@ static int rf_display_init(struct ctx *c, int drm_fd)
                drm_fd, RF_VIDEO_PORT);
 
         drm_make_idle_fb(c);   /* reserve the park FB BEFORE the pool grabs the CMA */
+
+        /* Ahead of the pool, because comp_pool_init calls seam_scratch_init, which probes this
+         * device for the ranged cache ioctl.
+         */
+        if (c->dmablit_fd < 0) {
+            /* off-CPU tile blit via the AXI DMA engine. Optional - if /dev/ml-dmablit is absent
+             * (ml_dmablit.ko not loaded) or a tile is not a packed dmabuf, on_tile CPU-blits.
+             */
+            c->dmablit_fd = open("/dev/ml-dmablit", O_RDWR | O_CLOEXEC);
+            fprintf(stderr, "ml-pipeline: tile blit = %s\n",
+                    c->dmablit_fd >= 0 ? "DMA (ml_dmablit) with CPU fallback" :
+                    "CPU only (/dev/ml-dmablit not available - load ml_dmablit.ko for DMA)");
+        }
+
+        seam_mode_init(c);
         if (c->comp_n == 0 && !comp_pool_init(c)) {   /* pool is allocated once, reused across swaps */
             fprintf(stderr, "ml-pipeline: composite dma-heap pool init failed "
                             "(CONFIG_DMABUF_HEAPS_CMA? enough CMA?)\n");
@@ -259,16 +274,6 @@ static int rf_display_init(struct ctx *c, int drm_fd)
         if (drm_disp_init(c)) {
             fprintf(stderr, "ml-pipeline: DRM display sink init failed\n");
             return 1;
-        }
-
-        if (c->dmablit_fd < 0) {
-            /* off-CPU tile blit via the AXI DMA engine. Optional - if /dev/ml-dmablit is absent
-             * (ml_dmablit.ko not loaded) or a tile is not a packed dmabuf, on_tile CPU-blits.
-             */
-            c->dmablit_fd = open("/dev/ml-dmablit", O_RDWR | O_CLOEXEC);
-            fprintf(stderr, "ml-pipeline: tile blit = %s\n",
-                    c->dmablit_fd >= 0 ? "DMA (ml_dmablit) with CPU fallback" :
-                    "CPU only (/dev/ml-dmablit not available - load ml_dmablit.ko for DMA)");
         }
     }
     c->rf_planes = c->planes_on;
@@ -653,7 +658,7 @@ int main(int argc, char **argv)
     }
 
     struct ctx c = { .taddr = { .sun_family = AF_UNIX }, .dmablit_fd = -1, .stage_fd = -1,
-                     .scaler_fd = -1 };
+                     .scaler_fd = -1, .seam_scratch_fd = -1 };
     lat_init(&c);
     pace_init(&c);
     strncpy(c.taddr.sun_path, MLM_TELEMETRY_SOCK, sizeof c.taddr.sun_path - 1);

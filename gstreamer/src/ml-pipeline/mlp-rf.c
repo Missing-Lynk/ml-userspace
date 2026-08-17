@@ -22,6 +22,8 @@ static void slot_drop(struct ctx *c, struct comp_slot *sl)
 
     sl->used = FALSE;
     sl->have[0] = sl->have[1] = FALSE;
+    sl->seam_ok[0] = sl->seam_ok[1] = FALSE;
+    sl->first_ch = -1;
 }
 
 /* Find the slot for this PTS, or claim one (free slot, else evict the OLDEST incomplete
@@ -80,6 +82,8 @@ static struct comp_slot *slot_get(struct ctx *c, GstClockTime pts)
     sl->used = TRUE;
     sl->pts = pts;
     sl->have[0] = sl->have[1] = FALSE;
+    sl->seam_ok[0] = sl->seam_ok[1] = FALSE;
+    sl->first_ch = -1;
 
     return sl;
 }
@@ -92,6 +96,8 @@ static void slot_reset(struct comp_slot *sl)
     sl->cbi = -1;
     sl->sfb[0] = sl->sfb[1] = 0;
     sl->have[0] = sl->have[1] = FALSE;
+    sl->seam_ok[0] = sl->seam_ok[1] = FALSE;
+    sl->first_ch = -1;
 }
 
 /* Push a completed frame to the display thread. Caller holds c->comp_lock. Plane mode hands
@@ -232,8 +238,26 @@ GstFlowReturn on_tile(GstAppSink *sink, gpointer u)
             }
         }
     } else if (sl) {
-        int dst_row = (ch == 0) ? 0 : TILE1_Y;
+        int fb_row = (ch == 0) ? 0 : TILE1_Y;
+        int dst_row = fb_row, src_row = 0;
         int cfd = c->comp_pool[sl->cbi].fd;
+        gboolean first = sl->first_ch < 0;
+
+        if (first) {
+            sl->first_ch = ch;
+            c->first_ch_n[ch]++;
+        }
+
+        seam_geom_update(c, ch, &t);
+
+        /* Split geometry: each tile keeps its own top overlap rows at the source and lands
+         * immediately below the previous tile, so no composite row is written twice and the
+         * band holds tile 0's copy of it for the cross-fade. Only tile 1 has rows to skip.
+         */
+        if (c->seam_geom && ch == 1) {
+            src_row = TILE_OVER;
+            dst_row = c->seam_h0;
+        }
 
         /* Keep the composite DMA-only: a dmabuf tile DMAs straight in; a non-dmabuf tile is packed
          * into our staging dmabuf and DMA'd from there. Only if BOTH fail do we CPU-blit directly
@@ -242,10 +266,33 @@ GstFlowReturn on_tile(GstAppSink *sink, gpointer u)
          * a direct CPU blit into a DMA-touched composite could never be made coherent - hence the
          * staging path exists to avoid that mix entirely.
          */
-        if (blit_tile_dma(c, cfd, &t, dst_row) || blit_tile_staged(c, cfd, &t, dst_row)) {
+        if (blit_tile_dma(c, cfd, &t, dst_row, src_row)) {
+            c->blit_dma++;
+
+            /* The split geometry writes tile 1's band to no composite row, and its decoder
+             * buffer is released when this callback returns, so it is staged here. Tile 0's
+             * copy of the band is the composite's own rows, and the blend reads it there.
+             */
+            if (c->seam_mode == SEAM_BLEND && ch == 1) {
+                gint64 t_cap = g_get_monotonic_time();
+                guint64 us;
+
+                sl->seam_ok[1] = seam_band_capture(c, sl, &t, ch);
+                us = (guint64)(g_get_monotonic_time() - t_cap);
+                c->ns_bandcap += us;
+                if (us > c->mx_bandcap) {
+                    c->mx_bandcap = us;
+                }
+            } else {
+                sl->seam_ok[ch] = c->seam_geom;
+            }
+        } else if (blit_tile_staged(c, cfd, &t, fb_row)) {
+            /* No DMA path for this tile: it takes the overwrite placement and covers the band
+             * itself, so this pair goes out unblended and counts as seam_skip.
+             */
             c->blit_dma++;
         } else {
-            blit_tile(c->comp_pool[sl->cbi].map, &t, dst_row);
+            blit_tile(c->comp_pool[sl->cbi].map, &t, fb_row);
             if (c->dmablit_fd >= 0) {
                 ioctl(c->dmablit_fd, ML_DMABLIT_FLUSH, &cfd);
             } else {
@@ -257,6 +304,15 @@ GstFlowReturn on_tile(GstAppSink *sink, gpointer u)
 
         sl->have[ch] = TRUE;
         if (sl->have[0] && sl->have[1]) {
+            if (c->seam_mode == SEAM_BLEND) {
+                if (seam_blend_band(c, sl)) {
+                    c->seam_done++;
+                    c->n_blend++;
+                } else {
+                    c->seam_skip++;
+                }
+            }
+
             slot_push(c, sl);
         }
     }
@@ -672,6 +728,23 @@ gboolean rf_ready_tick(gpointer u)
         c->ns_map[0] = c->ns_map[1] = c->ns_blit[0] = c->ns_blit[1] = 0;
         c->n_prof[0] = c->n_prof[1] = 0;
         c->n_fd[0] = c->n_fd[1] = 0;
+    }
+
+    if (c->seam_mode != SEAM_OFF) {
+        guint64 n = c->n_blend ? c->n_blend : 1;
+
+        fprintf(stderr, "ml-pipeline: seam mode=%d geom=%d band=%d..%d pool=%d done=%llu skip=%llu "
+                "cap=%llu/%llu inv=%llu/%llu blend=%llu/%llu wb=%llu/%llu us(mean/max) "
+                "order=%llu/%llu\n",
+                (int)c->seam_mode, c->seam_geom, c->seam_top, c->seam_top + TILE_OVER - 1,
+                c->comp_n, (unsigned long long)c->seam_done, (unsigned long long)c->seam_skip,
+                (unsigned long long)(c->ns_bandcap / n), (unsigned long long)c->mx_bandcap,
+                (unsigned long long)(c->ns_inv / n), (unsigned long long)c->mx_inv,
+                (unsigned long long)(c->ns_blend / n), (unsigned long long)c->mx_blend,
+                (unsigned long long)(c->ns_bandwb / n), (unsigned long long)c->mx_bandwb,
+                (unsigned long long)c->first_ch_n[0], (unsigned long long)c->first_ch_n[1]);
+        c->ns_bandcap = c->ns_inv = c->ns_blend = c->ns_bandwb = c->n_blend = 0;
+        c->mx_bandcap = c->mx_inv = c->mx_blend = c->mx_bandwb = 0;
     }
 
     return G_SOURCE_CONTINUE;

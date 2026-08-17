@@ -1,5 +1,8 @@
 #include "ml-pipeline.h"
 
+/* Path of the heap the last successful allocation came from. */
+static char g_heap_name[280];
+
 /* Allocate one contiguous dma-buf; returns its fd.
  *
  * Heap choice matters for correctness and placement. `mmz` (ml_mmzheap.ko) is the no-map
@@ -10,13 +13,12 @@
  * composite can sit in L2 while the DC scans stale DDR - clean in every CPU dump, garbage on
  * the panel. Prefer mmz; the scan falls back to a CMA heap when it is absent; ML_HEAP overrides.
  */
-int ml_heap_alloc(gsize len)
+static int heap_alloc_pref(const char *pref, gsize len, char *name_out, gsize name_len)
 {
     struct dma_heap_allocation_data a = { .len = len, .fd_flags = O_RDWR | O_CLOEXEC };
     struct dirent *de;
     DIR *d;
     int hfd = -1;
-    const char *pref = getenv("ML_HEAP") ? getenv("ML_HEAP") : "mmz";
     char path[280];
 
     snprintf(path, sizeof path, "/dev/dma_heap/%s", pref);
@@ -56,14 +58,25 @@ int ml_heap_alloc(gsize len)
 
     close(hfd);
 
-    {
+    g_strlcpy(name_out, path, name_len);
+
+    return a.fd;
+}
+
+int ml_heap_alloc(gsize len)
+{
+    const char *pref = getenv("ML_HEAP") ? getenv("ML_HEAP") : "mmz";
+    int fd = heap_alloc_pref(pref, len, g_heap_name, sizeof g_heap_name);
+
+    if (fd >= 0) {
         static int logged;
+
         if (g_verbose && !logged++) {
-            fprintf(stderr, "ml-pipeline: composite heap = %s\n", path);
+            fprintf(stderr, "ml-pipeline: composite heap = %s\n", g_heap_name);
         }
     }
 
-    return a.fd;
+    return fd;
 }
 
 /* Bracket CPU writes to a CMA buffer so the non-snooping DC sees them (start=1 before the
@@ -73,6 +86,21 @@ void ml_dmabuf_sync(int fd, int start)
 {
     struct dma_buf_sync s = { .flags = DMA_BUF_SYNC_WRITE |
                                        (start ? DMA_BUF_SYNC_START : DMA_BUF_SYNC_END) };
+    ioctl(fd, DMA_BUF_IOCTL_SYNC, &s);
+}
+
+/* Invalidate a cached dma-buf so a CPU read sees what a device DMA'd into it.
+ *
+ * The bracket ml_dmabuf_sync() opens is DMA_BUF_SYNC_WRITE, which the dma-buf ioctl maps to
+ * DMA_TO_DEVICE: dma_sync_sgtable_for_cpu with that direction invalidates nothing, so it
+ * covers CPU writes and not CPU reads. SYNC_READ maps to DMA_FROM_DEVICE, which is the
+ * invalidate. Whole-buffer, because the ABI has no range; on the write-combine mmz heap
+ * begin_cpu_access is not implemented and this is a no-op.
+ */
+void ml_dmabuf_invalidate(int fd)
+{
+    struct dma_buf_sync s = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
+
     ioctl(fd, DMA_BUF_IOCTL_SYNC, &s);
 }
 
@@ -104,6 +132,11 @@ gboolean comp_pool_init(struct ctx *c)
         }
     }
 
+    /* The band scratch is 180 KiB at a fixed size, claimed here ahead of the pool. A failure
+     * drops the mode to SEAM_SPLIT.
+     */
+    seam_scratch_init(c);
+
     /* DVR 720p scaler-dst pool next (rec_hw_init; a no-op without /dev/arscaler): it must claim
      * its ~5.4 MiB while there still is CMA to claim - steady state runs ~0.3 MiB free - and the
      * composite grab below adapts to whatever remains, so the budget closes itself.
@@ -124,18 +157,21 @@ gboolean comp_pool_init(struct ctx *c)
         cap = COMP_POOL;
     }
 
+    /* COMP_ALLOC, not COMP_SIZE: the encoder's dmabuf import demands its 16-row-aligned
+     * sizeimage; the content layout stays COMP_SIZE (the tail is padding). It is also the
+     * largest size inside the heap's 768-page alignment slot.
+     */
+    gsize buf_len = COMP_ALLOC;
+
     for (int i = 0; i < cap; i++) {
-        /* COMP_ALLOC, not COMP_SIZE: the encoder's dmabuf import demands its 16-row-aligned
-         * sizeimage; the content layout stays COMP_SIZE (the tail is padding).
-         */
-        int fd = ml_heap_alloc(COMP_ALLOC);
+        int fd = ml_heap_alloc(buf_len);
         guint8 *m;
 
         if (fd < 0) {
             break;                      /* pool exhausted/fragmented - use what we have */
         }
 
-        m = mmap(NULL, COMP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        m = mmap(NULL, buf_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         if (m == MAP_FAILED) {
             close(fd);
             break;
@@ -279,7 +315,8 @@ void blit_tile(guint8 *out, const struct tileview *t, int dst_row)
  * non-dmabuf or row-padded tile, a non-packed composite, or on any submit failure. Caller holds
  * c->comp_lock. dst_row is even, so all offsets/lengths stay 4-byte aligned (ml_dmablit requires it).
  */
-gboolean blit_tile_dma(struct ctx *c, int dst_fd, const struct tileview *t, int dst_row)
+gboolean blit_tile_dma(struct ctx *c, int dst_fd, const struct tileview *t, int dst_row,
+                       int src_row)
 {
     if (c->dmablit_fd < 0 || t->fd < 0 || t->nv12) {
         return FALSE;
@@ -294,21 +331,25 @@ gboolean blit_tile_dma(struct ctx *c, int dst_fd, const struct tileview *t, int 
         return FALSE;
     }
 
-    int h = t->h;
+    int h = t->h - src_row;
     if (dst_row + h > COMP_H) {
         h = COMP_H - dst_row;
     }
 
-    if (h <= 0) {
+    if (h <= 0 || src_row < 0 || src_row % 2) {
         return FALSE;
     }
 
+    guint32 sy = (guint32)(t->yoff + (gsize)src_row * t->ys);
+    guint32 su = (guint32)(t->uoff + (gsize)(src_row / 2) * t->us);
+    guint32 sv = (guint32)(t->voff + (gsize)(src_row / 2) * t->vs);
+
     struct ml_dmablit_req req = { .dst_fd = dst_fd, .n = 3 };
-    req.copy[0] = (struct ml_dmablit_copy){ t->fd, (guint32)t->yoff,
+    req.copy[0] = (struct ml_dmablit_copy){ t->fd, sy,
                   (guint32)(dst_row * COMP_LSTRIDE), (guint32)(COMP_LSTRIDE * h) };
-    req.copy[1] = (struct ml_dmablit_copy){ t->fd, (guint32)t->uoff,
+    req.copy[1] = (struct ml_dmablit_copy){ t->fd, su,
                   (guint32)(COMP_UOFF + (dst_row / 2) * COMP_CSTRIDE), (guint32)(COMP_CSTRIDE * (h / 2)) };
-    req.copy[2] = (struct ml_dmablit_copy){ t->fd, (guint32)t->voff,
+    req.copy[2] = (struct ml_dmablit_copy){ t->fd, sv,
                   (guint32)(COMP_VOFF + (dst_row / 2) * COMP_CSTRIDE), (guint32)(COMP_CSTRIDE * (h / 2)) };
 
     if (ioctl(c->dmablit_fd, ML_DMABLIT_SUBMIT, &req) != 0) {
@@ -379,4 +420,298 @@ gboolean blit_tile_staged(struct ctx *c, int dst_fd, const struct tileview *t, i
                   (guint32)(COMP_VOFF + (dst_row / 2) * COMP_CSTRIDE), (guint32)(COMP_CSTRIDE * (h / 2)) };
 
     return ioctl(c->dmablit_fd, ML_DMABLIT_SUBMIT, &req) == 0;
+}
+
+/* Select the seam handling from ML_SEAM once, before comp_pool_init: the seam modes are what
+ * make seam_scratch_init claim its 180 KiB, and that lands ahead of the pool.
+ */
+void seam_mode_init(struct ctx *c)
+{
+    const char *v = getenv("ML_SEAM");
+    int mode = v ? atoi(v) : SEAM_OFF;
+
+    if (mode < SEAM_OFF || mode > SEAM_BLEND) {
+        mode = SEAM_OFF;
+    }
+
+    c->seam_mode = (enum seam_mode)mode;
+    if (c->seam_mode != SEAM_OFF) {
+        fprintf(stderr, "ml-pipeline: seam mode %d (%s)\n", mode,
+                mode == SEAM_SPLIT ? "split geometry" : "split geometry + cross-fade");
+    }
+}
+
+/* Byte offsets of one ring region of the band scratch. */
+#define BAND_Y_OFF(r)   ((guint32)((r) * COMP_BAND_SIZE))
+#define BAND_U_OFF(r)   (BAND_Y_OFF(r) + COMP_BAND_YSIZE)
+#define BAND_V_OFF(r)   (BAND_U_OFF(r) + COMP_BAND_CSIZE)
+
+/* Which ring region a slot uses. Slots are a fixed array, so a slot maps to the same region for
+ * the pair's lifetime; the PTS stamp is what makes a collision detectable.
+ */
+static int band_region(struct ctx *c, const struct comp_slot *sl)
+{
+    return (int)((sl - c->slot) % COMP_BAND_SLOTS);
+}
+
+/* Cache maintenance over one range of a dmabuf, via ml_dmablit. Returns FALSE when the running
+ * module predates the ioctl, which is what seam_scratch_init's probe tests for.
+ */
+static gboolean band_cache(struct ctx *c, int fd, guint32 off, guint32 len, guint32 op)
+{
+    struct ml_dmablit_cache rq = { .fd = fd, .off = off, .len = len, .op = op };
+
+    return ioctl(c->dmablit_fd, ML_DMABLIT_CACHE, &rq) == 0;
+}
+
+/* The band occupies three disjoint ranges of the composite, one per plane. */
+static gboolean band_cache_all(struct ctx *c, int fd, guint32 op)
+{
+    guint32 y = (guint32)((gsize)c->seam_top * COMP_LSTRIDE);
+    guint32 u = (guint32)(COMP_UOFF + (gsize)(c->seam_top / 2) * COMP_CSTRIDE);
+    guint32 v = (guint32)(COMP_VOFF + (gsize)(c->seam_top / 2) * COMP_CSTRIDE);
+
+    return band_cache(c, fd, y, COMP_BAND_YSIZE, op) &&
+           band_cache(c, fd, u, COMP_BAND_CSIZE, op) &&
+           band_cache(c, fd, v, COMP_BAND_CSIZE, op);
+}
+
+/* Allocate the ring tile 1's band is staged into, and probe for the ranged cache ioctl.
+ *
+ * A CMA heap, named explicitly rather than through ml_heap_alloc's write-combine mmz
+ * preference, so the cross-fade reads the staged band cached. Blending straight out of the
+ * decoder's write-combine buffer measured 4 ms per frame.
+ */
+void seam_scratch_init(struct ctx *c)
+{
+    char heap[280] = "";
+
+    c->seam_scratch_fd = -1;
+    c->seam_scratch_map = NULL;
+    c->seam_ranged = FALSE;
+    for (int i = 0; i < COMP_BAND_SLOTS; i++) {
+        c->seam_stamp[i] = GST_CLOCK_TIME_NONE;
+    }
+
+    if (c->seam_mode != SEAM_BLEND) {
+        return;
+    }
+
+    c->seam_scratch_fd = heap_alloc_pref("default_cma_region", COMP_BAND_ALL, heap, sizeof heap);
+    if (c->seam_scratch_fd >= 0) {
+        c->seam_scratch_map = mmap(NULL, COMP_BAND_ALL, PROT_READ | PROT_WRITE, MAP_SHARED,
+                                   c->seam_scratch_fd, 0);
+        if (c->seam_scratch_map == MAP_FAILED) {
+            close(c->seam_scratch_fd);
+            c->seam_scratch_fd = -1;
+            c->seam_scratch_map = NULL;
+        }
+    }
+
+    if (c->seam_scratch_fd < 0) {
+        fprintf(stderr, "ml-pipeline: seam scratch alloc failed - cross-fade off\n");
+        c->seam_mode = SEAM_SPLIT;
+        return;
+    }
+
+    c->seam_scratch_cached = strcmp(heap, "/dev/dma_heap/mmz") != 0;
+
+    /* Probe on the scratch itself: a clean of the whole ring is harmless whatever the answer. */
+    c->seam_ranged = c->dmablit_fd >= 0 &&
+                     band_cache(c, c->seam_scratch_fd, 0, COMP_BAND_ALL, ML_DMABLIT_CLEAN);
+    if (!c->seam_ranged) {
+        fprintf(stderr, "ml-pipeline: ml_dmablit has no ranged cache op - cross-fade off "
+                        "(load the current ml_dmablit.ko)\n");
+        c->seam_mode = SEAM_SPLIT;
+        return;
+    }
+
+    fprintf(stderr, "ml-pipeline: seam scratch = %d KiB on %s (%s), ranged cache ops\n",
+            COMP_BAND_ALL / 1024, heap, c->seam_scratch_cached ? "cached" : "write-combine");
+}
+
+/* Stage TILE 1's copy of the band out of its live decoder buffer: one submit, three whole-plane
+ * blocks. Only tile 1 needs this - tile 0's copy of the band is already in the composite, put
+ * there by its own body DMA - so the cross-fade costs exactly one extra submit per frame.
+ *
+ * Runs in tile 1's own callback because its decoder buffer is released when that callback
+ * returns and the split geometry writes those rows to no composite row. Caller holds
+ * c->comp_lock.
+ */
+gboolean seam_band_capture(struct ctx *c, struct comp_slot *sl, const struct tileview *t, int ch)
+{
+    if (c->seam_mode != SEAM_BLEND || ch != 1 || c->seam_scratch_fd < 0 || !c->seam_geom) {
+        return FALSE;
+    }
+
+    /* blit_tile_dma's preconditions, for the same reason: three whole-plane blocks only hold
+     * for an unpadded full-width I420 dmabuf.
+     */
+    if (c->dmablit_fd < 0 || t->fd < 0 || t->nv12 || t->w != COMP_W ||
+        t->ys != t->w || t->us != t->w / 2 || t->vs != t->w / 2 || t->h < TILE_OVER) {
+        return FALSE;
+    }
+
+    int region = band_region(c, sl);
+    struct ml_dmablit_req req = { .dst_fd = c->seam_scratch_fd, .n = 3 };
+
+    req.copy[0] = (struct ml_dmablit_copy){ t->fd, (guint32)t->yoff,
+                  BAND_Y_OFF(region), COMP_BAND_YSIZE };
+    req.copy[1] = (struct ml_dmablit_copy){ t->fd, (guint32)t->uoff,
+                  BAND_U_OFF(region), COMP_BAND_CSIZE };
+    req.copy[2] = (struct ml_dmablit_copy){ t->fd, (guint32)t->voff,
+                  BAND_V_OFF(region), COMP_BAND_CSIZE };
+
+    if (ioctl(c->dmablit_fd, ML_DMABLIT_SUBMIT, &req) != 0) {
+        return FALSE;
+    }
+
+    c->seam_stamp[region] = sl->pts;
+
+    return TRUE;
+}
+
+/* Derive the split geometry from the tile heights the decoders actually produce. The tile
+ * count and heights are negotiated, so the identity h0 + h1 - TILE_OVER == COMP_H is a
+ * runtime condition: on anything else the split stays off and every tile takes the overwrite
+ * placement. Caller holds c->comp_lock.
+ */
+void seam_geom_update(struct ctx *c, int ch, const struct tileview *t)
+{
+    if (c->seam_mode == SEAM_OFF || t->h <= 0) {
+        return;
+    }
+
+    /* Re-check the shape every frame. A session that changes resolution is absorbed by the
+     * PTS-epoch continuation without a pipeline rebuild, so this is what clears the latched
+     * heights and re-derives the split point.
+     */
+    if (c->tile_h[ch] != t->h || c->tile_w[ch] != t->w) {
+        c->tile_h[ch] = t->h;
+        c->tile_w[ch] = t->w;
+        c->seam_geom = FALSE;
+    }
+
+    if (c->seam_geom || c->tile_h[0] == 0 || c->tile_h[1] == 0) {
+        return;
+    }
+
+    if (c->tile_h[0] + c->tile_h[1] - TILE_OVER != COMP_H ||
+        c->tile_w[0] != COMP_W || c->tile_w[1] != COMP_W ||
+        c->tile_h[0] <= TILE_OVER || c->tile_h[1] <= TILE_OVER ||
+        c->tile_h[0] % 2 || c->tile_h[1] % 2 || TILE_OVER % 2) {
+        if (!c->seam_warned) {
+            c->seam_warned = TRUE;
+            fprintf(stderr, "ml-pipeline: seam off, tiles %dx%d + %dx%d do not overlap by %d "
+                    "into %d rows\n", c->tile_w[0], c->tile_h[0], c->tile_w[1], c->tile_h[1],
+                    TILE_OVER, COMP_H);
+        }
+
+        return;
+    }
+
+    c->seam_h0 = c->tile_h[0];
+    c->seam_top = c->seam_h0 - TILE_OVER;
+    c->seam_geom = TRUE;
+
+    if (g_verbose) {
+        fprintf(stderr, "ml-pipeline: seam band = composite rows %d..%d\n",
+                c->seam_top, c->seam_top + TILE_OVER - 1);
+    }
+}
+
+/* Cross-fade the band, in place in the composite.
+ *
+ * Tile 0's copy of those rows is already there from its own body DMA; tile 1's was staged into
+ * the scratch by seam_band_capture. So the only DMA this design adds is that one capture: the
+ * blend reads the composite band directly and writes the result back over it, and both the
+ * invalidate before and the clean after are scoped to the band's three plane ranges - about
+ * 90 KB of cache work, against 3 MB for a whole-buffer sync.
+ *
+ * This is the one CPU write into the composite that coexists with DMA writes to it: the band
+ * rows are cleaned before the buffer is pushed and no DMA targets them afterwards, which is
+ * what the rest of this file's flushing rules ask for.
+ *
+ * Runs at pair completion under c->comp_lock, before the OSD burn, so a glyph over the band
+ * survives.
+ */
+gboolean seam_blend_band(struct ctx *c, struct comp_slot *sl)
+{
+    if (c->seam_mode != SEAM_BLEND || !c->seam_geom || !c->seam_ranged || sl->cbi < 0) {
+        return FALSE;
+    }
+
+    if (!sl->seam_ok[0] || !sl->seam_ok[1]) {
+        return FALSE;
+    }
+
+    int region = band_region(c, sl);
+
+    /* A pair whose tile 1 arrived first holds its region until tile 0 lands, and another pair's
+     * tile 1 can claim the same region in between. The stamp catches that; the ring depth sets
+     * how often it happens, counted as seam_skip.
+     */
+    if (c->seam_stamp[region] != sl->pts) {
+        return FALSE;
+    }
+
+    int fd = c->comp_pool[sl->cbi].fd;
+    guint8 *comp = c->comp_pool[sl->cbi].map;
+    guint8 *scratch = c->seam_scratch_map;
+    gint64 t0;
+
+    /* Tile 0's body DMA and tile 1's capture have both completed - ML_DMABLIT_SUBMIT blocks -
+     * so both copies are in DDR while the CPU's view of them may not be.
+     */
+    t0 = g_get_monotonic_time();
+    if (!band_cache_all(c, fd, ML_DMABLIT_INVALIDATE)) {
+        return FALSE;
+    }
+
+    if (c->seam_scratch_cached &&
+        !band_cache(c, c->seam_scratch_fd, BAND_Y_OFF(region), COMP_BAND_SIZE, ML_DMABLIT_INVALIDATE)) {
+        return FALSE;
+    }
+
+    {
+        guint64 us = (guint64)(g_get_monotonic_time() - t0);
+
+        c->ns_inv += us;
+        if (us > c->mx_inv) {
+            c->mx_inv = us;
+        }
+    }
+
+    guint8 *band_y = comp + (gsize)c->seam_top * COMP_LSTRIDE;
+    guint8 *band_u = comp + COMP_UOFF + (gsize)(c->seam_top / 2) * COMP_CSTRIDE;
+    guint8 *band_v = comp + COMP_VOFF + (gsize)(c->seam_top / 2) * COMP_CSTRIDE;
+
+    t0 = g_get_monotonic_time();
+    seam_blend_plane(band_y, COMP_LSTRIDE, band_y, COMP_LSTRIDE, scratch + BAND_Y_OFF(region), COMP_LSTRIDE,
+                     COMP_W, SEAM_ROWS_LUMA);
+    seam_blend_plane(band_u, COMP_CSTRIDE, band_u, COMP_CSTRIDE, scratch + BAND_U_OFF(region), COMP_CSTRIDE,
+                     COMP_W / 2, SEAM_ROWS_CHROMA);
+    seam_blend_plane(band_v, COMP_CSTRIDE, band_v, COMP_CSTRIDE, scratch + BAND_V_OFF(region), COMP_CSTRIDE,
+                     COMP_W / 2, SEAM_ROWS_CHROMA);
+    {
+        guint64 us = (guint64)(g_get_monotonic_time() - t0);
+
+        c->ns_blend += us;
+        if (us > c->mx_blend) {
+            c->mx_blend = us;
+        }
+    }
+
+    t0 = g_get_monotonic_time();
+    band_cache_all(c, fd, ML_DMABLIT_CLEAN);
+    {
+        guint64 us = (guint64)(g_get_monotonic_time() - t0);
+
+        c->ns_bandwb += us;
+        if (us > c->mx_bandwb) {
+            c->mx_bandwb = us;
+        }
+    }
+
+    return TRUE;
 }

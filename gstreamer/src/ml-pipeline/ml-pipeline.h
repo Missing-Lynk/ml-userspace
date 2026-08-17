@@ -33,6 +33,7 @@
 #include <xf86drmMode.h>
 #include <drm_fourcc.h>
 #include "../../../ml-shared/mlm.h"
+#include "mlp-seam.h"
 
 /* dma-heap alloc + CPU-access sync UAPI (defined locally). */
 struct dma_heap_allocation_data { guint64 len; guint32 fd; guint32 fd_flags; guint64 heap_flags; };
@@ -53,6 +54,15 @@ struct ml_dmablit_copy { gint32 src_fd; guint32 src_off; guint32 dst_off; guint3
 struct ml_dmablit_req { gint32 dst_fd; guint32 n; struct ml_dmablit_copy copy[ML_DMABLIT_MAX_COPIES]; };
 #define ML_DMABLIT_SUBMIT _IOW('D', 0x01, struct ml_dmablit_req)
 #define ML_DMABLIT_FLUSH  _IOW('D', 0x02, gint32)   /* explicit CPU-cache clean of a dmabuf */
+
+/* Cache maintenance over a RANGE of a dmabuf: touching 90 KB of a 3 MB composite costs 90 KB of
+ * cache work. INVALIDATE discards the range and needs both ends cache-line aligned; CLEAN writes
+ * dirty lines back and takes any alignment.
+ */
+#define ML_DMABLIT_CLEAN        0
+#define ML_DMABLIT_INVALIDATE   1
+struct ml_dmablit_cache { gint32 fd; guint32 off; guint32 len; guint32 op; };
+#define ML_DMABLIT_CACHE  _IOW('D', 0x03, struct ml_dmablit_cache)
 
 /* ar_scaler dmabuf UAPI (kernel/modules/ar_scaler.h) - inlined like the two ABIs above. A batch of
  * fd-addressed crop/resize ops on /dev/arscaler: the kernel resolves fd + offset to phys (buffers
@@ -84,6 +94,20 @@ struct ar_scaler_dmabuf_batch { guint32 count; guint32 reserved; struct ar_scale
 #define COMP_W          1920
 #define COMP_H          1080
 #define TILE1_Y         528             /* tile 1 top row in the composite (even; absorbs the 32-row overlap) */
+#define TILE_OVER       SEAM_OVER       /* luma rows both tiles carry, from the negotiated split mode */
+
+/* Seam handling, selected once at startup from ML_SEAM and held in ctx.seam_mode.
+ *
+ * OFF places tile 1 at TILE1_Y so its top rows overwrite tile 0's copy of them. SPLIT skips
+ * each tile's own top overlap rows at the source and lands it immediately below the previous
+ * tile, so no composite row is written twice and the band keeps tile 0's copy. BLEND adds the
+ * cross-fade of mlp-seam.c over that band.
+ */
+enum seam_mode {
+    SEAM_OFF   = 0,
+    SEAM_SPLIT = 1,
+    SEAM_BLEND = 2,
+};
 
 /* The composite is a CMA dma-heap buffer scanned out zero-copy by kmssink. It uses PACKED
  * I420 strides matching the wave5 decoder's own output: luma 1920 (= COMP_W), chroma 960
@@ -106,6 +130,23 @@ struct ar_scaler_dmabuf_batch { guint32 count; guint32 reserved; struct ar_scale
  */
 #define COMP_HALIGN     (((COMP_H + 15) / 16) * 16)
 #define COMP_ALLOC      (COMP_LSTRIDE * COMP_HALIGN * 3 / 2)
+
+/* The cross-fade's band sources, in an allocation of their own. The CMA heap aligns every
+ * allocation to get_order(size) pages: COMP_ALLOC is 765 pages inside a 768-page slot, so the
+ * headroom is 12288 bytes and a band is 92160. Past 768 pages an allocation takes a 1024-page
+ * slot, ~0.9 MiB of waste per buffer, measured on this device as a pool yield of 10 buffers
+ * against 14.
+ */
+#define COMP_BAND_YSIZE (COMP_LSTRIDE * TILE_OVER)
+#define COMP_BAND_CSIZE (COMP_CSTRIDE * (TILE_OVER / 2))
+#define COMP_BAND_SIZE  (COMP_BAND_YSIZE + 2 * COMP_BAND_CSIZE)
+
+/* TILE 1's band is what gets staged; tile 0's copy is read in place in the composite, where its
+ * own body DMA put it. The ring is per-pair: a pair whose tile 1 arrived first holds its region
+ * until tile 0 lands, and another pair's tile 1 can claim a region in between.
+ */
+#define COMP_BAND_SLOTS 4
+#define COMP_BAND_ALL   (COMP_BAND_SLOTS * COMP_BAND_SIZE)
 
 /* One DVR recording format (dvr.resolution): the encoder-facing I420 geometry, derived entirely
  * from w/h with packed strides (lstride = w, cstride = w/2). alloc is the wave5 encoder's
@@ -194,6 +235,9 @@ struct ctx {
         guint32 sfb[RF_NCHN];           /* plane mode: their cached DRM FBs */
         GstClockTime pts;
         gboolean have[RF_NCHN];
+        gboolean seam_ok[RF_NCHN];      /* this half landed under the split geometry, so the band
+                                         * holds what the cross-fade expects */
+        int first_ch;                   /* channel whose half landed first, -1 before either */
     } slot[NSLOT];
     GstClockTime cur_pts;               /* PTS of the last pushed composite (telemetry) */
     guint64 pair_evict;
@@ -292,6 +336,43 @@ struct ctx {
      */
     int stage_fd;
     guint8 *stage_map;
+
+    /* Seam handling. seam_top/seam_h0 are derived from the tile heights the decoders actually
+     * produce, once both are known and h0 + h1 - TILE_OVER == COMP_H; until then, and on any
+     * other geometry, the split is off and every tile takes the overwrite placement.
+     */
+    enum seam_mode seam_mode;
+    int seam_h0;                        /* tile 0 height = first composite row of tile 1 */
+    int seam_top;                       /* first composite luma row of the band (seam_h0 - TILE_OVER) */
+    gboolean seam_geom;                 /* the split geometry is derived and usable */
+    gboolean seam_warned;               /* one-shot: logged a geometry mismatch already */
+
+    /* Band scratch: a ring of COMP_BAND_SLOTS regions, each holding one pair's copy of tile 1's
+     * overlap band, DMA'd out of that tile's decoder buffer. Cached, so the cross-fade reads it
+     * with the CPU. A region is keyed by slot and stamped with the pair's PTS.
+     */
+    int seam_scratch_fd;
+    guint8 *seam_scratch_map;
+    gboolean seam_scratch_cached;       /* the scratch heap gives cached mappings, so the CPU
+                                         * needs an invalidate after the capture DMA */
+    gboolean seam_ranged;               /* ml_dmablit does ranged cache maintenance; SEAM_BLEND
+                                         * needs it and falls back to SEAM_SPLIT at init */
+    GstClockTime seam_stamp[COMP_BAND_SLOTS];   /* PTS each ring region holds; the blend compares
+                                                 * it against the pair's own */
+    guint64 seam_done;                  /* pairs whose band was cross-faded */
+    guint64 seam_skip;                  /* pairs that could not blend (geometry, no DMA path) */
+    guint64 first_ch_n[RF_NCHN];        /* which channel's half landed first, per completed pair */
+    guint64 ns_bandcap;                 /* tile 1's band capture submit (us) */
+    guint64 ns_inv;                     /* ranged invalidate of the composite band (us) */
+    guint64 ns_blend;                   /* the NEON cross-fade itself (us) */
+    guint64 ns_bandwb;                  /* ranged clean of the blended band (us) */
+    guint64 n_blend;                    /* pairs the four counters above cover */
+    /* Worst case per tick for each phase. ml_dmablit serialises every ioctl on one global mutex,
+     * so a ranged cache op or a capture submit can queue behind the other channel's body blit,
+     * which is milliseconds; the max is what says whether the cross-fade can push a frame past
+     * its latch.
+     */
+    guint64 mx_bandcap, mx_inv, mx_blend, mx_bandwb;
 
     /* Custom DRM/KMS display sink (replaces appsrc ! kmssink). Drives the artosyn_vo driver
      * directly and retires a composite buffer to the pool ONLY when its successor's page-flip
@@ -517,11 +598,18 @@ void emit_framestats(struct ctx *c, GstClockTime pts);
 /* compose */
 int ml_heap_alloc(gsize len);
 void ml_dmabuf_sync(int fd, int start);
+void ml_dmabuf_invalidate(int fd);
 gboolean comp_pool_init(struct ctx *c);
 GstBuffer *comp_get(struct ctx *c, int *idx_out);
 void blit_tile(guint8 *out, const struct tileview *t, int dst_row);
-gboolean blit_tile_dma(struct ctx *c, int dst_fd, const struct tileview *t, int dst_row);
+gboolean blit_tile_dma(struct ctx *c, int dst_fd, const struct tileview *t, int dst_row,
+                       int src_row);
 gboolean blit_tile_staged(struct ctx *c, int dst_fd, const struct tileview *t, int dst_row);
+void seam_mode_init(struct ctx *c);
+void seam_scratch_init(struct ctx *c);
+void seam_geom_update(struct ctx *c, int ch, const struct tileview *t);
+gboolean seam_band_capture(struct ctx *c, struct comp_slot *sl, const struct tileview *t, int ch);
+gboolean seam_blend_band(struct ctx *c, struct comp_slot *sl);
 
 /* display */
 void drm_disp_submit(struct ctx *c, const struct ditem *it, GstClockTime pts);

@@ -18,11 +18,10 @@
 /**
  * @brief Blend one row of the band.
  *
- * The rounding narrow is spelled out as add-then-shift rather than vrshrn_n_u16, whose shift
- * is an immediate: that would force @p shift to be a literal, and so either a macro or one
- * copy of this loop per band height. vshlq_u16 takes its count from a vector, so a plain
- * parameter serves both planes and the function still compiles unoptimised. The two forms are
- * arithmetically identical, and seam-blend.c proves it over the whole input space.
+ * The rounding narrow is spelled out as add-then-shift. vshlq_u16 takes its shift count from a
+ * vector, so @p shift stays a plain parameter and one copy of this loop serves both planes at
+ * both band heights. It is arithmetically identical to vrshrn_n_u16, which takes an immediate,
+ * and seam-blend.c proves the two agree over the whole input space.
  */
 static void blend_row(uint8_t *dst, const uint8_t *prev, const uint8_t *cur, int width,
                       int prev_weight, int cur_weight, int shift)
@@ -47,8 +46,8 @@ static void blend_row(uint8_t *dst, const uint8_t *prev, const uint8_t *cur, int
         vst1q_u8(dst + i, vcombine_u8(vmovn_u16(acc_low), vmovn_u16(acc_high)));
     }
 
-    /* Continues where the vector loop stopped; it must not restart at 0. dst may alias prev,
-     * so a second pass over a blended pixel would blend it again.
+    /* Continues from where the vector loop stopped. dst may alias prev, so each pixel takes
+     * exactly one pass.
      */
     for (; i < width; i++) {
         unsigned acc = prev[i] * (unsigned)prev_weight + cur[i] * (unsigned)cur_weight;
@@ -63,9 +62,8 @@ bool seam_blend_supported(int rows)
 }
 
 /*
- * The weight climbs by one per row but skips the value just past the midpoint, so the ramp
- * spans the whole 0..rows range in exactly rows steps and both ends land on a whole tile. A
- * plain i would end at rows - 1 and leave a step where the band meets the current tile.
+ * The weight climbs by one per row and skips the value just past the midpoint, so the ramp
+ * spans the whole 0..rows range in exactly rows steps and both ends land on a whole tile.
  */
 void seam_weight_table(uint8_t *weights, int rows)
 {
