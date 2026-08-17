@@ -110,6 +110,25 @@ check: $(BUILD)/msp-canvas-roundtrip $(BUILD)/air-power-standby $(BUILD)/mp-para
 	$(BUILD)/rx-1v1-decode
 	$(BUILD)/msp-parser
 	$(BUILD)/ae-decision
+	@$(MAKE) --no-print-directory check-seam
+
+# The seam cross-fade kernel is NEON, so its test is the one host test that must run as
+# aarch64: cross-built and executed under qemu-user. Both tools are optional, and the test
+# reports itself skipped rather than failing the run when either is missing.
+SEAM_CC   ?= aarch64-linux-gnu-gcc
+SEAM_QEMU ?= qemu-aarch64-static
+SEAM_SRCS := tests/seam-blend.c gstreamer/src/ml-pipeline/mlp-seam.c
+
+.PHONY: check-seam
+check-seam: | $(BUILD)
+	@if ! command -v $(SEAM_CC) >/dev/null 2>&1; then \
+	    echo "seam-blend SKIPPED ($(SEAM_CC) not installed)"; \
+	  elif ! command -v $(SEAM_QEMU) >/dev/null 2>&1; then \
+	    echo "seam-blend SKIPPED ($(SEAM_QEMU) not installed)"; \
+	  else \
+	    $(SEAM_CC) $(CHECK_CFLAGS) -static -o $(BUILD)/seam-blend $(SEAM_SRCS) && \
+	    $(SEAM_QEMU) $(BUILD)/seam-blend; \
+	  fi
 
 $(BUILD)/msp-canvas-roundtrip: tests/msp-canvas-roundtrip.c ml-linkd/ml-msp.c \
                                ml-hud/src/osd/msp_canvas.c | $(BUILD)
