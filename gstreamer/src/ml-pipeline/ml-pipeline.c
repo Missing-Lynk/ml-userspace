@@ -551,13 +551,61 @@ static int run_file(struct ctx *c, const char *file, int plane, int drm_fd)
  * install happens after this one and overrides it, so listing them here only affected the window
  * before the main loop exists, where the default action is the honest outcome.
  */
-static void fatal_sig(int sig)
+/* Append @p s to @p out, returning the new end. */
+static char *put_str(char *out, const char *s)
+{
+    while (*s) {
+        *out++ = *s++;
+    }
+
+    return out;
+}
+
+/* Append @p v as 16 hex digits to @p out, returning the new end. */
+static char *put_hex64(char *out, unsigned long v)
+{
+    static const char digits[] = "0123456789abcdef";
+
+    for (int i = 15; i >= 0; i--) {
+        out[i] = digits[v & 0xf];
+        v >>= 4;
+    }
+
+    return out + 16;
+}
+
+/* Faulting address, program counter, and the runtime address of this function. The binary is
+ * a static PIE, so the PC alone means nothing across runs; the anchor gives the load bias:
+ *
+ *   nm ml-pipeline.debug | grep ' fatal_sig$'          -> LINK_ADDR
+ *   addr2line -fe ml-pipeline.debug $((PC - ANCHOR + LINK_ADDR))
+ */
+static void fatal_sig(int sig, siginfo_t *info, void *ucontext)
 {
     char msg[64] = "ml-pipeline: FATAL signal 00\n";
+    char detail[128];
+    char *end = detail;
+    unsigned long pc = 0;
+
+#if defined(__aarch64__)
+    pc = ((ucontext_t *)ucontext)->uc_mcontext.pc;
+#else
+    (void)ucontext;
+#endif
 
     msg[26] = (char)('0' + sig / 10);
     msg[27] = (char)('0' + sig % 10);
     write(2, msg, sizeof "ml-pipeline: FATAL signal 00\n" - 1);
+
+    end = put_str(end, "ml-pipeline: fault 0x");
+    end = put_hex64(end, (unsigned long)(info ? info->si_addr : NULL));
+    end = put_str(end, " pc 0x");
+    end = put_hex64(end, pc);
+    end = put_str(end, " anchor 0x");
+    end = put_hex64(end, (unsigned long)(void *)fatal_sig);
+    end = put_str(end, "\n");
+    write(2, detail, (size_t)(end - detail));
+
     _exit(128 + sig);
 }
 
@@ -577,7 +625,7 @@ int main(int argc, char **argv)
     static const int sigs[] = { SIGSEGV, SIGBUS, SIGABRT, SIGILL, SIGFPE };
 
     for (unsigned i = 0; i < sizeof sigs / sizeof sigs[0]; i++) {
-        struct sigaction sa = { .sa_handler = fatal_sig };
+        struct sigaction sa = { .sa_sigaction = fatal_sig, .sa_flags = SA_SIGINFO };
 
         sigaction(sigs[i], &sa, NULL);
     }

@@ -47,7 +47,10 @@ static void blend_row(uint8_t *dst, const uint8_t *prev, const uint8_t *cur, int
         vst1q_u8(dst + i, vcombine_u8(vmovn_u16(acc_low), vmovn_u16(acc_high)));
     }
 
-    for (i = 0; i < width; i++) {
+    /* Continues where the vector loop stopped; it must not restart at 0. dst may alias prev,
+     * so a second pass over a blended pixel would blend it again.
+     */
+    for (; i < width; i++) {
         unsigned acc = prev[i] * (unsigned)prev_weight + cur[i] * (unsigned)cur_weight;
 
         dst[i] = (uint8_t)((acc + round_addend) >> shift);

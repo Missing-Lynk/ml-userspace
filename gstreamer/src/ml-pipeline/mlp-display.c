@@ -82,6 +82,29 @@ static guint32 drm_make_fb(struct ctx *c, int dmabuf_fd, guint32 *handle_out)
     return fb;
 }
 
+/* The kernel queues page-flip events on the drm_file, and that file outlives this process:
+ * ml-drmfd holds it open across pipeline generations. So the flip user_data must never be a
+ * pointer. A generation killed with a flip in flight leaves its event queued; the next
+ * generation's drmHandleEvent is handed that event, and a pointer there would be dereferenced
+ * against a dead address space - ctx is a local of main(), so it is a stack address. The event
+ * carries a per-process token instead, and the handler resolves the context itself.
+ */
+static struct ctx *g_disp_ctx;
+static unsigned long g_flip_token;
+
+/* Discard events queued before this generation started; they belong to a dead one. */
+static void drm_drain_events(int fd)
+{
+    struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
+    char buf[1024];
+
+    while (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
+        if (read(fd, buf, sizeof buf) <= 0) {
+            break;
+        }
+    }
+}
+
 /* Page-flip completion. Runs on the display thread inside drmHandleEvent, so
  * prev/front/pending are single-threaded here (no lock). The unref returns the retired
  * compbuf to comp_free via comp_on_finalize.
@@ -126,12 +149,17 @@ static int plane_commit(struct ctx *c, const struct ditem *it);
 static void drm_flip_handler(int fd, unsigned int seq, unsigned int tv_s,
                              unsigned int tv_us, void *data)
 {
-    struct ctx *c = data;
+    struct ctx *c = g_disp_ctx;
 
     (void)fd;
     (void)seq;
     (void)tv_s;
     (void)tv_us;
+
+    /* A previous generation's flip completing after we drained: not ours, nothing to retire. */
+    if (!c || (unsigned long)data != g_flip_token) {
+        return;
+    }
 
     if (c->retire_arm) {                /* SIGUSR1: arm a burst of post-scanout dumps */
         c->retire_dumps += c->retire_arm;
@@ -207,7 +235,8 @@ static void disp_try_submit(struct ctx *c)
         rc = plane_commit(c, &it);
     } else {
         guint32 fbid = c->single ? it.fb[0] : c->fb_id[it.cbi];
-        rc = drmModePageFlip(c->drm_fd, c->crtc_id, fbid, DRM_MODE_PAGE_FLIP_EVENT, c);
+        rc = drmModePageFlip(c->drm_fd, c->crtc_id, fbid, DRM_MODE_PAGE_FLIP_EVENT,
+                             (void *)g_flip_token);
     }
 
     if (rc) {
@@ -258,7 +287,8 @@ static int plane_commit(struct ctx *c, const struct ditem *it)
     }
 
     ret = drmModeAtomicCommit(c->drm_fd, r,
-                              DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK, c);
+                              DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK,
+                              (void *)g_flip_token);
     drmModeAtomicFree(r);
     return ret;
 }
@@ -713,6 +743,13 @@ int drm_disp_init(struct ctx *c)
             }
         }
     }
+
+    /* Before any event is read: claim this generation's token and drop whatever the previous
+     * one left queued.
+     */
+    g_disp_ctx = c;
+    g_flip_token = (unsigned long)getpid();
+    drm_drain_events(c->drm_fd);
 
     c->disp_run = 1;
     return pthread_create(&c->disp_thread, NULL, drm_disp_run, c) ? -1 : 0;
