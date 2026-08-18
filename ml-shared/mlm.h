@@ -4,12 +4,12 @@
  * ml-shared/ folder; every component (gstreamer/src tools, ml-linkd, ml-ledd, hud)
  * includes it from here.
  *
- * Two seams, both under /run/missinglynk:
- *  - drm.sock       SOCK_STREAM; ml-drmfd passes the shared DRM master fd via SCM_RIGHTS.
- *  - telemetry.sock SOCK_DGRAM; one datagram = one mlm_hdr-framed record, consumer binds,
- *    producer sends MSG_DONTWAIT and drops on error (video never blocks on the HUD).
- *  - osd.sock       same datagram contract, MSP DisplayPort records (the HUD binds; ml-linkd,
- *                    or ml-hud/tools/osd-replay on the bench, sends).
+ * Two transports; every socket lives under /run/missinglynk:
+ *  - SOCK_STREAM, drm.sock only: ml-drmfd passes the shared DRM master fd via SCM_RIGHTS.
+ *  - SOCK_DGRAM, every other socket: one datagram = one mlm_hdr-framed record. The consumer
+ *    binds, the producer sends MSG_DONTWAIT and drops on error (video never blocks on the HUD).
+ *
+ * Each socket's binder and direction is on its MLM_*_SOCK define below.
  */
 #ifndef MLM_H
 #define MLM_H
@@ -22,12 +22,23 @@
 
 #define MLM_RUN_DIR        "/run/missinglynk"
 
+/* ml-drmfd binds; ml-hud and ml-pipeline connect and fetch the fd */
 #define MLM_DRM_SOCK       MLM_RUN_DIR "/drm.sock"
+
+/* ml-hud binds; ml-linkd sends STATUS/LINK/LINKINFO/SCAN, ml-pipeline sends STATE/FRAMESTATS */
 #define MLM_TELEMETRY_SOCK MLM_RUN_DIR "/telemetry.sock"
+
+/* ml-hud binds; ml-linkd sends MSP DisplayPort records (ml-hud/tools/osd-replay on the bench) */
 #define MLM_OSD_SOCK       MLM_RUN_DIR "/osd.sock"
-#define MLM_LINK_SOCK      MLM_RUN_DIR "/link.sock"   /* consumer -> ml-linkd: READY gate */
-#define MLM_LED_SOCK       MLM_RUN_DIR "/led.sock"    /* any producer -> ml-ledd: LED command */
-#define MLM_CTRL_SOCK      MLM_RUN_DIR "/ctrl.sock"   /* HUD -> ml-pipeline: control commands (ml-pipeline binds) */
+
+/* ml-linkd binds; ml-pipeline sends the READY gate, the HUD and ml-rfcmd send RFCMD */
+#define MLM_LINK_SOCK      MLM_RUN_DIR "/link.sock"
+
+/* ml-ledd binds; any producer sends an LED command */
+#define MLM_LED_SOCK       MLM_RUN_DIR "/led.sock"
+
+/* ml-pipeline binds; the HUD, ml-rec and ml-play send control commands */
+#define MLM_CTRL_SOCK      MLM_RUN_DIR "/ctrl.sock"
 
 #define MLM_MAGIC 0x314d4c4du /* "MLM1" little-endian */
 
@@ -45,6 +56,13 @@ enum mlm_type {
     MLM_T_RFCMD      = 0x000a, /* HUD -> ml-linkd (link.sock): air-unit RF config command */
     MLM_T_SCAN       = 0x000b, /* ml-linkd -> HUD (telemetry.sock): RF channel scan result */
 };
+
+/* Fields carrying an enum value are declared uintN_t below, never as the enum type. The append
+ * rule makes an out-of-enum value legal on the wire (a newer producer reaching an older consumer),
+ * and an enum object is not guaranteed to represent one; two of these fields are also narrower
+ * than an enum can be here (mlm_hdr.type u16, mlm_led.mode u8). Consumers switch on the raw value
+ * and keep a default case. The same applies to the flags fields, which hold OR'd MLM_*_F_* bits,
+ * and to enum mlm_cam_sel, packed into the high half of mlm_rfcmd.arg. */
 
 struct mlm_hdr {
     uint32_t magic;
@@ -97,17 +115,20 @@ struct mlm_link {
  * air unit's own :10000 status frames (voltage/temperature) that ride MLM_T_STATUS. Each field is
  * self-describing: a sentinel means "not known yet / no link", so the HUD renders a dim placeholder.
  */
+
 /* channel/snr/distance sentinel: unknown or no link. INT32_MIN (not -1) so it never collides with a
- * valid reading - SNR in dB can legitimately be negative on a weak link. */
+ * valid reading - SNR in dB can legitimately be negative on a weak link. snr_db is the only one of
+ * the three whose real values ever go negative; channel (0..18) and distance_m (clamped at 0 by the
+ * producer) are signed only to carry this sentinel, so all three share one constant and one test. */
 #define MLM_LINKINFO_NONE INT32_MIN
 
 struct mlm_linkinfo {
-    int32_t  channel;      /* channel table index the RX is tuned to (the select value), or MLM_LINKINFO_NONE */
-    int32_t  snr_db;       /* link SNR in dB (from Get1V1Info), or MLM_LINKINFO_NONE */
-    int32_t  distance_m;   /* RF-ranging distance in metres, or MLM_LINKINFO_NONE (not ranging) */
-    uint32_t flags;        /* MLM_LINKINFO_F_* validity/state bits */
+    int32_t  channel;         /* channel table index the RX is tuned to (the select value), or MLM_LINKINFO_NONE */
+    int32_t  snr_db;          /* link SNR in dB (from Get1V1Info), or MLM_LINKINFO_NONE */
+    int32_t  distance_m;      /* RF-ranging distance in metres, or MLM_LINKINFO_NONE (not ranging) */
+    uint32_t flags;           /* MLM_LINKINFO_F_* validity/state bits */
     uint32_t throughput_kbps; /* measured PHY link throughput / capacity (Get1V1Info +0x0c); NOT the
-                            * encoder bitrate. 0 = unknown / no video link. Appended, older readers ignore. */
+                               * encoder bitrate. 0 = unknown / no video link. Appended, older readers ignore. */
 } __attribute__((packed));
 
 /* The air unit is currently in standby (its work-mode sync, :10000 SetStandyMode 0x12, reports
@@ -126,7 +147,7 @@ struct mlm_linkinfo {
  * link-up and on a slow cadence, without sweeping, so the HUD can show the channel grid from the
  * start; a full sweep republishes with `measured` = 1. The retune-and-measure sweep, which interrupts
  * video, stays a one-shot on an explicit HUD request. */
-#define MLM_SCAN_MAX_CH     19
+#define MLM_SCAN_MAX_CH      19
 #define MLM_SCAN_SIGNAL_NONE INT16_MIN     /* snr_db has no value (snr_raw <= 0) */
 
 /* snr_raw sentinels. The vendor buckets the RAW value, so it is the wire's source of truth and
@@ -147,7 +168,10 @@ struct mlm_scan {
     uint8_t  count;      /* number of entries in chan[] */
     uint8_t  active_idx; /* table index the local RX is currently tuned to (for the active highlight) */
     uint8_t  measured;   /* 1 = snr_* came from a completed sweep; 0 = table-only seed (SNRs unmeasured) */
-    uint8_t  pad[1];
+    uint8_t  reserved;   /* sent as 0 (producers memset the whole struct; no code names this
+                          * field). Not compiler padding, the struct is packed: it holds chan[]
+                          * at offset 8 so a future u8 can take the slot without shifting the
+                          * array. */
     struct mlm_scan_chan chan[MLM_SCAN_MAX_CH];
 } __attribute__((packed));
 
@@ -171,8 +195,8 @@ struct mlm_led {
 
 /* MLM_T_CMD payload (HUD -> ml-pipeline on ctrl.sock). ml-pipeline is the source of truth for what
  * it is doing, so commands express intent, not absolute state: REC_TOGGLE flips recording and the
- * pipeline reports the result back as MLM_T_STATE. New commands (playback: PLAY/PAUSE/SEEK/STOP)
- * append; the pipeline ignores unknown cmd values. `arg` is command-specific (unused for the toggle).
+ * pipeline reports the result back as MLM_T_STATE. New commands append.
+ * The pipeline ignores unknown cmd values. `arg` is command-specific (unused for the toggle).
  */
 enum mlm_cmd_type {
     MLM_CMD_REC_TOGGLE = 1, /* start recording if idle, stop if recording */
@@ -221,6 +245,7 @@ struct mlm_cmd {
     uint32_t cmd; /* enum mlm_cmd_type */
     uint32_t arg; /* command-specific; 0 when unused, permille for SEEK */
 } __attribute__((packed));
+
 /* MLM_CMD_PLAY carries the file path as bytes after the mlm_cmd in the same datagram; the
  * full frame is { mlm_hdr, mlm_cmd, char path[] } (NUL-terminated, bounded by MLM_PATH_MAX). */
 #define MLM_PATH_MAX 512
@@ -232,10 +257,10 @@ struct mlm_cmd {
  * transparent (the HUD's own binary-alpha draw rule); ml-pipeline only ever writes the opaque
  * pixels. A frame with no pixel bytes clears the cell.
  */
-#define MLM_OSD_ROWS      20    /* BTFL HD DisplayPort grid (mirrors BTFL_OSD_ROWS/COLS) */
+#define MLM_OSD_ROWS      20     /* BTFL HD DisplayPort grid (mirrors BTFL_OSD_ROWS/COLS) */
 #define MLM_OSD_COLS      53
 #define MLM_OSD_CLEAR_ALL 0xffff /* row = col = this: clear every cached cell */
-#define MLM_OSD_CELL_WMAX 64    /* rect bounds a receiver must enforce */
+#define MLM_OSD_CELL_WMAX 64     /* rect bounds a receiver must enforce */
 #define MLM_OSD_CELL_HMAX 64
 #define MLM_OSD_CELL_MAX  (sizeof(struct mlm_osd_cell) + \
                            (size_t) MLM_OSD_CELL_WMAX * MLM_OSD_CELL_HMAX * 4)
@@ -248,7 +273,7 @@ struct mlm_osd_cell {
 
 /* MLM_T_STATE payload (ml-pipeline -> HUD on telemetry.sock). The pipeline broadcasts its current
  * mode on every change and re-asserts periodically, so a restarted HUD (or one that missed a
- * datagram) reconverges. New modes (PLAYBACK, ...) append; the HUD treats unknown values as IDLE.
+ * datagram) reconverges. New modes append. The HUD treats unknown values as IDLE.
  */
 enum mlm_state_mode {
     MLM_STATE_IDLE      = 0, /* receiving/decoding the live stream only */
@@ -263,29 +288,33 @@ struct mlm_state {
     uint32_t dur_ms;   /* playback: clip duration in ms (0 if unknown / not playing) */
 } __attribute__((packed));
 
-#define MLM_STATE_F_PAUSED 0x1 /* playback is paused (only meaningful in MLM_STATE_PLAYBACK) */
-#define MLM_STATE_F_ENDED  0x2 /* playback reached end-of-clip: last frame held, position at duration,
-                                *  awaiting the user (replay or exit). Still MLM_STATE_PLAYBACK. */
-#define MLM_STATE_F_RENDERING 0x4 /* first decoded frame is on the display (the clip is visible); before
-                                   *  this the HUD keeps the menu up with a loading spinner. */
+#define MLM_STATE_F_PAUSED 0x1     /* playback is paused (only meaningful in MLM_STATE_PLAYBACK) */
+#define MLM_STATE_F_ENDED  0x2     /* playback reached end-of-clip: last frame held, position at duration,
+                                    *  awaiting the user (replay or exit). Still MLM_STATE_PLAYBACK. */
+#define MLM_STATE_F_RENDERING 0x4  /* first decoded frame is on the display (the clip is visible); before
+                                    *  this the HUD keeps the menu up with a loading spinner. */
 #define MLM_STATE_F_VIDEO_LIVE 0x8 /* the pipeline is actively flipping frames to the display (a flip
                                     *  event within the last 500 ms). Video commits latch the whole VO
                                     *  shadow state including the HUD overlay's pixels, so while this
                                     *  is fresh the HUD suppresses its own per-present plane re-assert
                                     *  (a blocking SETPLANE commit that stalls the next video flip a
                                     *  full vblank in DRM's stall_checks). */
-#define MLM_STATE_F_RTSP   0x10 /* the RTSP restream is UP: enabled (MLM_CMD_RTSP) AND its encoder
-                                *  running. Reports actual state, not intent: the HUD re-asserts
-                                *  the dvr.rtsp_stream setting whenever this diverges from it,
-                                *  which retries a failed or torn-down encoder start (and covers
-                                *  a pipeline restart). Expected to read off during playback (the
-                                *  encoder yields the codec pool to the playback decoder). */
+#define MLM_STATE_F_RTSP   0x10    /* the RTSP restream is UP: enabled (MLM_CMD_RTSP) AND its encoder
+                                    *  running. Reports actual state, not intent: the HUD re-asserts
+                                    *  the dvr.rtsp_stream setting whenever this diverges from it,
+                                    *  which retries a failed or torn-down encoder start (and covers
+                                    *  a pipeline restart). Expected to read off during playback (the
+                                    *  encoder yields the codec pool to the playback decoder). */
 
 /* MLM_T_RFCMD payload (HUD -> ml-linkd on link.sock). ml-linkd owns /dev/artosyn_sdio and the
  * :10000 message channel, so the HUD never touches the air directly: it sends intent, and ml-linkd
  * translates it into the air's config datagrams and re-applies it after a session restart. The HUD
  * re-asserts on every link-up edge so the air converges to the menu's state (a default that was
- * never toggled still needs pushing). New cmds append; ml-linkd ignores unknown values.
+ * never toggled still needs pushing).
+ *
+ * Notes:
+ * - New cmds append.
+ * - ml-linkd ignores unknown values.
  */
 enum mlm_rfcmd_type {
     MLM_RF_SET_STANDBY = 1, /* arg = 1 arm standby, 0 disarm. Rides SetTranParm (:10000 msg 0x0D)
@@ -367,7 +396,11 @@ struct mlm_rfcmd {
  * next link-up edge regardless). */
 static inline int mlm_rfcmd_send(uint32_t cmd, uint32_t arg)
 {
-    struct { struct mlm_hdr h; struct mlm_rfcmd cmd; } __attribute__((packed)) frame;
+    struct {
+        struct mlm_hdr h;
+        struct mlm_rfcmd cmd;
+    } __attribute__((packed)) frame;
+
     frame.h.magic = MLM_MAGIC;
     frame.h.type = MLM_T_RFCMD;
     frame.h.flags = 0;
@@ -392,11 +425,21 @@ static inline int mlm_rfcmd_send(uint32_t cmd, uint32_t arg)
 static inline int mlm_send_fd(int sock, int fd)
 {
     char byte = 'F';
-    struct iovec iov = { .iov_base = &byte, .iov_len = 1 };
-    union { struct cmsghdr align; char buf[CMSG_SPACE(sizeof(int))]; } control;
+    struct iovec iov = {
+        .iov_base = &byte,
+        .iov_len = 1
+    };
+    union {
+        struct cmsghdr align;
+        char buf[CMSG_SPACE(sizeof(int))];
+    } control;
     memset(&control, 0, sizeof control);
-    struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1,
-                          .msg_control = control.buf, .msg_controllen = sizeof control.buf };
+    struct msghdr msg = {
+        .msg_iov = &iov,
+        .msg_iovlen = 1,
+        .msg_control = control.buf,
+        .msg_controllen = sizeof control.buf
+    };
 
     struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
     cmsg->cmsg_level = SOL_SOCKET;
@@ -410,11 +453,21 @@ static inline int mlm_send_fd(int sock, int fd)
 static inline int mlm_recv_fd(int sock)
 {
     char byte;
-    struct iovec iov = { .iov_base = &byte, .iov_len = 1 };
-    union { struct cmsghdr align; char buf[CMSG_SPACE(sizeof(int))]; } control;
+    struct iovec iov = {
+        .iov_base = &byte,
+        .iov_len = 1
+    };
+    union {
+        struct cmsghdr align;
+        char buf[CMSG_SPACE(sizeof(int))];
+    } control;
     memset(&control, 0, sizeof control);
-    struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1,
-                          .msg_control = control.buf, .msg_controllen = sizeof control.buf };
+    struct msghdr msg = {
+        .msg_iov = &iov,
+        .msg_iovlen = 1,
+        .msg_control = control.buf,
+        .msg_controllen = sizeof control.buf
+    };
 
     if (recvmsg(sock, &msg, 0) != 1) {
         return -1;
@@ -457,7 +510,11 @@ static inline int mlm_get_drm_fd(void)
  * down pipeline just means nobody is bound). */
 static inline int mlm_ctrl_send(uint32_t cmd, uint32_t arg, const char *path)
 {
-    struct { struct mlm_hdr h; struct mlm_cmd cmd; char path[MLM_PATH_MAX]; } __attribute__((packed)) frame;
+    struct {
+        struct mlm_hdr h;
+        struct mlm_cmd cmd;
+        char path[MLM_PATH_MAX];
+    } __attribute__((packed)) frame;
     size_t len = sizeof frame.h + sizeof frame.cmd;
 
     frame.h.magic = MLM_MAGIC;
@@ -491,8 +548,11 @@ static inline int mlm_ctrl_send(uint32_t cmd, uint32_t arg, const char *path)
  */
 static inline int mlm_ctrl_send_blob(uint32_t cmd, uint32_t arg, const void *data, size_t len)
 {
-    struct { struct mlm_hdr h; struct mlm_cmd cmd; unsigned char blob[MLM_OSD_CELL_MAX]; }
-        __attribute__((packed)) frame;
+    struct {
+        struct mlm_hdr h;
+        struct mlm_cmd cmd;
+        unsigned char blob[MLM_OSD_CELL_MAX];
+    } __attribute__((packed)) frame;
     size_t total = sizeof frame.h + sizeof frame.cmd + len;
 
     if (len > sizeof frame.blob) {
