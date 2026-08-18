@@ -284,13 +284,21 @@ GstFlowReturn on_tile(GstAppSink *sink, gpointer u)
                     c->mx_bandcap = us;
                 }
             } else {
-                sl->seam_ok[ch] = c->seam_geom;
+                /* Tile 0 lands at row 0 in every seam mode - the split adjustment above is
+                 * tile 1's alone - so its copy of the band is in the composite as soon as it
+                 * has blitted, whatever the geometry flag said at the time. Reading seam_geom
+                 * here instead would report the state BEFORE tile 1's height is known, which is
+                 * false for the first pair of every stream and every resolution change, and the
+                 * blend would decline a pair it could serve.
+                 */
+                sl->seam_ok[ch] = (ch == 0) ? TRUE : c->seam_geom;
             }
         } else if (blit_tile_staged(c, cfd, &t, fb_row)) {
-            /* No DMA path for this tile: it takes the overwrite placement and covers the band
-             * itself, so this pair goes out unblended and counts as seam_skip.
+            /* Staged tiles take the overwrite placement. For tile 0 that is the same row 0, so
+             * its band is still usable; tile 1 covers the band, and that pair cannot blend.
              */
             c->blit_dma++;
+            sl->seam_ok[ch] = (ch == 0);
         } else {
             blit_tile(c->comp_pool[sl->cbi].map, &t, fb_row);
             if (c->dmablit_fd >= 0) {
@@ -300,6 +308,10 @@ GstFlowReturn on_tile(GstAppSink *sink, gpointer u)
             }
 
             c->blit_cpu++;
+            /* Same placement argument as the staged path, and the flush above puts tile 0's
+             * band in DDR before the blend's ranged invalidate reads it back.
+             */
+            sl->seam_ok[ch] = (ch == 0);
         }
 
         sl->have[ch] = TRUE;
@@ -733,11 +745,14 @@ gboolean rf_ready_tick(gpointer u)
     if (c->seam_mode != SEAM_OFF) {
         guint64 n = c->n_blend ? c->n_blend : 1;
 
-        fprintf(stderr, "ml-pipeline: seam mode=%d geom=%d band=%d..%d pool=%d done=%llu skip=%llu "
+        fprintf(stderr, "ml-pipeline: seam mode=%d geom=%d band=%d..%d pool=%d done=%llu "
+                "skip=%llu(geom %llu ring %llu cache %llu) "
                 "cap=%llu/%llu inv=%llu/%llu blend=%llu/%llu wb=%llu/%llu us(mean/max) "
                 "order=%llu/%llu\n",
                 (int)c->seam_mode, c->seam_geom, c->seam_top, c->seam_top + TILE_OVER - 1,
                 c->comp_n, (unsigned long long)c->seam_done, (unsigned long long)c->seam_skip,
+                (unsigned long long)c->seam_skip_geom, (unsigned long long)c->seam_skip_ring,
+                (unsigned long long)c->seam_skip_cache,
                 (unsigned long long)(c->ns_bandcap / n), (unsigned long long)c->mx_bandcap,
                 (unsigned long long)(c->ns_inv / n), (unsigned long long)c->mx_inv,
                 (unsigned long long)(c->ns_blend / n), (unsigned long long)c->mx_blend,

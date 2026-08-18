@@ -642,6 +642,7 @@ gboolean seam_blend_band(struct ctx *c, struct comp_slot *sl)
     }
 
     if (!sl->seam_ok[0] || !sl->seam_ok[1]) {
+        c->seam_skip_geom++;
         return FALSE;
     }
 
@@ -649,9 +650,10 @@ gboolean seam_blend_band(struct ctx *c, struct comp_slot *sl)
 
     /* A pair whose tile 1 arrived first holds its region until tile 0 lands, and another pair's
      * tile 1 can claim the same region in between. The stamp catches that; the ring depth sets
-     * how often it happens, counted as seam_skip.
+     * how often it happens.
      */
     if (c->seam_stamp[region] != sl->pts) {
+        c->seam_skip_ring++;
         return FALSE;
     }
 
@@ -665,11 +667,13 @@ gboolean seam_blend_band(struct ctx *c, struct comp_slot *sl)
      */
     t0 = g_get_monotonic_time();
     if (!band_cache_all(c, fd, ML_DMABLIT_INVALIDATE)) {
+        c->seam_skip_cache++;
         return FALSE;
     }
 
     if (c->seam_scratch_cached &&
         !band_cache(c, c->seam_scratch_fd, BAND_Y_OFF(region), COMP_BAND_SIZE, ML_DMABLIT_INVALIDATE)) {
+        c->seam_skip_cache++;
         return FALSE;
     }
 
@@ -702,8 +706,24 @@ gboolean seam_blend_band(struct ctx *c, struct comp_slot *sl)
         }
     }
 
+    /* The clean is the step that makes the blend visible to the display controller, which does
+     * not snoop. An unchecked failure here leaves the band dirty in cache: this frame scans the
+     * pre-blend rows out of DDR, and the dirty lines land later, over whatever DMA has written
+     * into this pooled buffer by then. Retry once, then give up on the pair and say so.
+     */
     t0 = g_get_monotonic_time();
-    band_cache_all(c, fd, ML_DMABLIT_CLEAN);
+    if (!band_cache_all(c, fd, ML_DMABLIT_CLEAN) &&
+        !band_cache_all(c, fd, ML_DMABLIT_CLEAN)) {
+        if (!c->seam_clean_warned) {
+            c->seam_clean_warned = TRUE;
+            fprintf(stderr, "ml-pipeline: seam clean failed (%s) - band left unflushed\n",
+                    strerror(errno));
+        }
+
+        c->seam_skip_cache++;
+
+        return FALSE;
+    }
     {
         guint64 us = (guint64)(g_get_monotonic_time() - t0);
 

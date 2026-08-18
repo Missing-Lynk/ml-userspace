@@ -346,6 +346,7 @@ struct ctx {
     int seam_top;                       /* first composite luma row of the band (seam_h0 - TILE_OVER) */
     gboolean seam_geom;                 /* the split geometry is derived and usable */
     gboolean seam_warned;               /* one-shot: logged a geometry mismatch already */
+    gboolean seam_clean_warned;         /* one-shot: logged a failed band clean already */
 
     /* Band scratch: a ring of COMP_BAND_SLOTS regions, each holding one pair's copy of tile 1's
      * overlap band, DMA'd out of that tile's decoder buffer. Cached, so the cross-fade reads it
@@ -360,7 +361,13 @@ struct ctx {
     GstClockTime seam_stamp[COMP_BAND_SLOTS];   /* PTS each ring region holds; the blend compares
                                                  * it against the pair's own */
     guint64 seam_done;                  /* pairs whose band was cross-faded */
-    guint64 seam_skip;                  /* pairs that could not blend (geometry, no DMA path) */
+    guint64 seam_skip;                  /* pairs that could not blend: the sum of the three below */
+    guint64 seam_skip_geom;             /* the split geometry was not in force for one of the
+                                         * halves, so the band does not hold what the blend
+                                         * expects: tile 1 took the overwrite placement, or a
+                                         * tile had no DMA path */
+    guint64 seam_skip_ring;             /* a later pair claimed this pair's scratch region */
+    guint64 seam_skip_cache;            /* a cache-maintenance ioctl failed */
     guint64 first_ch_n[RF_NCHN];        /* which channel's half landed first, per completed pair */
     guint64 ns_bandcap;                 /* tile 1's band capture submit (us) */
     guint64 ns_inv;                     /* ranged invalidate of the composite band (us) */
