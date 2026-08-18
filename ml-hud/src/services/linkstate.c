@@ -217,6 +217,11 @@ bool linkstate_is_rtsp_on(void)
     return (g_pb_flags & MLM_STATE_F_RTSP) != 0;
 }
 
+bool linkstate_is_latency_counter_on(void)
+{
+    return (g_pb_flags & MLM_STATE_F_LATENCY_COUNTER) != 0;
+}
+
 bool linkstate_is_airunit_connected(void)
 {
     return g_last_seen_ms != 0 && (uint32_t) (now_ms() - g_last_seen_ms) < LINK_STALE_MS;

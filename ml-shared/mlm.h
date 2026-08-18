@@ -239,6 +239,14 @@ enum mlm_cmd_type {
                              *  companion app's default URL works); with no recording active it
                              *  runs the encoder with no file branch. The pipeline reports the
                              *  enabled state back via MLM_STATE_F_RTSP. */
+    MLM_CMD_LATENCY_COUNTER    = 13, /* enable/disable the glass-to-glass latency counter: arg = 1 on,
+                             *  0 off. Idempotent set, like MLM_CMD_RTSP, so the HUD re-asserts
+                             *  the goggles.show_latency_counter setting freely. While on,
+                             *  ml-pipeline burns a millisecond counter into every composite, so
+                             *  it reaches the panel and any recording identically; filming the
+                             *  panel with the air unit's camera then puts a live and a nested
+                             *  copy in one frame, whose difference is the end-to-end latency.
+                             *  The pipeline reports the state back via MLM_STATE_F_LATENCY_COUNTER. */
 };
 
 struct mlm_cmd {
@@ -305,6 +313,9 @@ struct mlm_state {
                                     *  which retries a failed or torn-down encoder start (and covers
                                     *  a pipeline restart). Expected to read off during playback (the
                                     *  encoder yields the codec pool to the playback decoder). */
+#define MLM_STATE_F_LATENCY_COUNTER 0x20   /* the glass-to-glass latency counter is being burned into the
+                                    *  composite (MLM_CMD_LATENCY_COUNTER). Reports actual state, so the
+                                    *  HUD re-asserts its setting after a pipeline restart. */
 
 /* MLM_T_RFCMD payload (HUD -> ml-linkd on link.sock). ml-linkd owns /dev/artosyn_sdio and the
  * :10000 message channel, so the HUD never touches the air directly: it sends intent, and ml-linkd

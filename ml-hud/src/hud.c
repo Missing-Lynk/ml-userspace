@@ -118,6 +118,7 @@ typedef struct {
     uint32_t       srt_next_ms;      /* next DVR subtitle line (while recording, save_srt on) */
     int            burn_active;      /* DVR OSD burn-in gate is open (recording + dvr.record_osd) */
     uint32_t       rtsp_assert_ms;   /* rtsp_tick rate limit: next allowed re-assert (ms) */
+    uint32_t       latency_counter_assert_ms; /* latency_counter_tick rate limit: next allowed re-assert (ms) */
     uint32_t       rec_seen_ms;      /* when RECORDING was first observed (FlightTime base); 0 = not recording */
     int            rec_autostop_sent;  /* latch: the "stream lost" record-stop toggle was already sent */
     int            rec_autostart_sent; /* latch: the "stream up" auto-record start toggle was already sent */
@@ -161,6 +162,16 @@ static void render_and_present(hud_ctx_t *h, const unsigned char *canvas, int le
     h->rendered++;
 }
 
+/* Whether the glass-to-glass latency counter is meant to be running. The filmed panel has to
+ * carry the counter and nothing else, so this also suppresses the HUD's own overlays; it is read
+ * from the setting rather than the pipeline's reported state so the suppression does not flicker
+ * while the two are reconciling.
+ */
+static bool latency_counter_is_enabled(hud_ctx_t *h)
+{
+    return settings_get_bool_in(h->settings, "goggle", "show_latency_counter", 0) != 0;
+}
+
 static void on_osd(void *ctx, const unsigned char *canvas, int len)
 {
     hud_ctx_t *h = ctx;
@@ -172,6 +183,14 @@ static void on_osd(void *ctx, const unsigned char *canvas, int len)
      */
     if (h->burn_active) {
         btfl_burn_update(canvas, len);
+    }
+
+    /* Latency mode: the air unit is filming this panel, so nothing but the counter may be on it.
+     * A runtime override, never a write to the user's settings, so turning the mode off restores
+     * whatever overlays they had.
+     */
+    if (latency_counter_is_enabled(h)) {
+        return;
     }
 
     if (!hud_btfl_visible(h->state)) {
@@ -493,6 +512,27 @@ static void rtsp_tick(hud_ctx_t *h, uint32_t now)
     h->rtsp_assert_ms = now + 1000;
 }
 
+/* Latency counter reconcile, the same shape as rtsp_tick: the goggles.show_latency_counter
+ * setting is the intent, MLM_STATE_F_LATENCY_COUNTER is the pipeline's truth, and the command is an
+ * idempotent set, so re-asserting while they diverge costs nothing and recovers a restarted
+ * pipeline.
+ */
+static void latency_counter_tick(hud_ctx_t *h, uint32_t now)
+{
+    int want = latency_counter_is_enabled(h);
+
+    if (!linkstate_has_pipeline_state() || linkstate_is_latency_counter_on() == want) {
+        return;
+    }
+
+    if (h->latency_counter_assert_ms != 0 && (int32_t) (now - h->latency_counter_assert_ms) < 0) {
+        return;
+    }
+
+    pipecmd_set_latency_counter(want);
+    h->latency_counter_assert_ms = now + 1000;
+}
+
 /* DVR OSD burn-in gate: open while recording with dvr.record_osd on. On the rising edge the
  * pipeline's cell cache is cleared and the burn grid invalidated, so the next canvas re-sends
  * every occupied cell and the two sides restart in sync (also covers a setting toggled on
@@ -504,7 +544,8 @@ static void burn_tick(hud_ctx_t *h, int recording)
 {
     /* the RTSP restream is the recording's twin (same encoder feed), so record_osd covers it too */
     int active = (recording || linkstate_is_rtsp_on())
-              && settings_get_bool_in(h->settings, "dvr", "record_osd", 0);
+              && settings_get_bool_in(h->settings, "dvr", "record_osd", 0)
+              && !latency_counter_is_enabled(h);
 
     if (active != h->burn_active) {
         pipecmd_osd_clear();
@@ -991,6 +1032,7 @@ int main(int argc, char **argv)
         srt_tick(&h, recording, connected, now);
         burn_tick(&h, recording);
         rtsp_tick(&h, now);
+        latency_counter_tick(&h, now);
         sysosd_tick(&h, now);
         tempwarn_tick(&h, connected, now);
         back_longpress_tick(&h);

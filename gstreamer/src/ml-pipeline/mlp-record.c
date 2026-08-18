@@ -770,6 +770,7 @@ void send_state(struct ctx *c)
                       | (c->pb_active && c->pb_ended ? MLM_STATE_F_ENDED : 0)
                       | (c->pb_active && c->pb_rendering ? MLM_STATE_F_RENDERING : 0)
                       | (c->rtsp_on && c->enc_on ? MLM_STATE_F_RTSP : 0)
+                      | (c->latency_counter_on ? MLM_STATE_F_LATENCY_COUNTER : 0)
                       | (c->flip_last_us != 0
                          && g_get_monotonic_time() - c->flip_last_us < 500000
                              ? MLM_STATE_F_VIDEO_LIVE : 0),
@@ -937,6 +938,12 @@ gboolean on_ctrl(gint fd, GIOCondition cond, gpointer u)
         case MLM_CMD_RTSP: {
             /* idempotent restream enable/disable; may spin the encoder up (file-less) or down */
             rtsp_set(c, cmd.arg != 0);
+            send_state(c);
+        } break;
+
+        case MLM_CMD_LATENCY_COUNTER: {
+            /* idempotent enable of the composite's latency counter; costs one branch per frame */
+            c->latency_counter_on = (cmd.arg != 0);
             send_state(c);
         } break;
 

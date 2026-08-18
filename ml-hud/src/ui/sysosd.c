@@ -593,8 +593,15 @@ void sysosd_update(const telemetry_t *telemetry, const air_telem_t *air, setting
         return;
     }
 
-    /* The bar shows while the menu is open (for context) or the Show System OSD setting is on. */
-    int show_bar = g_menu_open || settings_get_bool_in(settings, GOG_SECTION, "show_system_osd", 1);
+    /* The bar shows while the menu is open (for context) or the Show System OSD setting is on.
+     * The latency counter suppresses it, because the air unit is filming this panel and only the
+     * counter may be on it, but not while the menu is open: nobody films a capture run with the
+     * menu up, and the bar is what the menu needs for context. A runtime override either way, so
+     * the user's own setting is untouched.
+     */
+    int show_bar = g_menu_open
+                || (settings_get_bool_in(settings, GOG_SECTION, "show_system_osd", 1)
+                    && !settings_get_bool_in(settings, GOG_SECTION, "show_latency_counter", 0));
     if (show_bar) {
         lv_obj_remove_flag(g_osd, LV_OBJ_FLAG_HIDDEN);
     } else {

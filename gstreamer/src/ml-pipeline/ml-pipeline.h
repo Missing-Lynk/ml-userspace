@@ -255,6 +255,10 @@ struct ctx {
                                          * gates the composite feed (slot_push) and rec_push */
     volatile int rtsp_on;               /* the RTSP restream is enabled (MLM_CMD_RTSP); with no
                                          * recording the bin runs with no file branch */
+    volatile int latency_counter_on;    /* the glass-to-glass latency counter is burned into every
+                                         * composite (MLM_CMD_LATENCY_COUNTER). Deliberately NOT gated on
+                                         * enc_on: the counter has to be on the panel before a
+                                         * recording starts, so the air unit can be aimed at it. */
     char rec_path[256];
     GstClockTime rec_pts0;              /* first recorded PTS, rebased to 0 for a clean MP4 */
     gboolean rec_epoch_set;
@@ -629,6 +633,9 @@ int drm_make_idle_fb(struct ctx *c);
 void osd_burn_cell(struct ctx *c, const guint8 *frame, gssize len);
 void osd_burn_clear(struct ctx *c);
 void osd_burn_apply(struct ctx *c, guint8 *map);
+
+/* latency counter (mlp-latency-counter.c): glass-to-glass latency counter burned into the composite */
+void latency_counter_apply(struct ctx *c, guint8 *map);
 
 /* rtsp (mlp-rtsp.c): gst-rtsp-server restream of the DVR encoder's elementary stream */
 void rtsp_set(struct ctx *c, gboolean on);

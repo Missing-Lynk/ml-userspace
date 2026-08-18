@@ -93,6 +93,13 @@ bool linkstate_has_pipeline_state(void);
 bool linkstate_is_rtsp_on(void);
 
 /**
+ * @brief Whether ml-pipeline reports the glass-to-glass latency counter as being burned into the
+ *  composite (MLM_STATE_F_LATENCY_COUNTER). The reconcile tick compares this against the
+ *  goggles.show_latency_counter setting, which covers a pipeline restart.
+ */
+bool linkstate_is_latency_counter_on(void);
+
+/**
  * @brief Playback progress from the pipeline's MLM_T_STATE.
  * @param paused  out: 1 if playback is paused (may be NULL).
  * @param pos_ms  out: current position in ms (may be NULL).

@@ -63,6 +63,12 @@ void pipecmd_set_rtsp(int on)
     mlm_ctrl_send(MLM_CMD_RTSP, on ? 1u : 0u, NULL);
 }
 
+/* Glass-to-glass latency counter on/off (idempotent set, like the restream). */
+void pipecmd_set_latency_counter(int on)
+{
+    mlm_ctrl_send(MLM_CMD_LATENCY_COUNTER, on ? 1u : 0u, NULL);
+}
+
 /* One rendered burn-in cell: the mlm_osd_cell header + RGBA pixels ride after the mlm_cmd. */
 void pipecmd_osd_cell(int row, int col, int x, int y, int w, int h, const unsigned char *rgba)
 {

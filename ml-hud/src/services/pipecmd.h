@@ -56,6 +56,14 @@ void pipecmd_set_dvr_res(int height, int fps);
 void pipecmd_set_rtsp(int on);
 
 /**
+ * @brief Enable/disable the glass-to-glass latency counter (goggles.show_latency_counter).
+ *  Idempotent set, re-asserted by the reconcile tick against MLM_STATE_F_LATENCY_COUNTER. While on,
+ *  ml-pipeline burns a millisecond counter into every composite, so it reaches the panel and any
+ *  recording identically.
+ */
+void pipecmd_set_latency_counter(int on);
+
+/**
  * @brief Send one rendered BTFL OSD cell for the DVR burn-in. @p rgba is the cell's w*h RGBA
  *  patch (opaque glyph pixels, transparent background), or NULL to clear the cell pipeline-side.
  *  The rect is the cell's luma-pixel rectangle in the 1080p composite. The caller (btfl_burn)

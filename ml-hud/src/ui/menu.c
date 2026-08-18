@@ -89,6 +89,7 @@ static const gog_item_t g_goggles_items[] = {
     { ITEM_TOGGLE,  "goggles.show_encoder_stats",   "show_encoder_stats",   NULL,           0, 0, "" },
     { ITEM_TOGGLE,  "goggles.show_link_throughput", "show_link_throughput", NULL,           0, 0, "" },
     { ITEM_TOGGLE,  "goggles.show_air_ontime",      "show_air_ontime",      NULL,           0, 0, "" },
+    { ITEM_TOGGLE,  "goggles.show_latency_counter", "show_latency_counter", NULL,           0, 0, "latency_counter" },
 };
 #define GOGGLES_ITEM_COUNT ((int) (sizeof(g_goggles_items) / sizeof(g_goggles_items[0])))
 
@@ -573,6 +574,11 @@ static void apply_item(const gog_item_t *item, const char *value)
     } else if (strcmp(item->action, "rtsp") == 0) {
         /* the pipeline brings the restream (and, if needed, a file-less encoder) up or down */
         pipecmd_set_rtsp(strcmp(value, "on") == 0);
+    } else if (strcmp(item->action, "latency_counter") == 0) {
+        /* the pipeline burns the counter into every composite; the HUD's own overlays are
+         * suppressed while it is on, so the filmed panel carries the counter and nothing else
+         */
+        pipecmd_set_latency_counter(strcmp(value, "on") == 0);
     } else if (strcmp(item->action, "dvr_res") == 0) {
         /* the option label ("720p 30fps"); the pipeline latches it for the next recording */
         int height = 1080;

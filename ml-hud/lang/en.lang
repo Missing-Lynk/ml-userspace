@@ -23,6 +23,7 @@ goggles.show_temperature   = Show Temperature
 goggles.show_encoder_stats = Show Encoder Stats
 goggles.show_link_throughput = Show Link Throughput
 goggles.show_air_ontime    = Show Air On-Time
+goggles.show_latency_counter = Show Latency Counter
 
 # System section
 system.buzzer_volume       = Buzzer Volume

@@ -131,6 +131,11 @@ static void slot_push(struct ctx *c, struct comp_slot *sl)
         osd_burn_apply(c, c->comp_pool[sl->cbi].map);
     }
 
+    /* Glass-to-glass latency counter: the panel and the encoder consume this same pool buffer, so
+     * the burned value cannot skew between what is displayed and what is recorded.
+     */
+    latency_counter_apply(c, c->comp_pool[sl->cbi].map);
+
     /* end CPU write: flush to DDR for the DC */
     ml_dmabuf_sync(c->comp_pool[sl->cbi].fd, 0);
     if (c->enc_on) {
