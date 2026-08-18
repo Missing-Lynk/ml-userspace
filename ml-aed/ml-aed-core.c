@@ -19,6 +19,8 @@
  */
 #include <math.h>
 
+#include <stdint.h>
+
 #include "ml-aed-core.h"
 
 uint32_t mlaed_get_le32(const uint8_t *p)
@@ -238,4 +240,77 @@ int ae_tone_scalar_q8(const struct ae_tuning *t, int exp_index, float current_lu
     }
 
     return (int)floor(scalar) << 8;
+}
+
+/*
+ * The vendor rounds the half-period count two ways and picks between them at run time: to nearest
+ * when the working gain has headroom (at least twice the table entry's), truncating otherwise.
+ * Truncating shortens the exposure, so the compensation raises gain, which is always available;
+ * rounding up needs headroom that may not be there. At the point ml-aed actuates, the working gain
+ * IS the table entry's, so the threshold never passes and this always truncates. The branch is
+ * kept because the comparison is the vendor's and a future manual-gain path would reach it.
+ */
+static double flicker_periods(double exposure_s, double half_period, int have_headroom)
+{
+    double n = exposure_s / half_period;
+
+    return have_headroom ? floor(n + 0.5) : floor(n);
+}
+
+int ae_flicker_snap(int mains_hz, unsigned int line_ns, uint32_t *lines, uint32_t *gain_q8)
+{
+    double half_period;
+    double exposure;
+    double line_s;
+    double snapped;
+    double n;
+    uint32_t new_lines;
+
+    if (mains_hz != 50 && mains_hz != 60) {
+        return 0;
+    }
+
+    if (!line_ns || !*lines || !*gain_q8) {
+        return 0;
+    }
+
+    line_s = (double)line_ns / 1e9;
+    exposure = (double)*lines * line_s;
+    half_period = 1.0 / (2.0 * mains_hz);
+
+    /*
+     * The vendor's early-out. Below one half-period there is no whole number of periods to snap
+     * to that is not zero, and lengthening the exposure is not this function's job.
+     */
+    if (exposure <= half_period) {
+        return 0;
+    }
+
+    n = flicker_periods(exposure, half_period, 0);
+
+    if (n < 1.0) {
+        return 0;
+    }
+
+    snapped = n * half_period;
+    new_lines = (uint32_t)(snapped / line_s);
+
+    if (!new_lines || new_lines == *lines) {
+        return 0;
+    }
+
+    /*
+     * Gain carries the exposure that was removed. The product is held on the requested exposure,
+     * not on the truncated line count, so the residual of that truncation is not amplified.
+     */
+    double compensated = (double)*gain_q8 * exposure / snapped;
+
+    if (compensated > (double)UINT32_MAX) {
+        return 0;
+    }
+
+    *lines = new_lines;
+    *gain_q8 = (uint32_t)(compensated + 0.5);
+
+    return 1;
 }

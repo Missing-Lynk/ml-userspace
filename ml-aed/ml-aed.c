@@ -33,11 +33,23 @@
 #define TONE_ARM_PATH   "/sys/kernel/debug/ar-isp/tone"
 
 /*
- * cm and cm2 are absent on purpose. They key on the trigger scalar, axis
- * 0..550, not the 1..2048 gain the five ladders above take; writing the gain
- * into them selects row 0 where the vendor sat on row 1. Both stay at the
- * driver default, which pins the vendor's traced operating point.
+ * cm and cm2 key on the trigger scalar, axis 0..550, not the 1..2048 gain the
+ * five ladders above take: driving them from the gain selects row 0 where the
+ * vendor sat on row 1. They take the same scalar gamma and DRC do, so they are
+ * written from ae_actuate_tone and not from the per-step ladder path, and they
+ * arm through the ladders hook because that is the bank the driver packs them
+ * into. Without --tone both stay at the driver default, which pins the vendor's
+ * traced operating point.
  */
+/*
+ * Sensor line time for the shipped mode: 1080p60 over a 1125-line frame is 1/60 s / 1125, which
+ * rounds to 14815 ns. Only anti-flicker uses it, and only to decide how many mains half-periods
+ * fit in an exposure; a whole nanosecond of rounding moves that by less than one line.
+ */
+#define ML_AED_LINE_NS  14815u
+
+#define ISP_CM_TRIGGER  "/sys/module/ar_isp/parameters/cm_trigger"
+#define ISP_CM2_TRIGGER "/sys/module/ar_isp/parameters/cm2_trigger"
 
 /*
  * Poll interval while the driver reports no statistics, and how many of those
@@ -58,6 +70,8 @@ struct ae_opts {
     int decisions;              /* stop after N decisions, 0 = run forever */
     int no_ladders;
     int tone;                   /* drive gamma and DRC from the trigger scalar */
+    int banding;                /* mains anti-flicker: 0 off, 50 or 60 Hz */
+    unsigned int line_ns;       /* sensor line time, for the anti-flicker snap */
     int verbose;
 };
 
@@ -91,14 +105,35 @@ static int ae_actuate(const struct ae_tuning *tune, const struct ae_opts *opts,
               int exp_index)
 {
     const struct mlaed_exp_entry *e = &tune->table[exp_index];
-    unsigned int code = ae_sensor_gain_code(e->gain_q8);
+    uint32_t lines = e->line_count;
+    uint32_t gain_q8 = e->gain_q8;
+    unsigned int code;
     int ret;
 
     if (opts->dry_run) {
         return 0;
     }
 
-    ret = write_int(SENSOR_EXPOSURE, (int)e->line_count);
+    /*
+     * Anti-flicker rewrites the sensor-bound pair only. The ladder abscissa below stays on the
+     * table's own gain, because that is what the vendor's ladders key on: its flicker routine
+     * reads the table entry for a rounding decision and never writes it.
+     */
+    if (ae_flicker_snap(opts->banding, opts->line_ns, &lines, &gain_q8) && opts->verbose) {
+        /*
+         * Only on a change, and only under verbose. What reached the sensor is not derivable from
+         * the index once anti-flicker is on, so a recorded run has to state it rather than leave a
+         * reader to recompute it.
+         */
+        printf("flicker %d Hz: index %d, %u lines -> %u, gain %.2fx -> %.2fx\n",
+               opts->banding, exp_index, e->line_count, lines,
+               (double)e->gain_q8 / 256.0, (double)gain_q8 / 256.0);
+        fflush(stdout);
+    }
+
+    code = ae_sensor_gain_code(gain_q8);
+
+    ret = write_int(SENSOR_EXPOSURE, (int)lines);
     if (ret) {
         return ret;
     }
@@ -146,25 +181,21 @@ static int ae_actuate(const struct ae_tuning *tune, const struct ae_opts *opts,
  * scalar crosses a band edge, so writing it every decision costs two writes and
  * not a rebuild.
  */
-static int ae_actuate_tone(const struct ae_tuning *tune,
-               const struct ae_opts *opts, int exp_index, float luma)
+static int ae_actuate_tone(const struct ae_opts *opts, int q8)
 {
     static int last = -1;
-    int q8;
     int ret;
 
     if (opts->dry_run || !opts->tone) {
         return 0;
     }
 
-    q8 = ae_tone_scalar_q8(tune, exp_index, luma);
-
     /*
      * Only on a change. The scalar is truncated to whole counts, so a settled
      * scene repeats the same value and there is nothing for the driver to
      * reselect; writing it anyway would re-enter the page rebuild every frame
      * for no result. The driver skips an unchanged selection too, but the
-     * cheaper place to stop is here, before the two syscalls.
+     * cheaper place to stop is here, before the syscalls.
      */
     if (q8 == last) {
         return 0;
@@ -176,6 +207,26 @@ static int ae_actuate_tone(const struct ae_tuning *tune,
     }
 
     ret = write_int(TONE_ARM_PATH, 1);
+    if (ret) {
+        return ret;
+    }
+
+    /*
+     * cm and cm2 take the same scalar, and their bank is packed by the ladder
+     * path, so they need that hook fired rather than the tone one. Both writes
+     * land before the arm so one rebuild covers the pair.
+     */
+    ret = write_int(ISP_CM_TRIGGER, q8);
+    if (ret) {
+        return ret;
+    }
+
+    ret = write_int(ISP_CM2_TRIGGER, q8);
+    if (ret) {
+        return ret;
+    }
+
+    ret = write_int(LADDER_ARM_PATH, 1);
     if (ret) {
         return ret;
     }
@@ -257,6 +308,7 @@ static int run_loop(const struct ae_tuning *tune, const struct ae_opts *opts)
         int seq = read_stats(buf);
         float luma;
         int step, prev;
+        int tone_q8;
 
         /*
          * EAGAIN is the driver reporting no completed frame to hand over, not
@@ -318,17 +370,24 @@ static int run_loop(const struct ae_tuning *tune, const struct ae_opts *opts)
         step = st.exp_index - prev;
         decided++;
 
+        /*
+         * Computed before the log line and actuated from that same value, so a
+         * recorded decision states the scalar the daemon acted on rather than
+         * one a reader has to recompute and pair by hand.
+         */
+        tone_q8 = opts->tone ? ae_tone_scalar_q8(tune, st.exp_index, luma) : -1;
+
         if (step || opts->verbose) {
-            printf("seq %u luma %.3f target %d index %d step %d settle %u%s\n",
+            printf("seq %u luma %.3f target %d index %d step %d settle %u tone %d%s\n",
                    (unsigned int)seq, (double)luma,
                    ae_luma_target(tune, st.exp_index), st.exp_index,
-                   step, st.settle_counter,
+                   step, st.settle_counter, tone_q8 >> 8,
                    opts->dry_run ? " (dry)" : "");
             fflush(stdout);
         }
 
         if (opts->tone) {
-            int ret = ae_actuate_tone(tune, opts, st.exp_index, luma);
+            int ret = ae_actuate_tone(opts, tone_q8);
 
             if (ret) {
                 fprintf(stderr, "ml-aed: actuate tone: %s\n", strerror(-ret));
@@ -367,7 +426,12 @@ static void usage(void)
         "  --dry-run         decide and log, never write\n"
         "  --no-ladders      actuate the sensor only\n"
         "  --tone            also drive gamma, DRC, cm and cm2 from the trigger scalar\n"
-        "                    (off by default: its producer is unproven)\n"
+        "                    (off by default: awaiting its image gate boot)\n"
+        "  --banding N       mains anti-flicker: 0 off (default), 50 or 60. Snaps the\n"
+        "                    exposure to a whole number of mains half-periods and raises\n"
+        "                    gain to match; costs 0.74 stops at 50 Hz, and more than the\n"
+        "                    sensor has at the bottom of the table\n"
+        "  --line-ns N       sensor line time in ns for that snap (default 14815)\n"
         "  --tuning PATH     sensor tuning blob (default: the board's firmware path)\n"
         "  --verbose         log settled decisions too\n");
 }
@@ -383,6 +447,8 @@ int main(int argc, char **argv)
         { "dry-run", no_argument, NULL, 'd' },
         { "no-ladders", no_argument, NULL, 'L' },
         { "tone", no_argument, NULL, 'T' },
+        { "banding", required_argument, NULL, 'B' },
+        { "line-ns", required_argument, NULL, 'B' + 128 },
         { "tuning", required_argument, NULL, 'T' + 128 },
         { "verbose", no_argument, NULL, 'v' },
         { NULL, 0, NULL, 0 },
@@ -390,6 +456,7 @@ int main(int argc, char **argv)
     struct ae_opts opts = {
         .start_index = 317,
         .floor_index = 1,
+        .line_ns = ML_AED_LINE_NS,
     };
     const char *tuning_path = ML_AED_TUNING_FALLBACK;
     struct ae_tuning tune;
@@ -419,6 +486,20 @@ int main(int argc, char **argv)
 
         case 'd': {
             opts.dry_run = 1;
+        } break;
+
+        case 'B': {
+            opts.banding = atoi(optarg);
+
+            if (opts.banding != 0 && opts.banding != 50 && opts.banding != 60) {
+                fprintf(stderr, "ml-aed: --banding takes 0, 50 or 60\n");
+
+                return 2;
+            }
+        } break;
+
+        case 'B' + 128: {
+            opts.line_ns = (unsigned int)atoi(optarg);
         } break;
 
         case 'L': {

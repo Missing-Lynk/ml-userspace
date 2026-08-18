@@ -34,4 +34,7 @@
 /* 77.893997. In this file and nowhere in libmpp_service.so. Heap state+36. */
 #define MLAED_LOG_LADDER_OFF        0xba620u
 
+/* Mains anti-flicker selector: 0 unset, 1 = 50 Hz, 2 = 60 Hz, 3 = explicit off. Copied to heap state+0x414c by the AE tuning init at libmpp_service.so 0x2638f8/0x263918, and read by the gate inlined into aec_process_preview_and_video at 0x26a5e0, which calls aec_process_apply_flicker_50_60hz (0x25e728) to snap exposure to a whole number of mains half-periods and rescale gain by the inverse. A runtime override exists at AE state+0x5218 via CAM_PRA_SET_ANTIBANDING (0x73c). Shipped value 0, and the runtime word is never written on this unit, so the vendor applies no flicker constraint either. */
+#define MLAED_ANTIBANDING_OFF       0xba624u
+
 #endif /* ML_AED_BLOB_H */

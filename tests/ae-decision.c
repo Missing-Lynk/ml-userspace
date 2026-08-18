@@ -246,6 +246,102 @@ int main(void)
         }
     }
 
+    /*
+     * Anti-flicker. The unit is 1080p60 with a 1125-line frame, so the line time is 14815 ns and
+     * one frame of exposure is exactly 1/60 s: already a whole number of 60 Hz half-periods and
+     * 1.667 of a 50 Hz one. That asymmetry is the whole reason the evening bands on 50 Hz mains.
+     */
+    const unsigned int line_ns = 14815;
+
+    {
+        uint32_t lines = 1125, gain = 256;
+
+        if (ae_flicker_snap(0, line_ns, &lines, &gain)) {
+            return fail("banding off must leave the pair alone");
+        }
+
+        if (lines != 1125 || gain != 256) {
+            return fail("banding off modified the pair");
+        }
+    }
+
+    {
+        /*
+         * 60 Hz: a full frame is two 8.333 ms half-periods, so the exposure is already safe and
+         * the snap is at most the one line the vendor's own truncation costs. line_ns is a whole
+         * nanosecond while the true line time is 14814.8, which is where that line comes from.
+         */
+        uint32_t lines = 1125, gain = 256;
+
+        ae_flicker_snap(60, line_ns, &lines, &gain);
+
+        if (lines < 1124 || lines > 1125) {
+            return fail("60 Hz moved a full-frame exposure by more than a rounding line");
+        }
+    }
+
+    {
+        /* 50 Hz: 16.667 ms snaps down to one 10 ms period, gain up by the inverse ratio. */
+        uint32_t lines = 1125, gain = 256;
+
+        if (!ae_flicker_snap(50, line_ns, &lines, &gain)) {
+            return fail("50 Hz should snap a full-frame exposure");
+        }
+
+        if (lines < 674 || lines > 675) {
+            return fail("50 Hz should snap 1125 lines to one 10 ms period");
+        }
+
+        /* 256 * 1125/675 = 426.67, and the product is held on the requested exposure. */
+        if (gain < 424 || gain > 429) {
+            return fail("50 Hz gain compensation is wrong");
+        }
+    }
+
+    {
+        /* Shorter than one half-period: the vendor's early-out, never lengthen. */
+        uint32_t lines = 300, gain = 256;
+
+        if (ae_flicker_snap(50, line_ns, &lines, &gain)) {
+            return fail("an exposure below one half-period must be left alone");
+        }
+
+        if (lines != 300) {
+            return fail("the early-out modified the pair");
+        }
+    }
+
+    {
+        /* The product is what is preserved, across the whole gain-only top of the table. */
+        for (int i = tune.index_min; i <= tune.index_max; i++) {
+            uint32_t lines = tune.table[i].line_count;
+            uint32_t gain = tune.table[i].gain_q8;
+            double before = (double)lines * gain;
+
+            if (!ae_flicker_snap(50, line_ns, &lines, &gain)) {
+                continue;
+            }
+
+            double after = (double)lines * gain;
+
+            /* Line truncation costs at most one line of the snapped exposure. */
+            if (after < before * 0.998 || after > before * 1.002) {
+                return fail("flicker snap did not preserve the exposure product");
+            }
+
+            /*
+             * The result must be a whole number of half-periods to within the one line the
+             * conversion back truncates. That, not an exact multiple, is the requirement.
+             */
+            double ms = (double)lines * line_ns / 1e6;
+            double rem = fmod(ms, 10.0);
+
+            if (rem > (double)line_ns / 1e6 && rem < 10.0 - (double)line_ns / 1e6) {
+                return fail("flicker snap produced a line count that still bands");
+            }
+        }
+    }
+
     printf("ae-decision OK\n");
 
     return 0;

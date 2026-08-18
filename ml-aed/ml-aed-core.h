@@ -78,4 +78,26 @@ unsigned int ae_sensor_gain_code(uint32_t gain_q8);
 
 int ae_tone_scalar_q8(const struct ae_tuning *t, int exp_index, float current_luma);
 
+/*
+ * Mains anti-flicker, the vendor's aec_process_apply_flicker_50_60hz.
+ *
+ * Artificial light rippples at twice the mains frequency, so an exposure that is not a whole
+ * number of half-periods integrates a different amount of light on each row and the frame carries
+ * bands. This snaps the exposure down to a whole number of half-periods and multiplies gain by the
+ * inverse ratio, holding the gain-times-time product, then converts back to whole lines.
+ *
+ * `mains_hz` is 0 (leave alone), 50 or 60, matching the blob's ae_antibanding selector and the
+ * SetCameraInfo banding field. `line_ns` is the sensor line time. `lines` and `gain_q8` are the
+ * exposure-table entry; both are updated in place.
+ *
+ * The exposure-table entry itself is NOT rewritten by the vendor, only the sensor-bound copy, so
+ * the gain-keyed ladder abscissa keeps the table's gain and is not compensated. Callers must pass
+ * copies for that reason.
+ *
+ * Returns 1 when it changed something, 0 when it left the pair alone. It never lengthens an
+ * exposure: an exposure already shorter than one half-period is returned untouched, which is the
+ * vendor's own early-out and is why bright scenes are not correctable this way.
+ */
+int ae_flicker_snap(int mains_hz, unsigned int line_ns, uint32_t *lines, uint32_t *gain_q8);
+
 #endif /* ML_AED_CORE_H */
