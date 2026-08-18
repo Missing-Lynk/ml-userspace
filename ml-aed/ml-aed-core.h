@@ -65,8 +65,17 @@ unsigned int ae_sensor_gain_code(uint32_t gain_q8);
 
 /*
  * The AEC trigger scalar gamma, DRC, cm and cm2 key on, in the Q8 the driver wants. Not the gain
- * the five ladders take. Its producer is unproven, so --tone is opt-in.
+ * the five ladders take.
+ *
+ * It is the exposure-table index the current luma would need to reach its target, which is
+ * exp_index plus the luma error converted to table steps, truncated. The two differ only while AE
+ * is off target, and they separate hard once the table saturates: with the lens covered the vendor
+ * reads 445 where exp_index is pinned at its ceiling of 365. Because it is unclamped by the table,
+ * it keeps describing the scene past the point exposure can follow, which is what the tone bands
+ * need out to 550.
  */
-int ae_tone_scalar_q8(int exp_index);
+#define AE_TONE_SCALAR_MAX      550
+
+int ae_tone_scalar_q8(const struct ae_tuning *t, int exp_index, float current_luma);
 
 #endif /* ML_AED_CORE_H */

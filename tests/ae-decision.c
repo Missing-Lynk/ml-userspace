@@ -11,7 +11,7 @@
  *   5. the sensor gain-code inversion at the four validated points,
  *   6. the target curve's two clamp regions and one interpolated point,
  *   7. metering decimating the grid rather than averaging each block,
- *   8. the tone scalar staying on the band tables' axis across the whole index range.
+ *   8. the trigger scalar against four paired vendor captures, including the saturated one.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,6 +56,16 @@ int main(void)
     table[283] = (struct mlaed_exp_entry){ 1432, 1125 };
     table[317] = (struct mlaed_exp_entry){ 3938, 1125 };
     table[365] = (struct mlaed_exp_entry){ 16328, 1125 };
+
+    /*
+     * The entry below each asserted index: the trigger scalar converts a luma
+     * error into table steps, and one step is the ratio between neighbours.
+     */
+    table[282] = (struct mlaed_exp_entry){ 1390, 1125 };
+    table[316] = (struct mlaed_exp_entry){ 3823, 1125 };
+    table[330] = (struct mlaed_exp_entry){ 5792, 1125 };
+    table[331] = (struct mlaed_exp_entry){ 5966, 1125 };
+    table[364] = (struct mlaed_exp_entry){ 15852, 1125 };
     tune = vendor_tuning(table, 366);
 
     if (table[0].gain_q8 != 256 || table[0].line_count != 1) {
@@ -183,11 +193,44 @@ int main(void)
         }
     }
 
-    /* The two measured operating points, and the ceiling. */
-    if (ae_tone_scalar_q8(283) != 283 * 256 ||
-        ae_tone_scalar_q8(317) != 317 * 256 ||
-        ae_tone_scalar_q8(tune.index_max) != tune.index_max * 256) {
-        return fail("tone scalar Q8 mapping");
+    /*
+     * The trigger scalar against the four vendor captures that pair a register
+     * sweep with a heap dump. Each row is {exp_index, metered luma, the scalar
+     * the vendor AE held}. The covered row is the one that matters: exposure is
+     * pinned at the table's last entry while the scene keeps darkening, so the
+     * index stops at 365 and the scalar runs on to 445.
+     */
+    static const struct {
+        int index;
+        float luma;
+        int scalar;
+    } vendor_scalar[] = {
+        { 283, 45.278f, 279 },
+        { 317, 38.347f, 319 },
+        { 331, 37.500f, 334 },
+        { 365,  3.819f, 445 },
+    };
+
+    for (size_t i = 0; i < sizeof(vendor_scalar) / sizeof(vendor_scalar[0]); i++) {
+        int got = ae_tone_scalar_q8(&tune, vendor_scalar[i].index,
+                                    vendor_scalar[i].luma);
+
+        if (got != vendor_scalar[i].scalar * 256) {
+            fprintf(stderr, "  index %d luma %.3f: got %d, want %d\n",
+                    vendor_scalar[i].index, (double)vendor_scalar[i].luma,
+                    got >> 8, vendor_scalar[i].scalar);
+
+            return fail("tone scalar against the vendor captures");
+        }
+    }
+
+    /*
+     * A pinned index must not pin the scalar. At the ceiling the index cannot
+     * move, so falling luma is the only thing left that can carry the scene.
+     */
+    if (ae_tone_scalar_q8(&tune, 365, 30.0f) >=
+        ae_tone_scalar_q8(&tune, 365, 3.819f)) {
+        return fail("tone scalar does not move with luma at the ceiling");
     }
 
     /*
@@ -196,9 +239,9 @@ int main(void)
      * stop long before the loop did.
      */
     for (int i = tune.index_min; i <= tune.index_max; i++) {
-        int q8 = ae_tone_scalar_q8(i);
+        int q8 = ae_tone_scalar_q8(&tune, i, 41.0f);
 
-        if (q8 <= 0 || q8 > 550 * 256) {
+        if (q8 < 0 || q8 > 550 * 256) {
             return fail("tone scalar leaves the band-table axis");
         }
     }

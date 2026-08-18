@@ -133,19 +133,56 @@ static int ae_actuate(const struct ae_tuning *tune, const struct ae_opts *opts,
         ret = write_int(LADDER_ARM_PATH, 1);
     }
 
-    /*
-     * The driver rebuilds the tone pages only when the scalar crosses a band
-     * edge, so writing this every decision costs two writes, not a rebuild.
-     */
-    if (!ret && opts->tone) {
-        ret = write_int(ISP_TONE_SCALAR, ae_tone_scalar_q8(exp_index));
-    }
-
-    if (!ret && opts->tone) {
-        ret = write_int(TONE_ARM_PATH, 1);
-    }
-
     return ret;
+}
+
+/*
+ * The trigger scalar, written every decision rather than every step.
+ *
+ * It moves with the luma error, not only with the index, so a pinned index does
+ * not mean a pinned scalar: with the lens covered the index sits at its ceiling
+ * while the scalar keeps climbing, and that saturated region is where it stops
+ * tracking the index at all. The driver rebuilds the tone pages only when the
+ * scalar crosses a band edge, so writing it every decision costs two writes and
+ * not a rebuild.
+ */
+static int ae_actuate_tone(const struct ae_tuning *tune,
+               const struct ae_opts *opts, int exp_index, float luma)
+{
+    static int last = -1;
+    int q8;
+    int ret;
+
+    if (opts->dry_run || !opts->tone) {
+        return 0;
+    }
+
+    q8 = ae_tone_scalar_q8(tune, exp_index, luma);
+
+    /*
+     * Only on a change. The scalar is truncated to whole counts, so a settled
+     * scene repeats the same value and there is nothing for the driver to
+     * reselect; writing it anyway would re-enter the page rebuild every frame
+     * for no result. The driver skips an unchanged selection too, but the
+     * cheaper place to stop is here, before the two syscalls.
+     */
+    if (q8 == last) {
+        return 0;
+    }
+
+    ret = write_int(ISP_TONE_SCALAR, q8);
+    if (ret) {
+        return ret;
+    }
+
+    ret = write_int(TONE_ARM_PATH, 1);
+    if (ret) {
+        return ret;
+    }
+
+    last = q8;
+
+    return 0;
 }
 
 /*
@@ -290,6 +327,17 @@ static int run_loop(const struct ae_tuning *tune, const struct ae_opts *opts)
             fflush(stdout);
         }
 
+        if (opts->tone) {
+            int ret = ae_actuate_tone(tune, opts, st.exp_index, luma);
+
+            if (ret) {
+                fprintf(stderr, "ml-aed: actuate tone: %s\n", strerror(-ret));
+                free(buf);
+
+                return 1;
+            }
+        }
+
         if (step) {
             int ret = ae_actuate(tune, opts, st.exp_index);
 
@@ -318,7 +366,7 @@ static void usage(void)
         "  --decisions N     stop after N decisions\n"
         "  --dry-run         decide and log, never write\n"
         "  --no-ladders      actuate the sensor only\n"
-        "  --tone            also drive gamma and DRC from the trigger scalar\n"
+        "  --tone            also drive gamma, DRC, cm and cm2 from the trigger scalar\n"
         "                    (off by default: its producer is unproven)\n"
         "  --tuning PATH     sensor tuning blob (default: the board's firmware path)\n"
         "  --verbose         log settled decisions too\n");

@@ -182,7 +182,60 @@ unsigned int ae_sensor_gain_code(uint32_t gain_q8)
     return best;
 }
 
-int ae_tone_scalar_q8(int exp_index)
+int ae_tone_scalar_q8(const struct ae_tuning *t, int exp_index, float current_luma)
 {
-    return exp_index << 8;
+    double ratio;
+    double target;
+    double scalar;
+    double ev_here;
+    double ev_prev;
+    int table_index;
+
+    if (t->table_len < 2 || current_luma <= 0.0f) {
+        return exp_index << 8;
+    }
+
+    /*
+     * The step ratio is taken backwards so it stays defined at the last table
+     * entry, which is where the lens-covered capture sits: at the ceiling there
+     * is no next entry, and that is exactly the point where the luma error is
+     * large and the correction matters.
+     */
+    table_index = exp_index;
+
+    if (table_index < 1) {
+        table_index = 1;
+    }
+
+    if ((size_t)table_index >= t->table_len) {
+        table_index = (int)t->table_len - 1;
+    }
+
+    ev_here = (double)t->table[table_index].gain_q8 *
+              (double)t->table[table_index].line_count;
+    ev_prev = (double)t->table[table_index - 1].gain_q8 *
+              (double)t->table[table_index - 1].line_count;
+
+    if (ev_prev <= 0.0 || ev_here <= ev_prev) {
+        return exp_index << 8;
+    }
+
+    ratio = ev_here / ev_prev;
+    target = (double)ae_luma_target(t, exp_index);
+
+    if (target <= 0.0) {
+        return exp_index << 8;
+    }
+
+    scalar = (double)exp_index + log(target / (double)current_luma) / log(ratio);
+
+    if (scalar < 0.0) {
+        scalar = 0.0;
+    }
+
+    if (scalar > AE_TONE_SCALAR_MAX) {
+        scalar = AE_TONE_SCALAR_MAX;
+    }
+
+    return (int)floor(scalar) << 8;
 }
