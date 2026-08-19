@@ -23,27 +23,101 @@
 #define LATENCY_MODULO      100000
 
 /* Digit geometry in luma pixels. Every value is even so the box maps cleanly onto the I420 chroma
- * planes, and the box sits at the top of the frame: those rows scan out first, so their
- * assembly-to-photon delay is the smallest and the most stable.
+ * planes.
+ *
+ * Sized for the copy that comes BACK, not for the panel. The filmed copy is as small as the panel
+ * is in the camera's frame, so a digit that is comfortable to read here arrives a fraction of the
+ * size, and the whole measurement rests on reading it. Nothing else is on the panel in this mode,
+ * so the space costs nothing.
  */
-#define LATENCY_DIGIT_H     96
-#define LATENCY_DIGIT_W     52
-#define LATENCY_STROKE      16
-#define LATENCY_GAP         20
-#define LATENCY_PAD         16
-#define LATENCY_TOP         24
+#define LATENCY_DIGIT_H     160
+#define LATENCY_DIGIT_W     88
+#define LATENCY_STROKE      26
+#define LATENCY_GAP         32
+#define LATENCY_PAD         26
 
-#define LATENCY_BOX_W       (LATENCY_DIGITS * LATENCY_DIGIT_W + (LATENCY_DIGITS - 1) * LATENCY_GAP + 2 * LATENCY_PAD)
-#define LATENCY_BOX_H       (LATENCY_DIGIT_H + 2 * LATENCY_PAD)
+/* The row the box starts on. Every row costs COMP_H rows of frame time in scanout, so the counter
+ * reads about 0.0155 ms later per row at 60 Hz, and that delay is inside the measurement: the
+ * filmed copy is these rows as the panel emitted them. At 180 the box carries ~2.8 ms of scanout
+ * that row 0 would not, which is the price of putting it where the camera can hold it in frame.
+ */
+#define LATENCY_TOP         180
+
+/* A saturated red frame around the box. It reads red on the panel but NOT in a recording: the air
+ * unit meters for the dark goggle body around the panel, so the panel clips and the border comes
+ * back white. What it contributes is a closed high-contrast rectangle, which is what the reader's
+ * pattern search locks onto.
+ */
+#define LATENCY_BORDER      12
+
+/* Tracking markers: a solid bar inside each end of the digit row, overhanging it top and bottom so
+ * nothing else in the box has their shape. A blown-out digit blooms its gaps shut and turns into an
+ * anonymous blob, while a solid bar has no gaps to lose, so the pair holds the box's position,
+ * scale and tilt when the digits alone no longer would. They are part of the pattern the reader
+ * correlates, so nothing has to detect them separately.
+ */
+#define LATENCY_MARK_W      52
+#define LATENCY_MARK_OVER   12
+#define LATENCY_MARK_H      (LATENCY_DIGIT_H + 2 * LATENCY_MARK_OVER)
+
+/* Kept wider than the digit gap so the markers' bloom cannot bridge into the first and last digit,
+ * which would cost exactly the digit the fine reading depends on.
+ */
+#define LATENCY_MARK_GAP    64
+
+/* The sweep bar: a bar under the digits that fills left to right once per LATENCY_SWEEP_MS and
+ * resets, carrying the time the digits cannot.
+ *
+ * The digits fail in a way that cannot be detected from the image. The panel advances the counter
+ * every frame, a camera exposure that spans two of those frames records both values superimposed,
+ * and the union of two 7-segment glyphs is almost always a legible WRONG digit: 8 absorbs 9, 0
+ * absorbs 7. The reading looks clean and is off by a frame.
+ *
+ * Superposition takes the brighter pixel, so two bars superimpose to the LONGER one, and its right
+ * edge is the later of the two times. The worst case is a bounded error of one frame with a known
+ * sign, instead of an undetectable one. The exception is a straddle across the reset, where the
+ * later frame's bar is the shorter one; the reader drops the samples near either end for that.
+ *
+ * The track spans the box between the markers, which is 800 px for 100 ms: 8 px per millisecond
+ * here, and about 2 px per millisecond by the time the panel has been filmed at a distance.
+ */
+#define LATENCY_SWEEP_MS    100
+#define LATENCY_TRACK_H     44
+#define LATENCY_TRACK_GAP   26
+
+#define LATENCY_DIGITS_W    (LATENCY_DIGITS * LATENCY_DIGIT_W + (LATENCY_DIGITS - 1) * LATENCY_GAP)
+#define LATENCY_BOX_W       (LATENCY_DIGITS_W + 2 * (LATENCY_PAD + LATENCY_MARK_W + LATENCY_MARK_GAP))
+#define LATENCY_BOX_H       (2 * LATENCY_PAD + LATENCY_DIGIT_H + LATENCY_TRACK_GAP + LATENCY_TRACK_H)
 #define LATENCY_BOX_X       ((((COMP_W - LATENCY_BOX_W) / 2) / 2) * 2)
 
-/* BT.601 limited range, the composite's own encoding: luma black and white levels, neutral
- * chroma. Both box and ink are achromatic, so the chroma planes are a flat fill and only the luma
- * plane carries the digits.
+#define LATENCY_DIGITS_X    (LATENCY_BOX_X + LATENCY_PAD + LATENCY_MARK_W + LATENCY_MARK_GAP)
+#define LATENCY_MARK_Y      (LATENCY_TOP + LATENCY_PAD - LATENCY_MARK_OVER)
+
+#define LATENCY_TRACK_X     (LATENCY_BOX_X + LATENCY_PAD)
+#define LATENCY_TRACK_W     (LATENCY_BOX_W - 2 * LATENCY_PAD)
+#define LATENCY_TRACK_Y     (LATENCY_TOP + LATENCY_PAD + LATENCY_DIGIT_H + LATENCY_TRACK_GAP)
+
+#define LATENCY_FRAME_W     (LATENCY_BOX_W + 2 * LATENCY_BORDER)
+#define LATENCY_FRAME_H     (LATENCY_BOX_H + 2 * LATENCY_BORDER)
+#define LATENCY_FRAME_X     (LATENCY_BOX_X - LATENCY_BORDER)
+#define LATENCY_FRAME_Y     (LATENCY_TOP - LATENCY_BORDER)
+
+/* BT.601 limited range, the composite's own encoding: neutral chroma for the box and the ink, and
+ * full-saturation red for the border.
+ *
+ * The ink is deliberately NOT the white level. The panel clips in a recording because it is far
+ * brighter than the dark goggle body the air unit's autoexposure meters for, and a clipped digit
+ * blooms its gaps shut. Dropping the ink about a stop below white buys that headroom back without
+ * dimming the video around it, which the panel backlight control cannot do. Against the box's black
+ * it is still a contrast of over a hundred levels, and the reader correlates zero-mean, so the
+ * absolute level costs it nothing.
  */
 #define LATENCY_Y_BOX       16
-#define LATENCY_Y_INK       235
+#define LATENCY_Y_INK       140
 #define LATENCY_C_NEUTRAL   128
+#define LATENCY_Y_RED       81
+#define LATENCY_U_RED       90
+#define LATENCY_V_RED       240
 
 /* Segment bits in the order a, b, c, d, e, f, g: top, top-right, bottom-right, bottom,
  * bottom-left, top-left, middle.
@@ -134,14 +208,39 @@ void latency_counter_apply(struct ctx *c, guint8 *map)
 
     guint32 value = latency_counter_value();
 
+    /* Red frame, then the black box inside it: two rectangle fills per plane rather than four
+     * strips, since the box overwrites the middle of the frame anyway.
+     */
+    plane_fill(map, COMP_LSTRIDE, LATENCY_FRAME_X, LATENCY_FRAME_Y, LATENCY_FRAME_W,
+               LATENCY_FRAME_H, LATENCY_Y_RED);
+    plane_fill(map + COMP_UOFF, COMP_CSTRIDE, LATENCY_FRAME_X / 2, LATENCY_FRAME_Y / 2,
+               LATENCY_FRAME_W / 2, LATENCY_FRAME_H / 2, LATENCY_U_RED);
+    plane_fill(map + COMP_VOFF, COMP_CSTRIDE, LATENCY_FRAME_X / 2, LATENCY_FRAME_Y / 2,
+               LATENCY_FRAME_W / 2, LATENCY_FRAME_H / 2, LATENCY_V_RED);
+
     plane_fill(map, COMP_LSTRIDE, LATENCY_BOX_X, LATENCY_TOP, LATENCY_BOX_W, LATENCY_BOX_H, LATENCY_Y_BOX);
     plane_fill(map + COMP_UOFF, COMP_CSTRIDE, LATENCY_BOX_X / 2, LATENCY_TOP / 2, LATENCY_BOX_W / 2,
                LATENCY_BOX_H / 2, LATENCY_C_NEUTRAL);
     plane_fill(map + COMP_VOFF, COMP_CSTRIDE, LATENCY_BOX_X / 2, LATENCY_TOP / 2, LATENCY_BOX_W / 2,
                LATENCY_BOX_H / 2, LATENCY_C_NEUTRAL);
 
+    plane_fill(map, COMP_LSTRIDE, LATENCY_BOX_X + LATENCY_PAD, LATENCY_MARK_Y,
+               LATENCY_MARK_W, LATENCY_MARK_H, LATENCY_Y_INK);
+    plane_fill(map, COMP_LSTRIDE, LATENCY_BOX_X + LATENCY_BOX_W - LATENCY_PAD - LATENCY_MARK_W,
+               LATENCY_MARK_Y, LATENCY_MARK_W, LATENCY_MARK_H, LATENCY_Y_INK);
+
+    /* Drawn before the digits consume @p value, and rounded down: the bar's right edge is the time
+     * it has reached, so rounding up would place the edge ahead of the value the digits show.
+     */
+    int filled = (int) ((guint64) (value % LATENCY_SWEEP_MS) * LATENCY_TRACK_W / LATENCY_SWEEP_MS);
+
+    if (filled > 0) {
+        plane_fill(map, COMP_LSTRIDE, LATENCY_TRACK_X, LATENCY_TRACK_Y, filled, LATENCY_TRACK_H,
+                   LATENCY_Y_INK);
+    }
+
     for (int index = LATENCY_DIGITS - 1; index >= 0; index--) {
-        int x = LATENCY_BOX_X + LATENCY_PAD + index * (LATENCY_DIGIT_W + LATENCY_GAP);
+        int x = LATENCY_DIGITS_X + index * (LATENCY_DIGIT_W + LATENCY_GAP);
 
         draw_digit(map, x, LATENCY_TOP + LATENCY_PAD, (int) (value % 10));
         value /= 10;
