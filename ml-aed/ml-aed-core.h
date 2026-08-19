@@ -100,4 +100,38 @@ int ae_tone_scalar_q8(const struct ae_tuning *t, int exp_index, float current_lu
  */
 int ae_flicker_snap(int mains_hz, unsigned int line_ns, uint32_t *lines, uint32_t *gain_q8);
 
+/*
+ * The banding-file contents, parsed by the rule the ml-air-ae init script
+ * established: an empty file (or a bare newline) means 50, otherwise the
+ * number, with anything but 50 and 60 forced to off. An absent file means off
+ * and is the caller's case, since this takes text and not a path.
+ */
+int ae_banding_parse(const char *text);
+
+/*
+ * Loop health over a window of decisions: the two numbers glue/boot/au-health.sh
+ * derives from the outside (index moves against the stats_flips delta, and the
+ * mean luma error against target), accumulated by the loop itself so a recorded
+ * run carries them without a harness. A zeroed struct is an empty window.
+ *
+ * The hold rate is only meaningful while decisions are being made at all: a
+ * dead loop makes no moves and would read as a perfect hold, which is the
+ * caller's gate (au-health checks for a running daemon; inside ml-aed the
+ * window only accumulates on real decisions, so the number cannot be produced
+ * by a stalled loop).
+ */
+struct ae_health {
+    unsigned int decisions;
+    unsigned int moves;
+    float err_sum;              /* sum of |current_luma - target| */
+};
+
+void ae_health_update(struct ae_health *h, int step, float current_luma, int target);
+
+/* Percent of the window's decisions that held, 100 for an empty window. */
+unsigned int ae_health_hold_pct(const struct ae_health *h);
+
+/* Mean |luma error| over the window, 0 for an empty window. */
+float ae_health_mean_err(const struct ae_health *h);
+
 #endif /* ML_AED_CORE_H */

@@ -20,6 +20,7 @@
 #include <math.h>
 
 #include <stdint.h>
+#include <stdlib.h>
 
 #include "ml-aed-core.h"
 
@@ -313,4 +314,46 @@ int ae_flicker_snap(int mains_hz, unsigned int line_ns, uint32_t *lines, uint32_
     *gain_q8 = (uint32_t)(compensated + 0.5);
 
     return 1;
+}
+
+void ae_health_update(struct ae_health *h, int step, float current_luma, int target)
+{
+    h->decisions++;
+
+    if (step) {
+        h->moves++;
+    }
+
+    h->err_sum += fabsf(current_luma - (float)target);
+}
+
+unsigned int ae_health_hold_pct(const struct ae_health *h)
+{
+    if (!h->decisions) {
+        return 100;
+    }
+
+    return 100 - (h->moves * 100 / h->decisions);
+}
+
+float ae_health_mean_err(const struct ae_health *h)
+{
+    if (!h->decisions) {
+        return 0.0f;
+    }
+
+    return h->err_sum / (float)h->decisions;
+}
+
+int ae_banding_parse(const char *text)
+{
+    int hz;
+
+    if (text[0] == '\0' || text[0] == '\n') {
+        return 50;
+    }
+
+    hz = atoi(text);
+
+    return hz == 50 || hz == 60 ? hz : 0;
 }

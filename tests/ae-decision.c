@@ -342,6 +342,70 @@ int main(void)
         }
     }
 
+    {
+        /*
+         * The health window behind --stats: hold rate and mean luma error, the two numbers
+         * au-health.sh measures from the outside. An empty window must read as a perfect hold
+         * with zero error rather than divide, and a window is consumed by reset, not drained.
+         */
+        struct ae_health h = { 0 };
+
+        if (ae_health_hold_pct(&h) != 100 || ae_health_mean_err(&h) != 0.0f) {
+            return fail("empty health window");
+        }
+
+        /* Three holds at 2 luma counts off target, one move at 6 off. */
+        ae_health_update(&h, 0, 39.0f, 41);
+        ae_health_update(&h, 0, 43.0f, 41);
+        ae_health_update(&h, 0, 39.0f, 41);
+        ae_health_update(&h, 2, 47.0f, 41);
+
+        if (h.decisions != 4 || h.moves != 1) {
+            return fail("health counts");
+        }
+
+        if (ae_health_hold_pct(&h) != 75) {
+            return fail("hold rate should be 75%");
+        }
+
+        if (fabsf(ae_health_mean_err(&h) - 3.0f) > 1e-6f) {
+            return fail("mean luma error should be 3.0");
+        }
+
+        /* A negative step is a move like any other. */
+        ae_health_update(&h, -1, 41.0f, 41);
+
+        if (h.moves != 2) {
+            return fail("negative step should count as a move");
+        }
+
+        h = (struct ae_health){ 0 };
+
+        if (h.decisions || ae_health_hold_pct(&h) != 100) {
+            return fail("window reset");
+        }
+    }
+
+    {
+        /*
+         * The banding-file contents rule, shared with the ml-air-ae init script: empty (or a
+         * bare newline) means 50, otherwise the number, anything but 50/60 forced to off. The
+         * absent-file case is the caller's and means off.
+         */
+        if (ae_banding_parse("") != 50 || ae_banding_parse("\n") != 50) {
+            return fail("an empty banding file should mean 50");
+        }
+
+        if (ae_banding_parse("50\n") != 50 || ae_banding_parse("60") != 60) {
+            return fail("banding 50/60 should parse verbatim");
+        }
+
+        if (ae_banding_parse("0\n") != 0 || ae_banding_parse("47") != 0 ||
+            ae_banding_parse("junk") != 0) {
+            return fail("anything but 50/60 should be forced to off");
+        }
+    }
+
     printf("ae-decision OK\n");
 
     return 0;

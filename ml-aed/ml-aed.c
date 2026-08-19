@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,6 +57,15 @@
 #define ISP_CM2_TRIGGER "/sys/module/ar_isp/parameters/cm2_trigger"
 
 /*
+ * The persistent banding toggle. The init script reads it at boot and passes --banding; a SIGHUP
+ * makes this process re-read it live, which is how ml-linkd applies the goggle's SetCameraInfo
+ * selector 10 (ml-air-cam.c) without restarting the loop and losing its operating point. The
+ * parse must match the init script's: absent = off, empty = 50, else the number, anything but
+ * 50/60 forced to off.
+ */
+#define BANDING_FILE    "/usrdata/missinglynk/banding"
+
+/*
  * Poll interval while the driver reports no statistics, and how many of those
  * polls separate the "still waiting" lines. Frames land at 60/s, so 100 ms
  * picks the first flip up promptly without spinning; 300 polls is one line per
@@ -76,8 +86,36 @@ struct ae_opts {
     int tone;                   /* drive gamma, DRC, cm, cm2 from the trigger scalar (default) */
     int banding;                /* mains anti-flicker: 0 off, 50 or 60 Hz */
     unsigned int line_ns;       /* sensor line time, for the anti-flicker snap */
+    int stats;                  /* print hold rate and mean luma error every N decisions, 0 = off */
     int verbose;
 };
+
+static volatile sig_atomic_t g_reload_banding;
+
+static void on_sighup(int sig)
+{
+    (void)sig;
+    g_reload_banding = 1;
+}
+
+/* Absent means off; the contents rule is the core's, shared with the host test. */
+static int read_banding_file(void)
+{
+    char buf[16];
+    FILE *f = fopen(BANDING_FILE, "r");
+
+    if (f == NULL) {
+        return 0;
+    }
+
+    if (fgets(buf, sizeof buf, f) == NULL) {
+        buf[0] = '\0';
+    }
+
+    fclose(f);
+
+    return ae_banding_parse(buf);
+}
 
 static int write_int(const char *path, int value)
 {
@@ -278,11 +316,12 @@ static int read_stats(uint8_t *buf)
     return -EAGAIN;
 }
 
-static int run_loop(const struct ae_tuning *tune, const struct ae_opts *opts)
+static int run_loop(const struct ae_tuning *tune, struct ae_opts *opts)
 {
     struct ae_state st = {
         .exp_index = opts->start_index,
     };
+    struct ae_health health = { 0 };
     uint8_t *buf = malloc(STATS_RAW_SIZE);
     uint32_t last_seq = 0;
     unsigned int waited = 0;
@@ -309,10 +348,34 @@ static int run_loop(const struct ae_tuning *tune, const struct ae_opts *opts)
     }
 
     while (!opts->decisions || decided < opts->decisions) {
-        int seq = read_stats(buf);
+        int seq;
         float luma;
         int step, prev;
         int tone_q8;
+
+        /*
+         * A SIGHUP re-reads the banding toggle and re-actuates the current
+         * index at once: a settled scene may not step again for minutes, and
+         * the correction must not wait for one.
+         */
+        if (g_reload_banding) {
+            int hz = read_banding_file();
+
+            g_reload_banding = 0;
+            if (hz != opts->banding) {
+                opts->banding = hz;
+                printf("banding %d Hz (SIGHUP)\n", hz);
+                fflush(stdout);
+
+                ret = ae_actuate(tune, opts, st.exp_index);
+                if (ret) {
+                    fprintf(stderr, "ml-aed: actuate after SIGHUP: %s\n",
+                            strerror(-ret));
+                }
+            }
+        }
+
+        seq = read_stats(buf);
 
         /*
          * EAGAIN is the driver reporting no completed frame to hand over, not
@@ -375,6 +438,24 @@ static int run_loop(const struct ae_tuning *tune, const struct ae_opts *opts)
         decided++;
 
         /*
+         * The two au-health.sh numbers, from the inside: a settled loop prints
+         * nothing per decision, so without this a converged run and a dead one
+         * leave the same log. Windowed, print and reset, so each line stands
+         * alone the way the health sweep's two-sample delta does.
+         */
+        if (opts->stats) {
+            ae_health_update(&health, step, luma,
+                     ae_luma_target(tune, st.exp_index));
+            if (health.decisions >= (unsigned int)opts->stats) {
+                printf("stats: held %u%% of %u decisions, mean luma error %.2f\n",
+                       ae_health_hold_pct(&health), health.decisions,
+                       (double)ae_health_mean_err(&health));
+                fflush(stdout);
+                health = (struct ae_health){ 0 };
+            }
+        }
+
+        /*
          * Computed before the log line and actuated from that same value, so a
          * recorded decision states the scalar the daemon acted on rather than
          * one a reader has to recompute and pair by hand.
@@ -430,13 +511,14 @@ static void usage(void)
         "  --dry-run         decide and log, never write\n"
         "  --no-ladders      actuate the sensor only\n"
         "  --no-tone         pin gamma, DRC, cm and cm2 instead of driving them from the trigger scalar\n"
-        "                    (off by default: awaiting its image gate boot)\n"
         "  --banding N       mains anti-flicker: 0 off (default), 50 or 60. Snaps the\n"
         "                    exposure to a whole number of mains half-periods and raises\n"
         "                    gain to match; costs 0.74 stops at 50 Hz, and more than the\n"
         "                    sensor has at the bottom of the table\n"
         "  --line-ns N       sensor line time in ns for that snap (default 14815)\n"
         "  --tuning PATH     sensor tuning blob (default: the board's firmware path)\n"
+        "  --stats N         every N decisions print the hold rate and the mean luma\n"
+        "                    error against target, then reset the window (0 = off)\n"
         "  --verbose         log settled decisions too\n");
 }
 
@@ -454,6 +536,7 @@ int main(int argc, char **argv)
         { "banding", required_argument, NULL, 'B' },
         { "line-ns", required_argument, NULL, 'B' + 128 },
         { "tuning", required_argument, NULL, 'T' + 128 },
+        { "stats", required_argument, NULL, 'S' },
         { "verbose", no_argument, NULL, 'v' },
         { NULL, 0, NULL, 0 },
     };
@@ -519,6 +602,16 @@ int main(int argc, char **argv)
             tuning_path = optarg;
         } break;
 
+        case 'S': {
+            opts.stats = atoi(optarg);
+
+            if (opts.stats < 0) {
+                fprintf(stderr, "ml-aed: --stats takes a decision count\n");
+
+                return 2;
+            }
+        } break;
+
         case 'v': {
             opts.verbose = 1;
         } break;
@@ -551,6 +644,14 @@ int main(int argc, char **argv)
 
         return 1;
     }
+
+    /*
+     * SA_RESTART so the statistics read is not torn by the reload signal; the
+     * loop polls often enough that the flag is picked up within a frame or two.
+     */
+    struct sigaction sa = { .sa_handler = on_sighup, .sa_flags = SA_RESTART };
+
+    sigaction(SIGHUP, &sa, NULL);
 
     ret = run_loop(&tune, &opts);
     ae_tuning_free(&tune);
