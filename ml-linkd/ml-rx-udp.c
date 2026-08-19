@@ -294,6 +294,16 @@ static int rx_set_camera(unsigned sel, unsigned value)
             g_cam.nr3d_en = (uint16_t) value;
         } break;
 
+        case MLM_CAM_BANDING: {
+            /* The air forces anything but 0/50/60 to off; refusing here keeps a typo visible
+             * instead of silently disabling a correction the operator relies on. */
+            if (value != 0 && value != 50 && value != 60) {
+                return 0;
+            }
+
+            g_cam.banding = (uint16_t) value;
+        } break;
+
         default: {
             return 0;
         } break;

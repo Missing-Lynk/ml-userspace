@@ -31,6 +31,7 @@ struct rf_verb {
     int takes_arg;              /* 0 = arg ignored, 1 = required */
     uint32_t allowed[RF_ARG_MAX];  /* terminated by ARG_ANY, or first entry ARG_ANY for unbounded */
     const char *help;
+    uint32_t cam_sel;           /* nonzero: a camera verb, arg becomes (cam_sel << 16) | arg */
 };
 
 static const struct rf_verb VERBS[] = {
@@ -40,6 +41,8 @@ static const struct rf_verb VERBS[] = {
     { "channel", MLM_RF_SELECT_CHANNEL, 1, { ARG_ANY },         "channel table index 0..18" },
     { "scan",    MLM_RF_SCAN,           0, { ARG_ANY },         "one-shot channel sweep" },
     { "bind",    MLM_RF_BIND,           1, { 0, 1, ARG_ANY },   "0 dry-run, 1 persist the peer" },
+    { "banding", MLM_RF_SET_CAMERA,     1, { 0, 50, 60 },       "mains anti-flicker: 0 off, 50 or 60 Hz",
+      MLM_CAM_BANDING },
 };
 static const int VERBS_N = sizeof(VERBS) / sizeof(VERBS[0]);
 
@@ -115,6 +118,10 @@ int main(int argc, char **argv)
                 fprintf(stderr, "ml-rfcmd: %s does not take %u (%s)\n", verb->name, arg, verb->help);
                 return 2;
             }
+        }
+
+        if (verb->cam_sel != 0) {
+            arg = (verb->cam_sel << 16) | (arg & 0xffffu);
         }
 
         if (mlm_rfcmd_send(verb->cmd, arg) != 0) {

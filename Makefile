@@ -99,7 +99,7 @@ CHECK_CFLAGS := -O1 -Wall -Wextra -Werror
 check: $(BUILD)/msp-canvas-roundtrip $(BUILD)/air-power-standby $(BUILD)/mp-params-reply \
        $(BUILD)/bb-frame-builders $(BUILD)/air-rate-governor $(BUILD)/rx-scan-decode \
        $(BUILD)/mp-frame-builders $(BUILD)/rx-1v1-decode \
-       $(BUILD)/msp-parser $(BUILD)/ae-decision
+       $(BUILD)/msp-parser $(BUILD)/ae-decision $(BUILD)/air-cam-banding
 	$(BUILD)/msp-canvas-roundtrip
 	$(BUILD)/air-power-standby
 	$(BUILD)/mp-params-reply
@@ -110,6 +110,7 @@ check: $(BUILD)/msp-canvas-roundtrip $(BUILD)/air-power-standby $(BUILD)/mp-para
 	$(BUILD)/rx-1v1-decode
 	$(BUILD)/msp-parser
 	$(BUILD)/ae-decision
+	$(BUILD)/air-cam-banding
 	@$(MAKE) --no-print-directory check-seam
 
 # The seam cross-fade kernel is NEON, so its test is the one host test that must run as
@@ -164,6 +165,10 @@ $(BUILD)/msp-parser: tests/msp-parser.c ml-linkd/ml-msp.c | $(BUILD)
 # The AE decision law, the half of ml-aed that touches no file descriptors. -lm for log10f.
 $(BUILD)/ae-decision: tests/ae-decision.c ml-aed/ml-aed-core.c | $(BUILD)
 	gcc $(CHECK_CFLAGS) -o $@ $^ -lm
+
+# The air's SetCameraInfo parse against the goggle's own frame builder.
+$(BUILD)/air-cam-banding: tests/air-cam-banding.c ml-linkd/ml-air-cam.c | $(BUILD)
+	gcc $(CHECK_CFLAGS) -o $@ $^
 
 $(BUILD)/ml-msp-echo: ml-msp-echo/ml-msp-echo.c ml-linkd/ml-msp.c ml-linkd/ml-msp.h | $(BUILD)
 	docker run --rm --platform linux/arm64 -v $(REPO):/w -w /w \

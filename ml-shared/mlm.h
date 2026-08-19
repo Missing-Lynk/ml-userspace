@@ -369,15 +369,17 @@ enum mlm_rfcmd_type {
 };
 
 /* MLM_RF_SET_CAMERA selectors, the air's SetCameraInfo union tags. Only the ones the stock Camera
- * page exposed and the slot-A capture confirmed are listed; the others (brightness 0, WB 4,
- * aspect-as-0x0C 6, NR2D 8, ISO 9, banding 10) exist on the air but were never captured, so
- * ml-linkd does not send them. */
+ * page exposed and the slot-A capture confirmed are listed, plus banding, which our air handles
+ * (ml-air-cam.c) even though it was never captured from a stock goggle; the others (brightness 0,
+ * WB 4, aspect-as-0x0C 6, NR2D 8, ISO 9) exist on the air but were never captured, so ml-linkd
+ * does not send them. */
 enum mlm_cam_sel {
     MLM_CAM_EXPOSURE   = 1,  /* value: 0 = auto, else manual exposure time in us */
     MLM_CAM_SATURATION = 2,  /* value: 0..100 (stock default 50) */
     MLM_CAM_SHARPNESS  = 3,  /* value: 0..100 (stock default 55) */
     MLM_CAM_ROTATION   = 5,  /* value: 0 = normal, 1 = 180 degrees */
     MLM_CAM_NR3D       = 7,  /* value: 0 = off, 1 = on (3D noise reduction) */
+    MLM_CAM_BANDING    = 10, /* value: 0 = off, 50 / 60 = mains Hz anti-flicker */
 };
 
 /* The air's cold-boot camera defaults (from the captured SetLdCfg base's camera block): the values
