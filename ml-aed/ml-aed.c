@@ -38,8 +38,12 @@
  * vendor sat on row 1. They take the same scalar gamma and DRC do, so they are
  * written from ae_actuate_tone and not from the per-step ladder path, and they
  * arm through the ladders hook because that is the bank the driver packs them
- * into. Without --tone both stay at the driver default, which pins the vendor's
- * traced operating point.
+ * into. Under --no-tone both stay at the driver default, which pins the
+ * vendor's traced operating point.
+ *
+ * Driven by default: the vendor's AE moves the selector continuously, and the
+ * consume side is proven on hardware (pinned-page A/B, 2026-08-19), so opt-in
+ * would be a deviation rather than caution.
  */
 /*
  * Sensor line time for the shipped mode: 1080p60 over a 1125-line frame is 1/60 s / 1125, which
@@ -69,7 +73,7 @@ struct ae_opts {
     int dry_run;
     int decisions;              /* stop after N decisions, 0 = run forever */
     int no_ladders;
-    int tone;                   /* drive gamma and DRC from the trigger scalar */
+    int tone;                   /* drive gamma, DRC, cm, cm2 from the trigger scalar (default) */
     int banding;                /* mains anti-flicker: 0 off, 50 or 60 Hz */
     unsigned int line_ns;       /* sensor line time, for the anti-flicker snap */
     int verbose;
@@ -425,7 +429,7 @@ static void usage(void)
         "  --decisions N     stop after N decisions\n"
         "  --dry-run         decide and log, never write\n"
         "  --no-ladders      actuate the sensor only\n"
-        "  --tone            also drive gamma, DRC, cm and cm2 from the trigger scalar\n"
+        "  --no-tone         pin gamma, DRC, cm and cm2 instead of driving them from the trigger scalar\n"
         "                    (off by default: awaiting its image gate boot)\n"
         "  --banding N       mains anti-flicker: 0 off (default), 50 or 60. Snaps the\n"
         "                    exposure to a whole number of mains half-periods and raises\n"
@@ -446,7 +450,7 @@ int main(int argc, char **argv)
         { "decisions", required_argument, NULL, 'n' },
         { "dry-run", no_argument, NULL, 'd' },
         { "no-ladders", no_argument, NULL, 'L' },
-        { "tone", no_argument, NULL, 'T' },
+        { "no-tone", no_argument, NULL, 'T' },
         { "banding", required_argument, NULL, 'B' },
         { "line-ns", required_argument, NULL, 'B' + 128 },
         { "tuning", required_argument, NULL, 'T' + 128 },
@@ -457,6 +461,7 @@ int main(int argc, char **argv)
         .start_index = 317,
         .floor_index = 1,
         .line_ns = ML_AED_LINE_NS,
+        .tone = 1,
     };
     const char *tuning_path = ML_AED_TUNING_FALLBACK;
     struct ae_tuning tune;
@@ -507,7 +512,7 @@ int main(int argc, char **argv)
         } break;
 
         case 'T': {
-            opts.tone = 1;
+            opts.tone = 0;
         } break;
 
         case 'T' + 128: {
