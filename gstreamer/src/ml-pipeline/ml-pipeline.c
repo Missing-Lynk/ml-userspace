@@ -229,6 +229,10 @@ static int rf_display_init(struct ctx *c, int drm_fd)
         fprintf(stderr, "ml-pipeline: ML_DVR set -> forcing composite mode (plane scanout has no composite to encode)\n");
         c->planes_on = FALSE;
     }
+    if (c->planes_on) {
+        comp_pool_reclaim(c);   /* a crashed predecessor's tiles may still sit on the overlay planes */
+    }
+
     if (c->planes_on && drm_disp_init(c) == 0) {
         /* Gate bounds: display holds at most 4 pairs (next/pending/front/prev) of the
          * ~9-buffer decoder capture pools; keep unpaired skew small so parked halves
@@ -250,6 +254,11 @@ static int rf_display_init(struct ctx *c, int drm_fd)
                drm_fd, RF_VIDEO_PORT);
 
         drm_make_idle_fb(c);   /* reserve the park FB BEFORE the pool grabs the CMA */
+
+        /* A crashed predecessor's pool still pins its CMA on the shared drm_file; free it BEFORE
+         * comp_pool_init needs that CMA back (the idle FB just adopted/made is excluded).
+         */
+        comp_pool_reclaim(c);
 
         /* Ahead of the pool, because comp_pool_init calls seam_scratch_init, which probes this
          * device for the ranged cache ioctl.

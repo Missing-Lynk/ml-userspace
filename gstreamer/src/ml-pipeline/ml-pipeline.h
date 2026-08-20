@@ -628,6 +628,7 @@ guint32 tile_fb_get(struct ctx *c, int ch, const struct tileview *t);
 int drm_disp_init(struct ctx *c);
 void drm_disp_shutdown(struct ctx *c);
 int drm_make_idle_fb(struct ctx *c);
+int comp_pool_reclaim(struct ctx *c);
 
 /* osdburn */
 void osd_burn_cell(struct ctx *c, const guint8 *frame, gssize len);
