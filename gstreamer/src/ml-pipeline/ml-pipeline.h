@@ -627,6 +627,10 @@ void drm_disp_submit(struct ctx *c, const struct ditem *it, GstClockTime pts);
 guint32 tile_fb_get(struct ctx *c, int ch, const struct tileview *t);
 int drm_disp_init(struct ctx *c);
 void drm_disp_shutdown(struct ctx *c);
+int drm_find_output(struct ctx *c);
+guint32 drm_make_fb(struct ctx *c, int dmabuf_fd, guint32 *handle_out);
+
+/* mlp-drmfile: objects that outlive a generation on ml-drmfd's shared drm_file */
 int drm_make_idle_fb(struct ctx *c);
 int comp_pool_reclaim(struct ctx *c);
 
