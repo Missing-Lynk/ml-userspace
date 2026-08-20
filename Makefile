@@ -99,7 +99,7 @@ CHECK_CFLAGS := -O1 -Wall -Wextra -Werror
 check: $(BUILD)/msp-canvas-roundtrip $(BUILD)/air-power-standby $(BUILD)/mp-params-reply \
        $(BUILD)/bb-frame-builders $(BUILD)/air-rate-governor $(BUILD)/rx-scan-decode \
        $(BUILD)/mp-frame-builders $(BUILD)/rx-1v1-decode \
-       $(BUILD)/msp-parser $(BUILD)/ae-decision $(BUILD)/air-cam-banding
+       $(BUILD)/msp-parser $(BUILD)/ae-decision $(BUILD)/air-cam-banding $(BUILD)/ltm-page
 	$(BUILD)/msp-canvas-roundtrip
 	$(BUILD)/air-power-standby
 	$(BUILD)/mp-params-reply
@@ -111,6 +111,7 @@ check: $(BUILD)/msp-canvas-roundtrip $(BUILD)/air-power-standby $(BUILD)/mp-para
 	$(BUILD)/msp-parser
 	$(BUILD)/ae-decision
 	$(BUILD)/air-cam-banding
+	$(BUILD)/ltm-page
 	@$(MAKE) --no-print-directory check-seam
 
 # The seam cross-fade kernel is NEON, so its test is the one host test that must run as
@@ -168,6 +169,10 @@ $(BUILD)/ae-decision: tests/ae-decision.c ml-aed/ml-aed-core.c | $(BUILD)
 
 # The air's SetCameraInfo parse against the goggle's own frame builder.
 $(BUILD)/air-cam-banding: tests/air-cam-banding.c ml-linkd/ml-air-cam.c | $(BUILD)
+	gcc $(CHECK_CFLAGS) -o $@ $^
+
+# The neo_v2 LTM page arithmetic, the library-grounded stages (the clip tables are device data).
+$(BUILD)/ltm-page: tests/ltm-page.c ml-ltm/ml-ltm-core.c | $(BUILD)
 	gcc $(CHECK_CFLAGS) -o $@ $^
 
 $(BUILD)/ml-msp-echo: ml-msp-echo/ml-msp-echo.c ml-linkd/ml-msp.c ml-linkd/ml-msp.h | $(BUILD)
