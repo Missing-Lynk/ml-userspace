@@ -36,8 +36,39 @@ static int air_rate_total_kbps(int mcs, int throughput_kbps)
     return kbps != 0 ? kbps : AIR_RATE_FALLBACK_KBPS;
 }
 
-/* Derive the target for @p mcs / @p throughput_kbps and apply it, unless it is already applied or
- * we are only probing. */
+/* The vendor's frame-rate derivation, AR_8030_TX_GetFrameRate. Reduces only while the modulation
+ * index is at or below AIR_RATE_MIN_MCS and returns @p nominal_fps untouched otherwise, which on
+ * the shipped config is every sample. Returns a frame rate. */
+int air_rate_frame_rate(int mcs, int nominal_fps)
+{
+    int ratio = AIR_RATE_FPS_RATIO_PCT;
+
+    if (mcs > AIR_RATE_MIN_MCS) {
+        return nominal_fps;
+    }
+
+    if (ratio < AIR_RATE_FPS_QUARTER_PCT) {
+        return nominal_fps / 4;
+    }
+
+    if (ratio < AIR_RATE_FPS_HALF_PCT) {
+        return nominal_fps / 2;
+    }
+
+    return nominal_fps * 3 / 4;
+}
+
+/*
+ * Derive the target for @p mcs / @p throughput_kbps and apply it, unless it is already applied or
+ * we are only probing.
+ *
+ * The bitrate is the whole of what this commands. Frame rate on this stack belongs to the standby
+ * path, which runs the capture feeder at 15 or 60, and nothing the link does may move it: a
+ * picture that drops to 45 fps because the radio dipped is a worse failure than the bits it saves.
+ * That also matches the vendor at the shipped configuration, whose own frame-rate ladder is gated
+ * on an Ar803xMinMcs of -1 it never reaches. air_rate_frame_rate keeps that ladder as recovered
+ * arithmetic, exercised by the test, and no caller feeds it the encoder.
+ */
 static void air_rate_apply(struct air_rate *rate, int mcs, int throughput_kbps, const char *why)
 {
     int total_kbps = air_rate_total_kbps(mcs, throughput_kbps);
@@ -73,6 +104,36 @@ static void air_rate_apply(struct air_rate *rate, int mcs, int throughput_kbps, 
     fflush(stdout);
 }
 
+int air_rate_sim_parse(const char *line, int *mcs, int *throughput_kbps)
+{
+    char *end;
+    long parsed_mcs, parsed_throughput;
+
+    while (*line == ' ' || *line == '\t') {
+        line++;
+    }
+
+    if (*line == '\0' || *line == '#' || *line == '\n') {
+        return 0;
+    }
+
+    parsed_mcs = strtol(line, &end, 10);
+    if (end == line) {
+        return 0;
+    }
+
+    line = end;
+    parsed_throughput = strtol(line, &end, 10);
+    if (end == line) {
+        return 0;
+    }
+
+    *mcs = (int)parsed_mcs;
+    *throughput_kbps = (int)parsed_throughput;
+
+    return 1;
+}
+
 /* One decoded GET_MCS sample. The first sample seeds the baseline; after that a DROP is acted on
  * immediately and a RISE only once the higher MCS has held for AIR_RATE_RISE_MS, which is what the
  * vendor's split between MCS_CHANGE and MCS_CHANGE_FINISHED amounts to. A change in throughput
@@ -82,6 +143,21 @@ static void air_rate_sample(struct air_rate *rate, int mcs, int throughput_kbps,
     if (g_verbose) {
         fprintf(stderr, TAG " mcs sample: mcs=%d throughput=%d kbps\n", mcs, throughput_kbps);
     }
+
+    /* The index is the reply's first byte less MCS_INDEX_BIAS, so a byte below the bias decodes
+     * negative, which no modulation index is. A well-sized reply of zeros reaches here and would
+     * otherwise be acted on as a valid sample at the bottom of the range. Dropped, warned once. */
+    if (mcs < 0) {
+        if (!rate->warned_index) {
+            fprintf(stderr, TAG " rate: modulation index decoded as %d, dropping the sample\n",
+                    mcs);
+            rate->warned_index = 1;
+        }
+
+        return;
+    }
+
+    rate->warned_index = 0;
 
     if (rate->mcs < 0) {
         rate->mcs = mcs;
@@ -142,6 +218,45 @@ void air_rate_reply(struct air_rate *rate, const uint8_t *pay, int plen, long no
                     now);
 }
 
+/*
+ * One simulated sample, read fresh so the file can be rewritten under a running governor.
+ *
+ * Feeding it on every poll rather than on change is deliberate: it is what the baseband path does,
+ * and the settle window that delays a rise is counted in samples arriving, so a file read once
+ * would never let a rise mature.
+ */
+static void air_rate_sim_poll(struct air_rate *rate, long now)
+{
+    char line[AIR_RATE_SIM_MAX];
+    int mcs, throughput_kbps;
+    FILE *f = fopen(rate->sim_path, "r");
+
+    if (f == NULL) {
+        if (!rate->warned_sim) {
+            fprintf(stderr, TAG " rate sim: %s unreadable, the governor has no input\n",
+                    rate->sim_path);
+            rate->warned_sim = 1;
+        }
+
+        return;
+    }
+
+    if (fgets(line, sizeof line, f) == NULL || !air_rate_sim_parse(line, &mcs, &throughput_kbps)) {
+        fclose(f);
+        if (!rate->warned_sim) {
+            fprintf(stderr, TAG " rate sim: %s carries no `<mcs> <throughput_kbps>` line\n",
+                    rate->sim_path);
+            rate->warned_sim = 1;
+        }
+
+        return;
+    }
+
+    fclose(f);
+    rate->warned_sim = 0;
+    air_rate_sample(rate, mcs, throughput_kbps, now);
+}
+
 /* Service tick: hold the bb socket while enabled, poll GET_MCS on cadence. Replies arrive through
  * the shared drain. */
 void air_rate_service(struct air_rate *rate, struct air_bb *bb, long now)
@@ -149,6 +264,17 @@ void air_rate_service(struct air_rate *rate, struct air_bb *bb, long now)
     uint8_t frame[32];
 
     if (rate->mode == ML_RATE_OFF) {
+        return;
+    }
+
+    /* Simulated input replaces the baseband entirely: no acquire, no GET_MCS, nothing on
+     * /dev/artosyn_sdio. Same cadence as the live poll, so the settle window behaves identically. */
+    if (rate->sim_path != NULL) {
+        if (now - rate->last_poll_ms >= AIR_MCS_POLL_MS) {
+            rate->last_poll_ms = now;
+            air_rate_sim_poll(rate, now);
+        }
+
         return;
     }
 

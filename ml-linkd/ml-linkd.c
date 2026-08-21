@@ -47,6 +47,7 @@
 #include "ml-rx-bind.h"
 #include "ml-rx-reader.h"
 #include "ml-rx-udp.h"
+#include "ml-air-rate.h"   /* AIR_RATE_SIM_PATH, the --rate-sim default */
 
 /* TAG, LOCAL_ADDR, AIR_ADDR, HELLO_PORT, PARAMS_PORT, HELLO_LEN, PKT_MAX, UDP_TICK_US are shared
  * with the air role and live in ml-linkd.h; AIR_LOSS_MS, OPEN_STEP_US and OPEN_RETRY_EVERY are
@@ -454,6 +455,7 @@ int main(int argc, char **argv)
     const char *fc_tty = NULL;
     enum ml_rate_mode rate_mode = ML_RATE_OFF;
     enum ml_power_mode power_mode = ML_POWER_OFF;
+    const char *rate_sim = NULL;
     struct sigaction sa;
 
     for (int i = 1; i < argc; i++) {
@@ -471,6 +473,14 @@ int main(int argc, char **argv)
             rate_mode = ML_RATE_ON;
         } else if (!strcmp(argv[i], "--rate-probe")) {
             rate_mode = ML_RATE_PROBE;
+        } else if (!strcmp(argv[i], "--rate-sim")) {
+            /* Bench input for the governor: a file of `<mcs> <throughput_kbps>` instead of the
+             * baseband. Turns the governor on by itself, since observing it act is the point;
+             * pair it with --rate-probe to derive and log without writing the encoder. */
+            rate_sim = (i + 1 < argc && argv[i + 1][0] != '-') ? argv[++i] : AIR_RATE_SIM_PATH;
+            if (rate_mode == ML_RATE_OFF) {
+                rate_mode = ML_RATE_ON;
+            }
         } else if (!strcmp(argv[i], "--power-adapt")) {
             power_mode = ML_POWER_ON;
         } else if (!strcmp(argv[i], "--power-probe")) {
@@ -491,7 +501,8 @@ int main(int argc, char **argv)
             fprintf(stderr,
                     "usage: ml-linkd [-d /dev/artosyn_sdio] [--role air|rx] [--hw-version STR] "
                     "[--fc-tty /dev/ttyS1] [--no-gate] [--scan-probe] "
-                    "[--rate-adapt|--rate-probe] [--power-adapt|--power-probe] [-v]\n");
+                    "[--rate-adapt|--rate-probe] [--rate-sim [PATH]] "
+                    "[--power-adapt|--power-probe] [-v]\n");
             return 2;
         }
     }
@@ -506,7 +517,7 @@ int main(int argc, char **argv)
 
     /* Air unit (--role air): UDP telemetry TX on sdio0, handled entirely in ml-linkd-air.c. */
     if (g_role_air) {
-        air_main(hw_version, fc_tty, rate_mode, power_mode);
+        air_main(hw_version, fc_tty, rate_mode, power_mode, rate_sim);
         return 0;
     }
 

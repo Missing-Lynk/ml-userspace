@@ -19,7 +19,8 @@
  *   4. the derivation itself, including the integer divide that happens BEFORE the multiply and
  *      the cliff that divide creates below 100 kbps,
  *   5. a control socket that does not answer leaves the applied value alone, so the next sample
- *      retries rather than believing a write that never landed.
+ *      retries rather than believing a write that never landed,
+ *   6. the bench simulation input drives that same policy from a file, and touches no baseband.
  *
  * Point 4 is worth the test on its own. The quantisation and the fallback look like defects and are
  * not: both are transcribed from the vendor's AR_8030_TX_GetBitRate, and a well-meant "fix" to
@@ -31,7 +32,9 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 /* The stubs stand in for ml-air-bb.c, ml-air-ctrl.c and ml-linkd.c. */
 atomic_int g_run = 1;
@@ -39,6 +42,7 @@ int g_verbose;
 
 static char stub_cmd[64];       /* last control line, verbatim */
 static int stub_bps = -1;       /* last bitrate pushed, -1 = never */
+static int stub_fps = -1;       /* last frame rate pushed, -1 = never */
 static int stub_writes;         /* control lines accepted */
 static int stub_ctrl_fail;      /* make the control socket refuse */
 static int stub_bb_sends;
@@ -83,7 +87,9 @@ int air_ctrl_send(const char *cmd)
     }
 
     snprintf(stub_cmd, sizeof stub_cmd, "%s", cmd);
-    if (sscanf(cmd, "bitrate %d", &stub_bps) == 1) {
+    if (sscanf(cmd, "rate %d %d", &stub_bps, &stub_fps) == 2) {
+        stub_writes++;
+    } else if (sscanf(cmd, "bitrate %d", &stub_bps) == 1) {
         stub_writes++;
     }
 
@@ -116,6 +122,16 @@ static void sample(struct air_rate *rate, int mcs, uint32_t throughput_kbps, lon
     air_rate_reply(rate, pay, (int)sizeof pay, now);
 }
 
+/* Rewrite the simulation file in place, the way an operator's `echo ... >` does. */
+static void write_sim(int fd, const char *text)
+{
+    ssize_t len = (ssize_t)strlen(text);
+
+    if (ftruncate(fd, 0) != 0 || lseek(fd, 0, SEEK_SET) != 0 || write(fd, text, len) != len) {
+        check(0, "the simulation file could be written");
+    }
+}
+
 static void reset(struct air_rate *rate, enum ml_rate_mode mode)
 {
     memset(rate, 0, sizeof *rate);
@@ -123,6 +139,7 @@ static void reset(struct air_rate *rate, enum ml_rate_mode mode)
     rate->mcs = -1;
     rate->pending_mcs = -1;
     stub_bps = -1;
+    stub_fps = -1;
     stub_writes = 0;
     stub_ctrl_fail = 0;
     stub_cmd[0] = 0;
@@ -234,12 +251,20 @@ static void check_derivation(void)
     sample(&rate, 5, 0x80000000u, 0);
     check(stub_bps == 4000000, "a throughput read as negative falls back rather than going below zero");
 
-    /* The low-MCS branch is dead on a stock unit (Ar803xMinMcs is -1 and MCS is never negative),
-     * but the constant is the switch, so it is exercised directly.
+    /* A negative index is not a modulation index, it is a reply whose first byte fell below
+     * MCS_INDEX_BIAS, and a well-sized reply of zeros produces exactly that. Dropping it is what
+     * keeps a bad read off both the bitrate's low-MCS branch and the frame-rate ladder behind it.
+     * The low-MCS branch stays as recovered arithmetic, reachable only by raising
+     * AIR_RATE_MIN_MCS above the operating index.
      */
     reset(&rate, ML_RATE_ON);
-    sample(&rate, AIR_RATE_MIN_MCS, 10000, 0);
-    check(stub_bps == 4000000, "at or below AIR_RATE_MIN_MCS the low-MCS ratio applies instead");
+    sample(&rate, 10, 20926, 0);
+    check(stub_writes == 1, "a good sample applies");
+    sample(&rate, -1, 10000, 100);
+    check(stub_writes == 1 && stub_bps == 7315000,
+          "an index of -1 is dropped, leaving the applied rate standing");
+    sample(&rate, -2, 10000, 200);
+    check(stub_writes == 1, "and so is the -2 a zero-filled reply decodes to");
 }
 
 /** @brief Reply decoding and the modes that must stay silent. */
@@ -292,12 +317,120 @@ static void check_decode_and_modes(void)
     check(stub_writes == 1 && stub_bps == 3500000, "so the next sample retries and lands");
 }
 
+/**
+ * @brief The frame-rate ladder, and the fact that it is inert on the shipped config.
+ *
+ * AIR_RATE_MIN_MCS is -1 as shipped and a modulation index is never negative, so the vendor's
+ * reduction never fires and the governor must never send a frame-rate command. That inertness is
+ * the property under test: a governor that stamped its nominal onto the stream would override an
+ * ML_AIR_FPS the operator chose.
+ */
+static void check_frame_rate(void)
+{
+    struct air_rate rate;
+
+    printf("  -- frame rate --\n");
+
+    reset(&rate, ML_RATE_ON);
+    sample(&rate, 10, 20926, 1000);
+    check(stub_writes == 1, "a sample applies");
+    check(strncmp(stub_cmd, "bitrate ", 8) == 0,
+          "the shipped config sends bitrate alone, never a frame rate");
+    check(stub_fps == -1, "no frame rate is pushed while the ladder is inert");
+
+    reset(&rate, ML_RATE_ON);
+    sample(&rate, 0, 20926, 1000);
+    check(strncmp(stub_cmd, "bitrate ", 8) == 0, "mcs 0 is still above Ar803xMinMcs of -1");
+
+    /* The ladder itself, exercised directly at the boundary the constant sets. Reaching it needs
+     * a modulation index at or below AIR_RATE_MIN_MCS, which no chip reports, so this is the only
+     * place the arithmetic is covered. */
+    check(air_rate_frame_rate(AIR_RATE_MIN_MCS, 60) == 45,
+          "at the switch, ratio 100 takes three quarters of the rate");
+    check(air_rate_frame_rate(AIR_RATE_MIN_MCS - 1, 60) == 45,
+          "and below it too");
+    check(air_rate_frame_rate(AIR_RATE_MIN_MCS + 1, 60) == 60,
+          "one above the switch leaves the rate alone");
+    check(air_rate_frame_rate(AIR_RATE_MIN_MCS + 1, 15) == 15,
+          "a stream opened at 15 is left at 15");
+}
+
+/**
+ * @brief The bench simulation input: the parse, and a governor driven through a real file.
+ *
+ * The point of the simulation is that everything downstream of the sample is the live path, so the
+ * test drives air_rate_service against a file on disk and asserts the encoder writes that come out
+ * the other end, rather than asserting the parse alone.
+ */
+static void check_sim(void)
+{
+    char path[] = "/tmp/ml-air-rate-sim.XXXXXX";
+    struct air_rate rate;
+    struct air_bb bb = { .fd = -1 };
+    int mcs = -1, throughput = -1;
+    int fd;
+
+    printf("  -- bench simulation --\n");
+
+    check(air_rate_sim_parse("10 20926", &mcs, &throughput) == 1 && mcs == 10
+          && throughput == 20926, "a plain pair parses");
+    check(air_rate_sim_parse("  3\t4000  # dropping out\n", &mcs, &throughput) == 1 && mcs == 3
+          && throughput == 4000, "leading space, a tab separator and a trailing comment parse");
+    check(air_rate_sim_parse("-1 0", &mcs, &throughput) == 1 && mcs == -1 && throughput == 0,
+          "a negative index parses, since it is what arms the vendor's low-MCS branch");
+
+    mcs = 99;
+    throughput = 99;
+    check(air_rate_sim_parse("", &mcs, &throughput) == 0 && mcs == 99, "an empty line is refused");
+    check(air_rate_sim_parse("# just a comment\n", &mcs, &throughput) == 0, "a comment is refused");
+    check(air_rate_sim_parse("10\n", &mcs, &throughput) == 0, "an index with no throughput is refused");
+    check(air_rate_sim_parse("nonsense\n", &mcs, &throughput) == 0, "a non-numeric line is refused");
+    check(mcs == 99 && throughput == 99, "a refused line leaves both outputs untouched");
+
+    fd = mkstemp(path);
+    if (fd < 0) {
+        check(0, "the simulation file could be created");
+        return;
+    }
+
+    reset(&rate, ML_RATE_ON);
+    rate.sim_path = path;
+    stub_bb_sends = 0;
+
+    /* The service tick polls on AIR_MCS_POLL_MS, so each step below advances past one window. */
+    write_sim(fd, "5 10000\n");
+    air_rate_service(&rate, &bb, 1000);
+    check(stub_writes == 1 && stub_bps == 3500000, "a simulated sample drives the encoder");
+    check(stub_bb_sends == 0 && bb.fd < 0,
+          "and the baseband socket is never touched, so this runs with no radio");
+
+    write_sim(fd, "3 4000\n");
+    air_rate_service(&rate, &bb, 1000 + AIR_MCS_POLL_MS);
+    check(stub_writes == 2 && stub_bps == 1400000, "a simulated drop applies immediately");
+
+    write_sim(fd, "10 20926\n");
+    air_rate_service(&rate, &bb, 2000);
+    check(stub_writes == 2, "a simulated rise waits out the settle window");
+    air_rate_service(&rate, &bb, 2000 + AIR_RATE_RISE_MS);
+    check(stub_writes == 3 && stub_bps == 7315000,
+          "and then applies the rate measured on the one healthy link");
+
+    /* A file that vanishes under a running governor holds the last applied rate rather than
+     * falling back to anything: the encoder keeps the bitrate it was last told. */
+    close(fd);
+    unlink(path);
+    air_rate_service(&rate, &bb, 2000 + 2 * AIR_RATE_RISE_MS);
+    check(stub_writes == 3, "a missing file writes nothing and leaves the applied rate standing");
+}
+
 int main(void)
 {
     check_hysteresis();
+    check_frame_rate();
     check_throughput_alone();
     check_derivation();
     check_decode_and_modes();
+    check_sim();
 
     printf("%s\n", g_failed == 0 ? "air-rate-governor: all checks passed"
                                  : "air-rate-governor: FAILED");

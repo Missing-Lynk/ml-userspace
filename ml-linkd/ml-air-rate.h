@@ -29,6 +29,41 @@
  * socket takes a per-tile value. */
 #define AIR_RATE_TILES            2
 
+/*
+ * Frame rate. AR_8030_TX_GetFrameRate @0x434dc0 reduces the frame rate on the same condition the
+ * bitrate's low-MCS branch uses, `mcs <= Ar803xMinMcs`, and leaves it untouched otherwise. The
+ * reduction is a three-step ladder on its own runtime ratio, which defaults to 100 exactly as the
+ * bitrate ratio does:
+ *
+ *   ratio <  50   fps / 4
+ *   ratio <  75   fps / 2
+ *   otherwise     fps * 3 / 4
+ *
+ * With the shipped Ar803xMinMcs of -1 and a modulation index that is never negative, the condition
+ * is false on every sample and the vendor's frame rate never moves in flight. The ladder is
+ * implemented because it is the vendor's, and because AIR_RATE_MIN_MCS is the switch that arms it.
+ */
+#define AIR_RATE_FPS_RATIO_PCT    100       /* runtime ratio; the default the vendor falls back to */
+#define AIR_RATE_FPS_QUARTER_PCT  50        /* below this the ladder quarters the rate */
+#define AIR_RATE_FPS_HALF_PCT     75        /* below this it halves; at or above it takes 3/4 */
+
+/* The rate a stream is opened at, the nominal air_rate_frame_rate derives from. Frame rate on this
+ * stack is owned by the standby path, so this is the ladder's input in the test and nowhere else. */
+#define AIR_RATE_NOMINAL_FPS      60
+
+/*
+ * Bench simulation. The link quality a real sample carries is not reproducible on a desk: the chip
+ * picks the modulation index from conditions, and a bench link sits at one operating point or at
+ * none. So the sample can be read from a file instead of the baseband, one line of
+ * `<mcs> <throughput_kbps>`, re-read every poll. Everything downstream is the live path: the same
+ * derivation, the same drop-fast/rise-slow asymmetry, the same control-socket write.
+ *
+ * While it is set the baseband socket is never opened, so this runs with no RF hardware at all and
+ * cannot become a second opener on /dev/artosyn_sdio.
+ */
+#define AIR_RATE_SIM_PATH     "/run/missinglynk/rate-sim"
+#define AIR_RATE_SIM_MAX      64            /* longest line the file may carry */
+
 #define AIR_MCS_POLL_MS       200           /* GET_MCS cadence */
 #define AIR_RATE_RISE_MS      1000          /* a higher MCS must hold this long before it is acted on */
 #define AIR_CTRL_TIMEOUT_MS   200           /* control-socket reply budget */
@@ -43,8 +78,24 @@ struct air_rate {
     long pending_since_ms;
     int applied_bps;        /* per-tile bps last pushed, 0 = none */
     int warned_ctrl;
+    int warned_index;       /* a sample with an impossible modulation index has been reported */
     int probe_dumped;       /* raw reply hexdumps emitted so far (capped, see AIR_PROBE_DUMPS) */
+    const char *sim_path;   /* read samples from this file instead of the baseband, NULL = live */
+    int warned_sim;         /* the sim file has been reported unreadable */
 };
+
+/* The vendor's frame-rate ladder. Exposed because the branch that reaches it needs a
+ * modulation index no chip reports, so a unit test is the only way it is covered. */
+int air_rate_frame_rate(int mcs, int nominal_fps);
+
+/*
+ * Parse one simulation line into @p mcs and @p throughput_kbps.
+ *
+ * Accepts `<mcs> <throughput_kbps>` with any run of spaces or tabs between them, ignores anything
+ * after a '#', and ignores a blank or comment-only line. @return 1 on a complete pair, 0
+ * otherwise, leaving both outputs untouched. Pure, so the host test drives it directly.
+ */
+int air_rate_sim_parse(const char *line, int *mcs, int *throughput_kbps);
 
 void air_rate_service(struct air_rate *rate, struct air_bb *bb, long now);
 void air_rate_reply(struct air_rate *rate, const uint8_t *pay, int plen, long now);

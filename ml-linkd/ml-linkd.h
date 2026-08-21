@@ -55,8 +55,9 @@ enum ml_power_mode {
 };
 
 /* Air (TX) role entry point (--role air); hw_version is the board's hardware version string for the
- * status frame (NULL selects the default). Returns when g_run clears. */
+ * status frame (NULL selects the default). rate_sim is a bench sample file for the rate governor,
+ * NULL for the baseband. Returns when g_run clears. */
 void air_main(const char *hw_version, const char *fc_tty, enum ml_rate_mode rate_mode,
-              enum ml_power_mode power_mode);
+              enum ml_power_mode power_mode, const char *rate_sim);
 
 #endif /* ML_LINKD_H */
