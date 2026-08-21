@@ -197,7 +197,7 @@ gboolean rec_hw_init(struct ctx *c)
         pthread_cond_init(&c->rec_scale_cond, NULL);
         c->rec_free = g_async_queue_new();
         for (int i = 0; i < REC_POOL; i++) {
-            int fd = ml_heap_alloc(bufsize);
+            int fd = ml_heap_alloc_quiet(bufsize);   /* running the heap dry is the stop condition, not an error */
 
             if (fd < 0) {
                 break;                  /* heap exhausted - use what we have */

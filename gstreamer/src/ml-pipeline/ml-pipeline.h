@@ -608,6 +608,7 @@ void emit_framestats(struct ctx *c, GstClockTime pts);
 
 /* compose */
 int ml_heap_alloc(gsize len);
+int ml_heap_alloc_quiet(gsize len);
 void ml_dmabuf_sync(int fd, int start);
 void ml_dmabuf_invalidate(int fd);
 gboolean comp_pool_init(struct ctx *c);

@@ -13,7 +13,7 @@ static char g_heap_name[280];
  * composite can sit in L2 while the DC scans stale DDR - clean in every CPU dump, garbage on
  * the panel. Prefer mmz; the scan falls back to a CMA heap when it is absent; ML_HEAP overrides.
  */
-static int heap_alloc_pref(const char *pref, gsize len, char *name_out, gsize name_len)
+static int heap_alloc_pref(const char *pref, gsize len, char *name_out, gsize name_len, gboolean quiet)
 {
     struct dma_heap_allocation_data a = { .len = len, .fd_flags = O_RDWR | O_CLOEXEC };
     struct dirent *de;
@@ -51,7 +51,9 @@ static int heap_alloc_pref(const char *pref, gsize len, char *name_out, gsize na
     }
 
     if (ioctl(hfd, DMA_HEAP_IOCTL_ALLOC, &a)) {
-        perror("ml-pipeline: DMA_HEAP_IOCTL_ALLOC");
+        if (!quiet) {              /* the pool-fill loop expects to hit the heap's wall - see ml_heap_alloc_quiet */
+            perror("ml-pipeline: DMA_HEAP_IOCTL_ALLOC");
+        }
         close(hfd);
         return -1;
     }
@@ -63,10 +65,10 @@ static int heap_alloc_pref(const char *pref, gsize len, char *name_out, gsize na
     return a.fd;
 }
 
-int ml_heap_alloc(gsize len)
+static int heap_alloc_named(gsize len, gboolean quiet)
 {
     const char *pref = getenv("ML_HEAP") ? getenv("ML_HEAP") : "mmz";
-    int fd = heap_alloc_pref(pref, len, g_heap_name, sizeof g_heap_name);
+    int fd = heap_alloc_pref(pref, len, g_heap_name, sizeof g_heap_name, quiet);
 
     if (fd >= 0) {
         static int logged;
@@ -77,6 +79,21 @@ int ml_heap_alloc(gsize len)
     }
 
     return fd;
+}
+
+int ml_heap_alloc(gsize len)
+{
+    return heap_alloc_named(len, FALSE);
+}
+
+/* As ml_heap_alloc, but silent on the ALLOC failure. For the composite pool-fill loop only, where
+ * running the heap dry is the loop's stop condition, not an error - on this device steady-state CMA
+ * is a few hundred KiB, so a full pool never fits and the terminal failure fired one misleading
+ * "DMA_HEAP_IOCTL_ALLOC: Out of memory" on EVERY healthy boot. The real starvation (a pool below
+ * COMP_MIN) is still reported: comp_pool_init returns FALSE and the caller logs the failure. */
+int ml_heap_alloc_quiet(gsize len)
+{
+    return heap_alloc_named(len, TRUE);
 }
 
 /* Bracket CPU writes to a CMA buffer so the non-snooping DC sees them (start=1 before the
@@ -164,7 +181,7 @@ gboolean comp_pool_init(struct ctx *c)
     gsize buf_len = COMP_ALLOC;
 
     for (int i = 0; i < cap; i++) {
-        int fd = ml_heap_alloc(buf_len);
+        int fd = ml_heap_alloc_quiet(buf_len);   /* running the heap dry is the loop's stop condition, not an error */
         guint8 *m;
 
         if (fd < 0) {
@@ -497,7 +514,7 @@ void seam_scratch_init(struct ctx *c)
         return;
     }
 
-    c->seam_scratch_fd = heap_alloc_pref("default_cma_region", COMP_BAND_ALL, heap, sizeof heap);
+    c->seam_scratch_fd = heap_alloc_pref("default_cma_region", COMP_BAND_ALL, heap, sizeof heap, FALSE);
     if (c->seam_scratch_fd >= 0) {
         c->seam_scratch_map = mmap(NULL, COMP_BAND_ALL, PROT_READ | PROT_WRITE, MAP_SHARED,
                                    c->seam_scratch_fd, 0);
