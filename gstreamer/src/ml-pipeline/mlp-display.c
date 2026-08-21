@@ -175,6 +175,7 @@ static void drm_flip_handler(int fd, unsigned int seq, unsigned int tv_s,
 
     /* The event completes pending_it's flip: that frame is (about to be) latched. */
     if (!ditem_is_empty(&c->pending_it)) {
+        pmsg_mark(c, 'E', c->pending_it.pts);
         lat_mark_flip(c, c->pending_it.pts);
         pace_flip(c, c->flip_last_us - c->pending_since);
     }
@@ -231,6 +232,7 @@ static void disp_try_submit(struct ctx *c)
 
     int rc;
     lat_mark_issue(c, it.pts);
+    pmsg_mark(c, 'I', it.pts);
     if (c->planes_on) {
         rc = plane_commit(c, &it);
     } else {
@@ -250,6 +252,7 @@ static void disp_try_submit(struct ctx *c)
     c->pending_it = it;
     c->pending_since = g_get_monotonic_time();
     pthread_mutex_unlock(&c->disp_lock);
+    pmsg_mark(c, 'S', it.pts);
     lat_mark_submit(c, it.pts);
 }
 

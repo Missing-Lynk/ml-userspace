@@ -271,6 +271,7 @@ GstFlowReturn on_tile(GstAppSink *sink, gpointer u)
          * a direct CPU blit into a DMA-touched composite could never be made coherent - hence the
          * staging path exists to avoid that mix entirely.
          */
+        pmsg_mark(c, 'B', GST_BUFFER_PTS(b));
         if (blit_tile_dma(c, cfd, &t, dst_row, src_row)) {
             c->blit_dma++;
 
@@ -319,6 +320,7 @@ GstFlowReturn on_tile(GstAppSink *sink, gpointer u)
             sl->seam_ok[ch] = (ch == 0);
         }
 
+        pmsg_mark(c, 'b', GST_BUFFER_PTS(b));
         sl->have[ch] = TRUE;
         if (sl->have[0] && sl->have[1]) {
             if (c->seam_mode == SEAM_BLEND) {

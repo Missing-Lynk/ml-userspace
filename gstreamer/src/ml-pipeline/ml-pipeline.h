@@ -539,6 +539,11 @@ struct ctx {
      */
     gboolean lat_on;
     gboolean lat_raw;                   /* ML_LATRAW=1: one line per flip (short captures only) */
+
+    /* Persistent breadcrumbs (ML_PMSG=1, mlp-pmsg.c): one character per display-path phase
+     * written to /dev/pmsg0, which survives the watchdog reset a freeze ends in. -1 = off.
+     */
+    int pmsg_fd;
     pthread_mutex_t lat_lock;           /* guards lat_ent[] and the flush accumulators */
     struct lat_ent {
         GstClockTime pts;
@@ -675,6 +680,9 @@ void lat_mark_pair(struct ctx *c, GstClockTime pts);
 void lat_mark_issue(struct ctx *c, GstClockTime pts);
 void lat_mark_submit(struct ctx *c, GstClockTime pts);
 void lat_mark_flip(struct ctx *c, GstClockTime pts);
+
+void pmsg_init(struct ctx *c);
+void pmsg_mark(struct ctx *c, char phase, GstClockTime pts);
 
 /* rf decode-graph lifecycle (ml-pipeline.c) - built/torn down around playback swaps */
 int rf_decode_start(struct ctx *c);
