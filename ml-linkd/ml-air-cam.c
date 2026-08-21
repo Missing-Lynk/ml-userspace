@@ -16,11 +16,35 @@
 #include "ml-linkd.h"
 #include "mp-cmd.h"
 #include "ml-air-cam.h"
+#include "ml-air-seen.h"
 
 /* The file the ml-air-ae init script reads at boot and ml-aed re-reads on SIGHUP. Both parse it
  * the same way: absent = off, empty = 50, else the number forced to {0, 50, 60}. */
 #define AIR_CAM_BANDING_DIR   "/usrdata/missinglynk"
 #define AIR_CAM_BANDING_FILE  AIR_CAM_BANDING_DIR "/banding"
+
+/*
+ * The full union map, wider than enum mlm_cam_sel: that enum carries the selectors our goggle
+ * sends, while the air is the end that receives whatever a goggle offers, including the five the
+ * stock capture never produced. The numbers are the field comments of mp-cmd.h's struct mp_camera.
+ */
+const char *air_cam_selector_name(uint32_t sel)
+{
+    switch (sel) {
+        case 0:  return "brightness";
+        case 1:  return "exposure";
+        case 2:  return "saturation";
+        case 3:  return "sharpness";
+        case 4:  return "white balance";
+        case 5:  return "rotation";
+        case 6:  return "aspect";
+        case 7:  return "3D noise reduction";
+        case 8:  return "2D noise reduction";
+        case 9:  return "ISO";
+        case 10: return "banding";
+        default: return "unknown";
+    }
+}
 
 int air_cam_parse_banding(const uint8_t *dgram, ssize_t n, unsigned int *hz)
 {
@@ -133,11 +157,27 @@ void air_cam_set(const uint8_t *dgram, ssize_t n)
     unsigned int hz;
 
     if (!air_cam_parse_banding(dgram, n, &hz)) {
-        if (g_verbose && n >= MP_CAM_BODY_OFF + 4) {
-            uint32_t sel;
+        /* Unconditional and once per selector: banding is the one selector with an actuator, so
+         * every other camera control the goggle offers ends here, and the log is where that
+         * reaches the operator. */
+        static struct air_seen seen;
+        static int warned_short;
+        uint32_t sel;
 
-            memcpy(&sel, dgram + MP_CAM_BODY_OFF, 4);
-            fprintf(stderr, TAG " rx SetCameraInfo sel=%u, no handler, ignored\n", sel);
+        if (n < MP_CAM_BODY_OFF + (ssize_t)MP_CAM_BODY_LEN) {
+            if (!warned_short) {
+                warned_short = 1;
+                fprintf(stderr, TAG " rx SetCameraInfo of %zd B, body is %u, ignored\n",
+                        (ssize_t)n, (unsigned)MP_CAM_BODY_LEN);
+            }
+
+            return;
+        }
+
+        memcpy(&sel, dgram + MP_CAM_BODY_OFF, 4);
+        if (air_seen_first(&seen, sel)) {
+            fprintf(stderr, TAG " rx SetCameraInfo sel=%u (%s), no actuator, ignored\n",
+                    sel, air_cam_selector_name(sel));
         }
 
         return;

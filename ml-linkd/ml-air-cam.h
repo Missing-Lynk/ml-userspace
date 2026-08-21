@@ -8,8 +8,8 @@
  * told to re-read it with SIGHUP, so the correction applies without restarting the AE loop or
  * losing its operating point.
  *
- * Every other selector is drained and logged under verbose: our stack has no ISP call behind
- * them yet, and pretending to apply a value is worse than saying it was ignored.
+ * Every other selector is drained and named in the log once per run: our stack has no ISP call
+ * behind them yet, and pretending to apply a value is worse than saying it was ignored.
  */
 #ifndef ML_AIR_CAM_H
 #define ML_AIR_CAM_H
@@ -24,6 +24,9 @@
  * datagram or any other selector, *hz untouched.
  */
 int air_cam_parse_banding(const uint8_t *dgram, ssize_t n, unsigned int *hz);
+
+/* The control a selector names, for the log. Covers the whole union, "unknown" past it. */
+const char *air_cam_selector_name(uint32_t sel);
 
 /* Act on one 0x0C datagram: parse, persist on change, signal ml-aed. */
 void air_cam_set(const uint8_t *dgram, ssize_t n);

@@ -99,7 +99,8 @@ CHECK_CFLAGS := -O1 -Wall -Wextra -Werror
 check: $(BUILD)/msp-canvas-roundtrip $(BUILD)/air-power-standby $(BUILD)/mp-params-reply \
        $(BUILD)/bb-frame-builders $(BUILD)/air-rate-governor $(BUILD)/rx-scan-decode \
        $(BUILD)/mp-frame-builders $(BUILD)/rx-1v1-decode \
-       $(BUILD)/msp-parser $(BUILD)/ae-decision $(BUILD)/air-cam-banding $(BUILD)/ltm-page
+       $(BUILD)/msp-parser $(BUILD)/ae-decision $(BUILD)/air-cam-banding \
+       $(BUILD)/air-msg-seen $(BUILD)/ltm-page
 	$(BUILD)/msp-canvas-roundtrip
 	$(BUILD)/air-power-standby
 	$(BUILD)/mp-params-reply
@@ -111,6 +112,7 @@ check: $(BUILD)/msp-canvas-roundtrip $(BUILD)/air-power-standby $(BUILD)/mp-para
 	$(BUILD)/msp-parser
 	$(BUILD)/ae-decision
 	$(BUILD)/air-cam-banding
+	$(BUILD)/air-msg-seen
 	$(BUILD)/ltm-page
 	@$(MAKE) --no-print-directory check-seam
 
@@ -169,6 +171,10 @@ $(BUILD)/ae-decision: tests/ae-decision.c ml-aed/ml-aed-core.c | $(BUILD)
 
 # The air's SetCameraInfo parse against the goggle's own frame builder.
 $(BUILD)/air-cam-banding: tests/air-cam-banding.c ml-linkd/ml-air-cam.c | $(BUILD)
+	gcc $(CHECK_CFLAGS) -o $@ $^
+
+# The report-once latch the air logs unhandled goggle commands through.
+$(BUILD)/air-msg-seen: tests/air-msg-seen.c ml-linkd/ml-air-cam.c | $(BUILD)
 	gcc $(CHECK_CFLAGS) -o $@ $^
 
 # The neo_v2 LTM page arithmetic, the library-grounded stages (the clip tables are device data).
