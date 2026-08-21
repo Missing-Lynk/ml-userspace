@@ -117,12 +117,17 @@ static atomic_uint g_valid_bmp;
  * issues it once and clears it back to -1. One-shot, NOT a latch: re-issuing SelectChn on a cadence
  * would retune the RX continuously. The select must come from the bb-socket TX thread only; issuing
  * it from the UDP thread would race the steady poll and get lost (RE of the stock picker). */
+/* The chip's modulation indices. The sweep uses 0 and a live link has been seen at 10; the
+ * bound exists so a typo fails here rather than as a silent chip reject. */
+#define RX_MCS_MAX 15u
+
 static atomic_int g_pending_chnidx = -1;    /* HUD-requested channel table index (0..18), -1 = none */
 /* Channel the local RX is tuned to; tracks every SelectChn we issue, for the OSD and the sweep's
  * restore. -1 until rx_chan_open has read the band and chosen one, which is also the state left
  * behind when GetScanResult does not answer: we have set no channel, so we do not claim one. */
 static atomic_int g_cur_chnidx = -1;
 static atomic_int g_pending_scan;           /* HUD requested a one-shot scan (MLM_RF_SCAN); STEADY fires it */
+static atomic_int g_pending_mcs = -1;       /* requested MCS pin, MLM_MCS_AUTO to release, -1 = none */
 
 /* mlm_scan.active_idx is a u8 and the HUD highlights the tile whose index equals it. No table index
  * is 0xff, so that is the encoding for "no channel set yet" and the grid highlights nothing. */
@@ -689,6 +694,37 @@ void rx_chan_request_select(unsigned chnidx)
     atomic_store_explicit(&g_pending_chnidx, (int)chnidx, memory_order_release);
 }
 
+/*
+ * Pin the link's modulation index, or hand it back to the chip.
+ *
+ * The chip picks the MCS in normal running and the air's rate governor derives its encoder
+ * bitrate from whatever it picks, so driving the governor to a known input means pinning the
+ * MCS from this end. The sweep already does this for its own purposes, at a hardcoded 0.
+ *
+ * A pin outlives the process that set it: the chip keeps it until something restores AUTO, so a
+ * session that ends without restoring leaves the link stuck at the pinned rate.
+ */
+void rx_chan_request_mcs(unsigned mcs)
+{
+    if (mcs != MLM_MCS_AUTO && mcs > RX_MCS_MAX) {
+        fprintf(stderr, TAG " rfcmd: ignoring bad mcs %u, expected 0..%u or auto\n",
+                mcs, RX_MCS_MAX);
+        return;
+    }
+
+    if (g_verbose) {
+        if (mcs == MLM_MCS_AUTO) {
+            printf(TAG " rfcmd: mcs auto\n");
+        } else {
+            printf(TAG " rfcmd: pin mcs %u\n", mcs);
+        }
+
+        fflush(stdout);
+    }
+
+    atomic_store_explicit(&g_pending_mcs, (int)mcs, memory_order_release);
+}
+
 /* Queue a one-shot sweep; read-only and self-restoring, so it needs no gate of its own. */
 void rx_chan_request_scan(void)
 {
@@ -717,6 +753,22 @@ void rx_chan_service(uint8_t *frame, uint32_t *seq_link)
             printf(TAG " selected channel %d\n", chnidx);
             fflush(stdout);
         }
+    }
+
+    /* Before the sweep: a sweep pins MCS 0 and restores AUTO itself, so servicing a pin first
+     * would have the sweep undo it in the same pass. */
+    int mcs = atomic_exchange_explicit(&g_pending_mcs, -1, memory_order_acquire);
+    if (mcs >= 0) {
+        if ((unsigned)mcs == MLM_MCS_AUTO) {
+            send_frame(frame, bb_set_mcs_mode(frame, MCS_MODE_AUTO, (*seq_link)++), "mcs-auto");
+            printf(TAG " mcs: auto, the chip owns the rate again\n");
+        } else {
+            send_frame(frame, bb_set_mcs_mode(frame, MCS_MODE_MANUAL, (*seq_link)++), "mcs-manual");
+            send_frame(frame, bb_set_mcs_value(frame, (uint8_t)mcs, (*seq_link)++), "mcs-value");
+            printf(TAG " mcs: pinned to %d, restore with `ml-rfcmd mcs auto`\n", mcs);
+        }
+
+        fflush(stdout);
     }
 
     if (atomic_exchange_explicit(&g_pending_scan, 0, memory_order_acquire)) {

@@ -15,6 +15,7 @@ void rx_chan_on_scan_result(const uint8_t *payload, int plen);
  * bb-socket TX thread only, or they race the steady poll and get lost. */
 void rx_chan_request_select(unsigned chnidx);
 void rx_chan_request_scan(void);
+void rx_chan_request_mcs(unsigned mcs);   /* MLM_MCS_AUTO hands the rate back to the chip */
 
 /* bb-socket TX thread (main) only. rx_chan_open reads the band and sets the channel once, during
  * OPEN; it sets none if the chip does not answer. */

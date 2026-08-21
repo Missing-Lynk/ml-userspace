@@ -400,6 +400,12 @@ static void handle_rfcmd(const struct mlm_rfcmd *rfcmd, long now)
             rx_chan_request_scan();
         } break;
 
+        case MLM_RF_SET_MCS: {
+            /* Queued for the bb-socket owner like the selects; issuing it here would race the
+             * steady poll on that socket. */
+            rx_chan_request_mcs(rfcmd->arg);
+        } break;
+
         case MLM_RF_BIND: {
             rx_bind_request(rfcmd->arg != 0, now);
         } break;

@@ -359,6 +359,12 @@ enum mlm_rfcmd_type {
                              * the air's VIN scale: aspect 0 = 16:9, 1 = 4:3; zoom_pct = zoom factor
                              * in percent, one of {100, 70} (the two HW-captured stock values).
                              * Applied live; a change blips the feed (geometry restart). */
+    MLM_RF_SET_MCS      = 9, /* arg = the modulation index to pin the link to, or MLM_MCS_AUTO to
+                              * hand the rate back to the chip. A test lever: the chip picks the
+                              * MCS in normal running, and pinning it is how the air's rate
+                              * governor is driven to a known input. Issued on the goggle's
+                              * baseband socket by ml-linkd, which is its only opener. */
+
     MLM_RF_BIND         = 8, /* pair a new air unit: enter the chip's pair mode, poll for a peer
                              * (the AU must be in ITS pair mode too), pair-lock the reported MAC.
                              * arg = 0 dry-run (chip-runtime bind only, a power cycle reverts it),
@@ -367,6 +373,10 @@ enum mlm_rfcmd_type {
                              * (:10000 telemetry fresh) so nothing can happen mid-flight; progress
                              * comes back as MLM_T_LINK BINDING / BIND_OK / BIND_FAIL. */
 };
+
+/* MLM_RF_SET_MCS: hand the rate back to the chip rather than pinning it. Chosen above the 0..15
+ * the chip accepts so it cannot collide with a real index. */
+#define MLM_MCS_AUTO   0xffffu
 
 /* MLM_RF_SET_CAMERA selectors, the air's SetCameraInfo union tags. Only the ones the stock Camera
  * page exposed and the slot-A capture confirmed are listed, plus banding, which our air handles

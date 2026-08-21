@@ -41,6 +41,7 @@ static const struct rf_verb VERBS[] = {
     { "channel", MLM_RF_SELECT_CHANNEL, 1, { ARG_ANY },         "channel table index 0..18" },
     { "scan",    MLM_RF_SCAN,           0, { ARG_ANY },         "one-shot channel sweep" },
     { "bind",    MLM_RF_BIND,           1, { 0, 1, ARG_ANY },   "0 dry-run, 1 persist the peer" },
+    { "mcs",     MLM_RF_SET_MCS,        1, { ARG_ANY },         "pin the link MCS 0..15, or 'auto'" },
     { "banding", MLM_RF_SET_CAMERA,     1, { 0, 50, 60 },       "mains anti-flicker: 0 off, 50 or 60 Hz",
       MLM_CAM_BANDING },
 };
@@ -108,7 +109,15 @@ int main(int argc, char **argv)
                 return 2;
             }
 
-            arg = (uint32_t)strtoul(argv[2], &end, 0);
+            /* One keyword, for the command whose release value is not a rate. Spelling it
+             * out beats making the operator remember 65535 for the restore step. */
+            if (verb->cmd == MLM_RF_SET_MCS && !strcmp(argv[2], "auto")) {
+                arg = MLM_MCS_AUTO;
+                end = argv[2] + strlen(argv[2]);
+            } else {
+                arg = (uint32_t)strtoul(argv[2], &end, 0);
+            }
+
             if (*end != '\0') {
                 fprintf(stderr, "ml-rfcmd: '%s' is not a number\n", argv[2]);
                 return 2;
