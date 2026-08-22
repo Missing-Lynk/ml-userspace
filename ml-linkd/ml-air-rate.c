@@ -8,13 +8,16 @@
 
 #include "bb-cmd.h"
 #include "ml-linkd.h"
+#include "mp-cmd.h"
 #include "ml-air-bb.h"
 #include "ml-air-ctrl.h"
 #include "ml-air-rate.h"
 
 /* The vendor derivation, kept in its original shape: the integer divide by 100 happens BEFORE the
- * multiply, so the throughput input is quantised to 100 kbps steps. Returns a total in kbps. */
-static int air_rate_total_kbps(int mcs, int throughput_kbps)
+ * multiply, so the throughput input is quantised to 100 kbps steps. The goggle's cap is applied
+ * after it, over the fallback too, so it is a ceiling on everything the derivation can produce.
+ * Returns a total in kbps. */
+static int air_rate_total_kbps(const struct air_rate *rate, int mcs, int throughput_kbps)
 {
     int kbps;
 
@@ -33,7 +36,13 @@ static int air_rate_total_kbps(int mcs, int throughput_kbps)
         kbps = AIR_RATE_MAX_KBPS;
     }
 
-    return kbps != 0 ? kbps : AIR_RATE_FALLBACK_KBPS;
+    kbps = kbps != 0 ? kbps : AIR_RATE_FALLBACK_KBPS;
+
+    if (rate->cap_kbps != AIR_RATE_CAP_NONE && kbps > rate->cap_kbps) {
+        kbps = rate->cap_kbps;
+    }
+
+    return kbps;
 }
 
 /* The vendor's frame-rate derivation, AR_8030_TX_GetFrameRate. Reduces only while the modulation
@@ -71,7 +80,7 @@ int air_rate_frame_rate(int mcs, int nominal_fps)
  */
 static void air_rate_apply(struct air_rate *rate, int mcs, int throughput_kbps, const char *why)
 {
-    int total_kbps = air_rate_total_kbps(mcs, throughput_kbps);
+    int total_kbps = air_rate_total_kbps(rate, mcs, throughput_kbps);
     int bps = total_kbps * 1000 / AIR_RATE_TILES;
     char cmd[64];
 
@@ -158,6 +167,7 @@ static void air_rate_sample(struct air_rate *rate, int mcs, int throughput_kbps,
     }
 
     rate->warned_index = 0;
+    rate->throughput_kbps = throughput_kbps;
 
     if (rate->mcs < 0) {
         rate->mcs = mcs;
@@ -190,6 +200,46 @@ static void air_rate_sample(struct air_rate *rate, int mcs, int throughput_kbps,
         rate->mcs = mcs;
         rate->pending_mcs = -1;
         air_rate_apply(rate, mcs, throughput_kbps, "mcs rise");
+    }
+}
+
+/*
+ * One SetLdCfg, for the bitrate ceiling it carries.
+ *
+ * The goggle sends this once per association, which is after the governor has been polling for a
+ * while and has a rate applied, so a new cap re-derives from the sample in hand rather than waiting
+ * for the next modulation-index transition - that transition may be minutes away, and until it
+ * arrived the menu would look ignored. The derived rate is unchanged when the cap does not bite,
+ * and air_rate_apply drops a write that would repeat the applied value.
+ */
+void air_rate_ld_cfg(struct air_rate *rate, const uint8_t *dgram, ssize_t n)
+{
+    struct mp_ldcfg cfg;
+    int cap_kbps;
+
+    if (rate->mode == ML_RATE_OFF || n < MP_LDCFG_LEN) {
+        return;
+    }
+
+    memcpy(&cfg, dgram + MP_LDCFG_BODY_OFF, sizeof cfg);
+    cap_kbps = (int)cfg.bitrate_q * MP_LDCFG_BITRATE_KBPS;
+
+    if (cap_kbps == rate->cap_kbps) {
+        return;
+    }
+
+    rate->cap_kbps = cap_kbps;
+
+    if (cap_kbps == AIR_RATE_CAP_NONE) {
+        printf(TAG " rate: goggle set no max bitrate, capped at %d kbps total\n",
+               AIR_RATE_MAX_KBPS);
+    } else {
+        printf(TAG " rate: goggle set max bitrate %d kbps total\n", cap_kbps);
+    }
+    fflush(stdout);
+
+    if (rate->mcs >= 0) {
+        air_rate_apply(rate, rate->mcs, rate->throughput_kbps, "max bitrate");
     }
 }
 

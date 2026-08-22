@@ -355,7 +355,7 @@ To keep an access unit inside 65467 B, `vbv_ms` must be under `65467 * 8000 / bi
 
 ## Bitrate scale
 
-The vendor air unit takes no configured bitrate. `AR_8030_TX_GetBitRate` derives it from live RF MCS as `throughput * Ar803xThroutputRate * cfg`, capped at `ArMaxBitRate`, returning 8000 kbit/s when throughput reads zero. From captured `cfg_transmedium.json`: ratio 0.7, cap 20000 kbit/s. `bitrate_q` from the goggle menu is stored and never read.
+The vendor air unit takes no configured bitrate. `AR_8030_TX_GetBitRate` derives it from live RF MCS as `throughput * Ar803xThroutputRate * cfg`, capped at `ArMaxBitRate`, returning 8000 kbit/s when throughput reads zero. From captured `cfg_transmedium.json`: ratio 0.7, cap 20000 kbit/s. `bitrate_q` from the goggle menu is stored and never read. Our air derives the same number and then caps it at `bitrate_q`, which is a deviation (`ml-linkd/README.md`, encoder rate governor).
 
 | point | per tile | total |
 |---|---|---|

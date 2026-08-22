@@ -54,6 +54,10 @@ Polls `GET_MCS` on the bb socket every 200 ms and derives an encoder target from
 
 It recomputes on MCS transitions only, not on throughput drift, and the response is asymmetric: a drop in MCS is applied at once, a rise only after the higher MCS has held for a second. Frame rate and min QP are not touched.
 
+The air-unit image runs this at boot (`init.d/ml-air-link` passes `--rate-adapt`), so the flag being off by default is a bench convenience and not what a flashed unit does.
+
+**The goggle's bitrate menu is a ceiling on the derived total.** `SetLdCfg`'s `bitrate_q` (body 0x65, 250 kbps units) arrives once per association and is applied after the vendor's own 20000 kbps clamp and after the no-link fallback, so the menu can only lower the rate and a cap above 20000 does nothing. A cap that changes re-derives from the sample already in hand rather than waiting for the next MCS transition. Zero, which is what a goggle sends until the menu is touched, leaves the governor uncapped. This is a deviation: a vendor air stores `bitrate_q` at handle+0x115 and never reads it, so the wire is unchanged in both directions and a vendor goggle against this air simply sets a cap.
+
 `--rate-probe` runs the same poll and logs the raw reply, the decode and the target it would send, without touching the encoder. The reply is 8 bytes: MCS index at +0 biased by 2, link throughput as a u32 LE in kbps at +4. Measured values are `19 00 00 00 00 00 00 00` unassociated (MCS 23, 0 kbps) and `0c 00 00 00 be 51 00 00` associated (MCS 10, 20926 kbps), so throughput is the field that distinguishes the two states and the idle MCS reading is the higher one.
 
 ### TX power and standby (`--power-adapt`, off by default)
@@ -72,7 +76,7 @@ Two independent gates: **radiated power follows the FC arm state, frame rate fol
 
 Arming also cancels a commanded standby in the reported work mode, so the goggle is never shown a standby the air is not honouring. Standby itself no longer moves power: a disarmed aircraft is already at the minimum, and an armed one is flying.
 
-Both `:10000` messages carrying the two fields are read, and only those two fields: SetTranParm (`0x0d`, body\[0\] dBm, body\[8\] standby arm) arrives on a ~2 s cadence and is the live lever, SetLdCfg (`0x0a`, struct offsets 0x68 and 0x70) arrives once per association and is the durable one. The remaining 190 bytes of SetLdCfg are undecoded vendor state and are not read.
+Both `:10000` messages carrying the two fields are read, and only those two fields: SetTranParm (`0x0d`, body\[0\] dBm, body\[8\] standby arm) arrives on a ~2 s cadence and is the live lever, SetLdCfg (`0x0a`, struct offsets 0x68 and 0x70) arrives once per association and is the durable one. One further byte pair of SetLdCfg is read elsewhere, `bitrate_q` at 0x65 by the rate governor; the rest is undecoded vendor state, reported once per change and otherwise untouched.
 
 A value outside the chip's `pwr_range` of \[5, 23\] dBm is rejected rather than clamped, and leaves both the previous commanded value and the standby bit alone. A power that has not changed is not re-written, so the 2 s command cadence does not become a 2 s write cadence on the bb socket. Honouring a commanded power and letting the chip adjust it are mutually exclusive, so the first write turns the chip's self-adjust off and it stays off.
 

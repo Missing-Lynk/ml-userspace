@@ -11,6 +11,7 @@
 #define ML_AIR_RATE_H
 
 #include <stdint.h>
+#include <sys/types.h>
 
 #include "ml-linkd.h"
 #include "ml-air-bb.h"
@@ -28,6 +29,21 @@
 /* The derived rate is a TOTAL across the two tiles the 1080p frame is split into; the control
  * socket takes a per-tile value. */
 #define AIR_RATE_TILES            2
+
+/*
+ * The goggle's bitrate menu, read as a ceiling on the derived total.
+ *
+ * SetLdCfg carries bitrate_q (mp-cmd.h, body 0x65) in 250 kbps units, and the vendor air stores it
+ * at handle+0x115 without ever reading it: AR_LOWDELAY_TX_SYSCTRL_SetLdCfg @0x4487a0 takes TX
+ * power, resolution/canvas and an FSM event out of that body and nothing else, and its encoder
+ * rate is AR_8030_TX_GetBitRate alone. Acting on it is a deviation from the vendor and costs
+ * nothing on the wire, which stays byte-identical in both directions.
+ *
+ * It is applied last, after the vendor's own ArMaxBitRate clamp and after the no-link fallback, so
+ * the menu can only lower the rate and a cap above AIR_RATE_MAX_KBPS is inert. A goggle that never
+ * sends SetLdCfg leaves the governor uncapped.
+ */
+#define AIR_RATE_CAP_NONE         0
 
 /*
  * Frame rate. AR_8030_TX_GetFrameRate @0x434dc0 reduces the frame rate on the same condition the
@@ -74,6 +90,8 @@ struct air_rate {
     int holding;            /* holds a reference on the bb socket */
     long last_poll_ms;
     int mcs;                /* last acted-on MCS, -1 = no sample yet */
+    int throughput_kbps;    /* throughput the last acted-on sample carried */
+    int cap_kbps;           /* goggle-commanded ceiling on the total, AIR_RATE_CAP_NONE = uncapped */
     int pending_mcs;        /* higher MCS waiting out the settle window, -1 = none */
     long pending_since_ms;
     int applied_bps;        /* per-tile bps last pushed, 0 = none */
@@ -99,5 +117,9 @@ int air_rate_sim_parse(const char *line, int *mcs, int *throughput_kbps);
 
 void air_rate_service(struct air_rate *rate, struct air_bb *bb, long now);
 void air_rate_reply(struct air_rate *rate, const uint8_t *pay, int plen, long now);
+
+/* One SetLdCfg (0x0a) datagram: take bitrate_q as the cap. A change re-derives from the sample
+ * already in hand, so a cap that arrives between two modulation-index transitions still applies. */
+void air_rate_ld_cfg(struct air_rate *rate, const uint8_t *dgram, ssize_t n);
 
 #endif /* ML_AIR_RATE_H */

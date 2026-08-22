@@ -343,6 +343,7 @@ static int air_send_standby(uint32_t work_mode, void *ctx)
 struct air_msg_ctx {
     struct air_udp_tx *tx;
     struct air_power *power;
+    struct air_rate *rate;
     struct air_idr *idr;
     long now;
     uint32_t stamp_us;
@@ -391,7 +392,10 @@ static void air_on_params(const struct air_msg_ctx *c, const uint8_t *dgram, ssi
         } break;
 
         case MP_SETLDCFG: {
+            /* Two modules read this one body: power takes tx_power_dbm and standby_mode_en, the
+             * governor takes bitrate_q as its ceiling. */
             air_power_ld_cfg(c->power, dgram, n);
+            air_rate_ld_cfg(c->rate, dgram, n);
         } break;
 
         case MP_SETCAMERA: {
@@ -587,8 +591,8 @@ void air_main(const char *hw_version, const char *fc_tty, enum ml_rate_mode rate
         }
 
         /* Service the goggle's :10000 datagrams. */
-        struct air_msg_ctx mctx = { .tx = &status_tx, .power = &power, .idr = &idr,
-                                    .now = now, .stamp_us = stamp_us };
+        struct air_msg_ctx mctx = { .tx = &status_tx, .power = &power, .rate = &rate,
+                                    .idr = &idr, .now = now, .stamp_us = stamp_us };
 
         for (int got = 0; status_bound && got < AIR_RX_BURST_MAX &&
              (n = recvfrom(status_sock, mp_rx, sizeof mp_rx, MSG_DONTWAIT, NULL, NULL)) > 0; got++) {

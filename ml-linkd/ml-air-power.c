@@ -89,7 +89,8 @@ static void air_power_ld_cfg_report(const uint8_t *body)
     printf(TAG " ldcfg: rec %ux%u, aspect %u, scale %u/%u, rotation %u, zoom %.3f, roi %u,"
            " bitrate %u kbps, power %u dBm, standby %u\n",
            cfg.rec_width, cfg.rec_height, cfg.aspect_ratio, cfg.scale_mode, cfg.scale_unk25,
-           cfg.rotation, (double)cfg.zoom_factor, cfg.roi_enable, cfg.bitrate_q * 250u,
+           cfg.rotation, (double)cfg.zoom_factor, cfg.roi_enable,
+           cfg.bitrate_q * (unsigned)MP_LDCFG_BITRATE_KBPS,
            cfg.tx_power_dbm, cfg.standby_mode_en);
     printf(TAG " ldcfg: unk44 %u, unk45 %u, unk4a %u, unk4e %u, tran_blk %u/%u/%u/%u,"
            " caps %02x/%02x\n",

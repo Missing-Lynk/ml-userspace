@@ -37,7 +37,7 @@ struct rf_verb {
 static const struct rf_verb VERBS[] = {
     { "standby", MLM_RF_SET_STANDBY,    1, { 0, 1, ARG_ANY },   "0 disarm, 1 arm" },
     { "power",   MLM_RF_SET_POWER,      1, { 25, 100, 200 },    "air TX power in mW" },
-    { "bitrate", MLM_RF_SET_BITRATE,    1, { 8, 16, 24 },       "air video bitrate in Mbps" },
+    { "bitrate", MLM_RF_SET_BITRATE,    1, { 8, 16, 24 },       "air MAX video bitrate in Mbps" },
     { "channel", MLM_RF_SELECT_CHANNEL, 1, { ARG_ANY },         "channel table index 0..18" },
     { "scan",    MLM_RF_SCAN,           0, { ARG_ANY },         "one-shot channel sweep" },
     { "bind",    MLM_RF_BIND,           1, { 0, 1, ARG_ANY },   "0 dry-run, 1 persist the peer" },

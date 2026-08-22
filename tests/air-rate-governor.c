@@ -20,7 +20,9 @@
  *      the cliff that divide creates below 100 kbps,
  *   5. a control socket that does not answer leaves the applied value alone, so the next sample
  *      retries rather than believing a write that never landed,
- *   6. the bench simulation input drives that same policy from a file, and touches no baseband.
+ *   6. the bench simulation input drives that same policy from a file, and touches no baseband,
+ *   7. the goggle's bitrate menu caps the derived total, applies to the sample already in hand,
+ *      and can only ever lower the rate.
  *
  * Point 4 is worth the test on its own. The quantisation and the fallback look like defects and are
  * not: both are transcribed from the vendor's AR_8030_TX_GetBitRate, and a well-meant "fix" to
@@ -28,6 +30,7 @@
  */
 #include "../ml-linkd/bb-cmd.h"
 #include "../ml-linkd/ml-air-rate.h"
+#include "../ml-linkd/mp-cmd.h"
 
 #include <stdatomic.h>
 #include <stdint.h>
@@ -423,6 +426,91 @@ static void check_sim(void)
     check(stub_writes == 3, "a missing file writes nothing and leaves the applied rate standing");
 }
 
+
+/**
+ * @brief The goggle's bitrate menu, read as a ceiling on the derived total.
+ *
+ * The datagram is built with the goggle's own mp_set_ld_cfg, so the field offset both sides use is
+ * under test here rather than transcribed a second time. What matters beyond the arithmetic is
+ * WHEN the cap lands: SetLdCfg arrives once per association, long after the governor has a rate
+ * applied, so a cap that waited for the next modulation-index transition would look ignored for
+ * however long the link stayed put.
+ */
+static void check_cap(void)
+{
+    struct air_rate rate;
+    uint8_t cfg[MP_LDCFG_LEN];
+    struct mp_ldcfg *body = (struct mp_ldcfg *)(cfg + MP_LDCFG_BODY_OFF);
+
+    printf("  -- max bitrate cap --\n");
+
+    reset(&rate, ML_RATE_ON);
+    sample(&rate, 10, 20926, 1000);
+    check(stub_writes == 1 && stub_bps == 7315000,
+          "20926 kbps derives 7315 kbps per tile uncapped");
+
+    mp_set_ld_cfg(cfg, 0, 8, -1, 0);
+    air_rate_ld_cfg(&rate, cfg, MP_LDCFG_LEN);
+    check(rate.cap_kbps == 8000, "8 Mbps arrives as an 8000 kbps cap");
+    check(stub_writes == 2 && stub_bps == 4000000,
+          "and applies at once, re-derived from the sample already in hand");
+
+    air_rate_ld_cfg(&rate, cfg, MP_LDCFG_LEN);
+    check(stub_writes == 2, "the same cap re-sent on the next association writes nothing");
+
+    sample(&rate, 3, 5215, 2000);
+    check(stub_writes == 3 && stub_bps == 1820000,
+          "a drop below the cap derives its own rate, cap or no cap");
+
+    /* The menu's other two levels against the same throughput: neither bites, so the governor is
+     * left deriving. 16000 is above the 14630 that input produces, and 24000 is above the vendor's
+     * own ArMaxBitRate, which no cap may raise. */
+    mp_set_ld_cfg(cfg, 0, 16, -1, 0);
+    air_rate_ld_cfg(&rate, cfg, MP_LDCFG_LEN);
+    sample(&rate, 10, 20926, 2000 + AIR_RATE_RISE_MS);
+    sample(&rate, 10, 20926, 2000 + 2 * AIR_RATE_RISE_MS);
+    check(stub_bps == 7315000, "a 16 Mbps cap is above the derived total and does not bite");
+
+    reset(&rate, ML_RATE_ON);
+    mp_set_ld_cfg(cfg, 0, 24, -1, 0);
+    air_rate_ld_cfg(&rate, cfg, MP_LDCFG_LEN);
+    sample(&rate, 10, 100000, 0);
+    check(stub_bps == 10000000,
+          "a 24 Mbps cap cannot raise the ceiling past the vendor's AIR_RATE_MAX_KBPS");
+
+    /* The cap sits after the no-link fallback, so it holds on a link that reports nothing. */
+    reset(&rate, ML_RATE_ON);
+    mp_set_ld_cfg(cfg, 0, 4, -1, 0);
+    air_rate_ld_cfg(&rate, cfg, MP_LDCFG_LEN);
+    sample(&rate, 5, 0, 0);
+    check(stub_bps == 2000000, "the cap holds over the 8 Mbps no-link fallback too");
+
+    /* A goggle that leaves the field at zero, which is what ours sends until the menu is touched. */
+    reset(&rate, ML_RATE_ON);
+    mp_set_ld_cfg(cfg, 0, 8, -1, 0);
+    air_rate_ld_cfg(&rate, cfg, MP_LDCFG_LEN);
+    body->bitrate_q = 0;
+    air_rate_ld_cfg(&rate, cfg, MP_LDCFG_LEN);
+    check(rate.cap_kbps == AIR_RATE_CAP_NONE, "a zero bitrate_q leaves the governor uncapped");
+    sample(&rate, 10, 100000, 0);
+    check(stub_bps == 10000000, "so the vendor's clamp is what stands");
+
+    reset(&rate, ML_RATE_ON);
+    mp_set_ld_cfg(cfg, 0, 8, -1, 0);
+    air_rate_ld_cfg(&rate, cfg, MP_LDCFG_LEN);
+    check(stub_writes == 0 && rate.cap_kbps == 8000,
+          "a cap arriving before the first sample is latched and commands nothing");
+    sample(&rate, 10, 20926, 0);
+    check(stub_writes == 1 && stub_bps == 4000000, "and caps the baseline when it arrives");
+
+    air_rate_ld_cfg(&rate, cfg, MP_LDCFG_LEN - 1);
+    check(rate.cap_kbps == 8000, "a truncated SetLdCfg is dropped, not decoded from stack bytes");
+
+    reset(&rate, ML_RATE_OFF);
+    air_rate_ld_cfg(&rate, cfg, MP_LDCFG_LEN);
+    check(rate.cap_kbps == AIR_RATE_CAP_NONE, "and OFF takes no cap, having no rate to cap");
+}
+
 int main(void)
 {
     check_hysteresis();
@@ -431,6 +519,7 @@ int main(void)
     check_derivation();
     check_decode_and_modes();
     check_sim();
+    check_cap();
 
     printf("%s\n", g_failed == 0 ? "air-rate-governor: all checks passed"
                                  : "air-rate-governor: FAILED");

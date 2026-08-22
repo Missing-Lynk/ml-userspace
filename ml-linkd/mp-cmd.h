@@ -271,6 +271,7 @@ static inline int mp_set_tran_parm(uint8_t *frame, uint8_t dbm, uint8_t standby,
  * exact encoding is undecoded and a fabricated RF/config byte can reboot the goggle. */
 #define MP_LDCFG_LEN       216
 #define MP_LDCFG_BODY_OFF  0x14   /* body (struct mp_ldcfg) starts here in the datagram */
+#define MP_LDCFG_BITRATE_KBPS 250 /* bitrate_q's unit: the field is a count of 250 kbps steps */
 
 /* Decoded SetLdCfg body (192 B). Only fields marked [SET] are varied by ml-linkd; the rest ride the
  * captured default. Named fields are CONFIRMED (HW cross-diff or a direct handle-offset RE read);

@@ -334,10 +334,13 @@ enum mlm_rfcmd_type {
     MLM_RF_SET_POWER   = 2, /* arg = the air's TX power in mW, one of {25,100,200}. Rides the same
                              * SetTranParm (:10000 msg 0x0D) byte[0]; ml-linkd maps mW -> dBm
                              * (25->0x0e, 100->0x14, 200->0x17) and rejects any other value. */
-    MLM_RF_SET_BITRATE = 3, /* arg = the air's video bitrate in Mbps, one of {8,16,24}. Rides
-                             * SetLdCfg (:10000 msg 0x0A) bitrate_q (Mbps * 4, 250 kbps units);
-                             * the air latches it at association, so a change takes effect on the
-                             * next session. ml-linkd rejects any other value. */
+    MLM_RF_SET_BITRATE = 3, /* arg = a CEILING on the air's video bitrate in Mbps, one of
+                             * {8,16,24}. Rides SetLdCfg (:10000 msg 0x0A) bitrate_q (Mbps * 4,
+                             * 250 kbps units); the air latches it at association, so a change
+                             * takes effect on the next session. The air derives its actual rate
+                             * from the RF link and caps it here, so the picture sits at or below
+                             * this number and reaches it only on a link that carries it.
+                             * ml-linkd rejects any other value. */
     MLM_RF_SELECT_CHANNEL = 4, /* arg = the channel table index (0..18) to tune the local RX to,
                              * passed verbatim to the bb-socket SelectChn (SET_CHNIDX): the same
                              * index the scan reports and the tiles show, no +1. Unlike the three

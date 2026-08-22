@@ -68,7 +68,7 @@ static long g_last_ready_ms;                /* last MLM_T_READY heartbeat */
  * needed - a toggle or a returning air unit is picked up by the next tick. */
 static int g_standby_arm = -1;              /* 0/1 = HUD-commanded u8StandbyModeEn, -1 = unknown */
 static int g_power_dbm = -1;                /* HUD-commanded TX power (dBm) for SetTranParm body[0], -1 = unset */
-static int g_bitrate_mbps;                  /* HUD-commanded bitrate (Mbps) for SetLdCfg bitrate_q, 0 = unset */
+static int g_bitrate_mbps;                  /* HUD-commanded max bitrate (Mbps) for SetLdCfg bitrate_q, 0 = unset */
 
 /* Camera/scale state the HUD has commanded (MLM_RF_SET_CAMERA / MLM_RF_SET_SCALE). Owned entirely
  * by this thread: the commands arrive on link.sock and the :10000 datagrams leave on params_sock,
@@ -341,13 +341,14 @@ static void handle_rfcmd(const struct mlm_rfcmd *rfcmd, long now)
         } break;
 
         case MLM_RF_SET_BITRATE: {
-            /* Applied via SetLdCfg at association (the air latches it there), so a change
+            /* A ceiling, not a target: the air derives its rate from the link and caps it at this
+             * number. Applied via SetLdCfg at association (the air latches it there), so a change
              * takes effect on the next session; only the stock-menu levels are valid. */
             if (rfcmd->arg != 8 && rfcmd->arg != 16 && rfcmd->arg != 24) {
                 fprintf(stderr, TAG " rfcmd: ignoring bad bitrate %u Mbps\n", rfcmd->arg);
             } else {
                 if ((int)rfcmd->arg != g_bitrate_mbps) {
-                    printf(TAG " rfcmd: bitrate %u Mbps (next session)\n", rfcmd->arg);
+                    printf(TAG " rfcmd: max bitrate %u Mbps (next session)\n", rfcmd->arg);
                     fflush(stdout);
                 }
                 g_bitrate_mbps = (int)rfcmd->arg;
@@ -476,8 +477,9 @@ static void handle_params(struct udp_socks *socks, const uint8_t *datagram, ssiz
                    mp_set_ld_cfg(cfg, dbm, (uint8_t) g_bitrate_mbps, g_standby_arm > 0,
                                  stamp_us),
                    MSG_DONTWAIT, (struct sockaddr *)&socks->air_params, sizeof socks->air_params);
-            /* Power is the lever the air honours; the blob's bitrate_q is stored-but-ignored
-             * on the air (HW-confirmed), so only power is worth noting. */
+            /* Power is the lever a vendor air honours; it stores bitrate_q and never reads it
+             * (HW-confirmed), so only power is worth noting here. Ours reads bitrate_q too, as a
+             * ceiling on its MCS-derived encoder rate, and logs the cap on its own side. */
             if (g_verbose) {
                 fprintf(stderr, TAG " tx SetLdCfg (power=0x%02x)\n", dbm);
             }
